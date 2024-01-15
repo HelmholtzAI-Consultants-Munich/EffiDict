@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=61.0", "setuptools_scm[toml]>=6.2"]
+
+[tool.setuptools]
+packages = ["effidict"]
+
+[tool.setuptools.dynamic]
+#version = {attr = "my_package.VERSION"}
+readme = { file = "README.md" }
+
+[tool.setuptools_scm]
+write_to = "effidict/_version.py"
+
+[project]
+name = "effidict"
+dynamic = ["version"]
+#version = "1.0.2"
+authors = [
+    { name = "Isra Mekki", email = "isra.mekki@helmholtz-munich.de" },
+    { name = "Lisa Barros de Andrade e Sousa", email = "lisa.barros.andrade.sousa@gmail.com" },
+    { name = "Francesco Campi", email = "francesco.campi@helmholtz-munich.de" },
+]
+maintainers = [
+    { name = "Isra Mekki", email = "isra.mekki@helmholtz-munich.de" },
+]
+description = "Fast Python package providing enhanced dictionary-like data structures with advanced caching capabilities."
+keywords = ["data structures", "efficient dictionary"]
+readme = "README.md"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.urls]
+documentation = "https://oligo-designer-toolsuite.readthedocs.io/"
+repository = "https://github.com/HelmholtzAI-Consultants-Munich/oligo-designer-toolsuite"
