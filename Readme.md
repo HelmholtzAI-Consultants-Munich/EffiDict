@@ -3,7 +3,9 @@ EffiDict is an efficient and fast Python package providing enhanced dictionary-l
 
 ## Features
 **LRU Caching:** Implements Least Recently Used caching for optimal data access.
+
 **Persistent Storage:** Supports disk storage with SQLite.
+
 **Versatile:** Adaptable for various data types.
 
 ## Installation
