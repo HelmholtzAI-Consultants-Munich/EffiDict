@@ -13,8 +13,8 @@ write_to = "effidict/_version.py"
 
 [project]
 name = "effidict"
-dynamic = ["version"]
-#version = "1.0.2"
+# dynamic = ["version"]
+version = "0.0.1"
 authors = [
     { name = "Isra Mekki", email = "isra.mekki@helmholtz-munich.de" },
     { name = "Lisa Barros de Andrade e Sousa", email = "lisa.barros.andrade.sousa@gmail.com" },
