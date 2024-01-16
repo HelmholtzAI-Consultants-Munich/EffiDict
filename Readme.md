@@ -1,19 +1,21 @@
 # EffiDict
 EffiDict is an efficient and fast Python package providing enhanced dictionary-like data structures with advanced caching capabilities. It's perfect for applications needing speedy retrieval and persistent key-value pair storage.
 
-# Features
+## Features
 **LRU Caching:** Implements Least Recently Used caching for optimal data access.
+
 **Persistent Storage:** Supports disk storage with SQLite.
+
 **Versatile:** Adaptable for various data types.
 
-# Installation
+## Installation
 You can install EffiDict via pip:
 
 ```
 pip install effidict
 ```
 
-# Usage
+## Usage
 ```
 from effidict import LRUDBDict, LRUDict, DBDict
 
@@ -30,5 +32,5 @@ db_dict = DBDict(storage_path="cache.db")
 db_dict['key'] = 'value'
 ```
 
-# License
+## License
 Licensed under the MIT License.
