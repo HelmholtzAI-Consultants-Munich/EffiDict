@@ -143,33 +143,28 @@ class LRUDBDict(EffiDictBase):
     :type max_in_memory: int
     :param storage_path: The file path to the SQLite database.
     :type storage_path: str
-    :param batch_size: The number of items to batch for database operations.
-    :type batch_size: int
     """
 
-    def __init__(self, max_in_memory=100, storage_path="cache.db", batch_size=10):
+    def __init__(self, max_in_memory=100, storage_path="cache.db"):
         super().__init__(max_in_memory, storage_path)
         self.conn = sqlite3.connect(storage_path)
         self.cursor = self.conn.cursor()
         self.cursor.execute(
             "CREATE TABLE IF NOT EXISTS data (key TEXT PRIMARY KEY, value TEXT)"
         )
-        self.batch_cache = []
-        self.batch_size = batch_size
 
-    def _serialize_batch(self):
+    def _serialize(self, key, value):
         """
-        Serialize and store a batch of items to the SQLite database.
+        Serialize and store a single item to the SQLite database.
 
-        This method is invoked when the batch cache reaches its specified size,
-        indicating it's time to persist the items to the database.
+        :param key: The key of the item to serialize.
+        :param value: The value of the item to serialize.
         """
         with self.conn:
-            self.cursor.executemany(
+            self.cursor.execute(
                 "REPLACE INTO data (key, value) VALUES (?, ?)",
-                [(key, json.dumps(value)) for key, value in self.batch_cache],
+                (key, json.dumps(value)),
             )
-        self.batch_cache.clear()
 
     def _deserialize(self, key):
         """
@@ -209,8 +204,7 @@ class LRUDBDict(EffiDictBase):
         """
         Set an item in the cache.
 
-        If the cache exceeds its memory limit, the item is added to the batch cache for later
-        serialization to the database.
+        If the cache exceeds its memory limit, the oldest item is serialized to the database directly.
 
         :param key: The key of the item to set.
         :param value: The value of the item to set.
@@ -219,9 +213,7 @@ class LRUDBDict(EffiDictBase):
         self.memory.move_to_end(key)
         if len(self.memory) > self.max_in_memory:
             oldest_key, oldest_value = self.memory.popitem(last=False)
-            self.batch_cache.append((oldest_key, oldest_value))
-            if len(self.batch_cache) >= self.batch_size:
-                self._serialize_batch()
+            self._serialize(oldest_key, oldest_value)
 
     def __delitem__(self, key):
         """
@@ -244,4 +236,5 @@ class LRUDBDict(EffiDictBase):
         """
         memory_keys = set(self.memory.keys())
         self.cursor.execute("SELECT key FROM data")
-        return list(memory_keys.union(self.cursor.fetchall()))
+        db_keys = {row[0] for row in self.cursor.fetchall()}
+        return list(memory_keys.union(db_keys))
