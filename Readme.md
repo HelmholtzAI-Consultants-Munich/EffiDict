@@ -1,3 +1,6 @@
+[![Documentation Status](https://readthedocs.org/projects/effidict/badge/?version=latest)](https://effidict.readthedocs.io/en/latest/?badge=latest)
+
+
 # EffiDict
 EffiDict is an efficient and fast Python package providing enhanced dictionary-like data structures with advanced caching capabilities. It's perfect for applications needing speedy retrieval and persistent key-value pair storage.
 
