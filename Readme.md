@@ -1,3 +1,4 @@
+[![test](https://github.com/HelmholtzAI-Consultants-Munich/EffiDict/actions/workflows/test.yml/badge.svg)](https://github.com/HelmholtzAI-Consultants-Munich/Effidict/actions/workflows/test.yml)
 [![Documentation Status](https://readthedocs.org/projects/effidict/badge/?version=latest)](https://effidict.readthedocs.io/en/latest/?badge=latest)
 
 
