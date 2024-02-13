@@ -4,11 +4,9 @@ on:
   push:
     branches:
       - main
-      - feats/automated_testing
   pull_request:
     branches:
       - main
-      - feats/automated_testing
   workflow_dispatch:
   workflow_call:
 
