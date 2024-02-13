@@ -24,7 +24,7 @@ cache_dict = LRUDict(max_in_memory=100, storage_path="cache")
 cache_dict['key'] = 'value'
 
 # Using LRUDBDict for persistent storage
-db_cache_dict = LRUDBDict(max_in_memory=100, storage_path="cache.db", batch_size=10)
+db_cache_dict = LRUDBDict(max_in_memory=100, storage_path="cache.db")
 db_cache_dict['key'] = 'value'
 
 # Standard DBDict

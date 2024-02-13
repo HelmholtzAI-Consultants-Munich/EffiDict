@@ -8,7 +8,7 @@ from types import FunctionType, ModuleType
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-from effidict._db_dict import LRUDict
+from effidict import LRUDict
 
 sns.set()
 
