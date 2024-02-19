@@ -60,6 +60,12 @@ def test_lrudict_keys_method(lru_dict):
     }, "All keys should be returned, including those in the database"
 
 
+def test_lrudict_load_from_dict(lru_dict):
+    lru_dict.load_from_dict({"key1": "value1", "key2": "value2"})
+    assert lru_dict["key1"] == "value1", "key1 should be in the cache"
+    assert lru_dict["key2"] == "value2", "key2 should be in the cache"
+
+
 ####################################################################################################
 ### Test for LRUDBDict
 ####################################################################################################
@@ -129,3 +135,15 @@ def test_lrudbdict_keys_method(lrudb_dict):
         "key2",
         "key3",
     }, "All keys should be returned, including those in the database"
+
+
+def test_lrudbdict_load_from_dict(lrudb_dict):
+    lrudb_dict.load_from_dict(
+        {
+            "key1": "value1",
+            "key2": "value2",
+            "key3": "value3",
+        }
+    )
+    assert lrudb_dict["key1"] == "value1", "key1 should be in the cache"
+    assert lrudb_dict["key2"] == "value2", "key2 should be in the cache"

@@ -69,3 +69,27 @@ class EffiDictBase:
     @abstractmethod
     def keys(self):
         pass
+
+    @abstractmethod
+    def __getitem__(self, key):
+        pass
+
+    @abstractmethod
+    def __setitem__(self, key, value):
+        pass
+
+    @abstractmethod
+    def __delitem__(self, key):
+        pass
+
+    @abstractmethod
+    def _serialize(self, key, value):
+        pass
+
+    @abstractmethod
+    def _deserialize(self, key):
+        pass
+
+    @abstractmethod
+    def load_from_dict(self, dictionary):
+        pass

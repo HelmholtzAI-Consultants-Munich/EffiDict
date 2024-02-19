@@ -41,3 +41,13 @@ class DBDict:
     def keys(self):
         self.cursor.execute("SELECT key FROM data")
         return [key[0] for key in self.cursor.fetchall()]
+
+    def load_from_dict(self, dictionary):
+        with self.conn:
+            items_to_insert = [
+                (key, json.dumps(value)) for key, value in dictionary.items()
+            ]
+            self.cursor.executemany(
+                "REPLACE INTO data (key, value) VALUES (?, ?)",
+                items_to_insert,
+            )

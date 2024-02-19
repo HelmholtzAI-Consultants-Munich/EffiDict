@@ -130,6 +130,17 @@ class LRUDict(EffiDictBase):
         }
         return list(memory_keys.union(serialized_keys))
 
+    def load_from_dict(self, dictionary):
+        """
+        Load items from a dictionary into the cache.
+
+        This method is used to populate the cache with items from a dictionary.
+
+        :param dictionary: A dictionary containing items to load into the cache.
+        """
+        for key, value in dictionary.items():
+            self[key] = value
+
 
 class LRUDBDict(EffiDictBase):
     """
@@ -238,3 +249,19 @@ class LRUDBDict(EffiDictBase):
         self.cursor.execute("SELECT key FROM data")
         db_keys = {row[0] for row in self.cursor.fetchall()}
         return list(memory_keys.union(db_keys))
+
+    def load_from_dict(self, dictionary):
+        """
+        Load items from a dictionary into the cache.
+
+        :param dictionary: A dictionary containing items to load into the cache.
+        """
+        with self.conn:
+
+            items_to_insert = [
+                (key, json.dumps(value)) for key, value in dictionary.items()
+            ]
+            self.cursor.executemany(
+                "REPLACE INTO data (key, value) VALUES (?, ?)",
+                items_to_insert,
+            )
