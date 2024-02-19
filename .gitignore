@@ -4,3 +4,4 @@ dist/
 .DS_Store
 effidict/_version.py
 docs/_build
+.vscode/

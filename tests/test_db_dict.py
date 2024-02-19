@@ -52,4 +52,5 @@ def test_keys_method(db):
     """
     db["key1"] = {"a": 1}
     db["key2"] = {"b": 2}
-    keys = db.keys
+    keys = db.keys()
+    assert len(keys) == 2 and "key1" in keys and "key2" in keys
