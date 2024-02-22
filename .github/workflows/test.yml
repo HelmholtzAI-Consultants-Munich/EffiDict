@@ -35,12 +35,19 @@ jobs:
         pip install pytest
         pip install coverage
         pip install -e .
-    
-    - name: Test with pytest
-      run: pytest
 
+    - name: Test with pytest
+      run: |
+        coverage run -m pytest
+        coverage xml -i
+      working-directory: src/client
+      env:
+        PLATFORM: ${{ matrix.platform }}
+      
     - name: Upload coverage reports to Codecov
       uses: codecov/codecov-action@v4.0.1
       with:
-        token: ${{ secrets.CODECOV_TOKEN }}
-        slug: HelmholtzAI-Consultants-Munich/EffiDict
+        files: src/client/coverage.xml
+      env:
+        CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
