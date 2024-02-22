@@ -40,7 +40,6 @@ jobs:
       run: |
         coverage run -m pytest
         coverage xml -i
-      working-directory: src/client
       env:
         PLATFORM: ${{ matrix.platform }}
       
