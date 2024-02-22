@@ -41,7 +41,7 @@ jobs:
         coverage run -m pytest
         coverage xml -i
       env:
-        PLATFORM: ${{ matrix.platform }}
+        PLATFORM: ${{ matrix.os }}
       
     - name: Upload coverage reports to Codecov
       uses: codecov/codecov-action@v4.0.1
