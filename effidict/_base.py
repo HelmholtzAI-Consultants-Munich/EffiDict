@@ -1,3 +1,5 @@
+import os
+import time
 from abc import abstractmethod
 from collections import OrderedDict
 
@@ -15,6 +17,9 @@ class EffiDictBase:
     def __init__(self, max_in_memory=100, storage_path="cache"):
         self.max_in_memory = max_in_memory
         self.storage_path = storage_path
+        # add a unique identifier to the storage path to avoid conflicts
+        self.storage_path = self.storage_path + f"{int(time.time())}_{id(self)}"
+
         self.memory = OrderedDict()
 
     def __iter__(self):
@@ -93,3 +98,29 @@ class EffiDictBase:
     @abstractmethod
     def load_from_dict(self, dictionary):
         pass
+
+    @abstractmethod
+    def destroy(self):
+        pass
+
+    def __del__(self):
+        self.destroy()
+
+    def pop(self, key, default=None):
+        """
+        Remove an item from the cache and return its value.
+
+        This method attempts to use the __getitem__ and __delitem__ methods to
+        access and remove the item, respectively. If the key is not found, it
+        returns a default value if provided, or raises a KeyError.
+
+        :param key: The key of the item to remove.
+        :param default: The default value to return if the key is not found.
+        :return: The value of the removed item if the key is found or the default value if not.
+        """
+        try:
+            value = self[key]
+            del self[key]
+            return value
+        except KeyError:
+            return default

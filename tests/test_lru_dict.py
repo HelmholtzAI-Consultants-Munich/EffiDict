@@ -78,7 +78,6 @@ def lrudb_dict(tmp_path):
     cache = LRUDBDict(max_in_memory=2, storage_path=db_path)
     yield cache
     cache.conn.close()
-    os.remove(db_path)
 
 
 def test_lrudbdict_initialization(lrudb_dict):
