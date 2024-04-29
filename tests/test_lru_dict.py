@@ -1,5 +1,4 @@
 import os
-import shutil
 
 import pytest
 
@@ -11,7 +10,6 @@ def lru_dict(tmp_path):
     """Fixture to create an LRUDict instance and clean up after tests."""
     cache = LRUDict(max_in_memory=2, storage_path=str(tmp_path / "lrudict_cache"))
     yield cache
-    shutil.rmtree(str(tmp_path / "lrudict_cache"), ignore_errors=True)
 
 
 def test_lrudict_set_and_get_item(lru_dict):
@@ -78,7 +76,6 @@ def lrudb_dict(tmp_path):
     cache = LRUDBDict(max_in_memory=2, storage_path=db_path)
     yield cache
     cache.conn.close()
-    os.remove(db_path)
 
 
 def test_lrudbdict_initialization(lrudb_dict):

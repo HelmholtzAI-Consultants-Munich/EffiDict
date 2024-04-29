@@ -1,7 +1,10 @@
+import inspect
 import json
 import os
 import pickle
+import shutil
 import sqlite3
+import warnings
 
 from ._base import EffiDictBase
 
@@ -34,8 +37,7 @@ class LRUDict(EffiDictBase):
 
         """
         super().__init__(max_in_memory, storage_path)
-        if not os.path.exists(storage_path):
-            os.makedirs(storage_path)
+        os.makedirs(self.storage_path)
 
     def _serialize(self, key, value):
         """
@@ -141,6 +143,20 @@ class LRUDict(EffiDictBase):
         for key, value in dictionary.items():
             self[key] = value
 
+    def destroy(self):
+        """
+        Destroy the cache and remove all serialized files on disk.
+        """
+        # Problem with joblib: don't delete the storage_path if called by joblib
+        called_by_joblib = any(
+            record.function == "_process_worker" for record in inspect.stack()
+        )
+
+        if not called_by_joblib:
+            shutil.rmtree(self.storage_path)
+
+        del self.memory
+
 
 class LRUDBDict(EffiDictBase):
     """
@@ -156,9 +172,9 @@ class LRUDBDict(EffiDictBase):
     :type storage_path: str
     """
 
-    def __init__(self, max_in_memory=100, storage_path="cache.db"):
+    def __init__(self, max_in_memory=100, storage_path="cache"):
         super().__init__(max_in_memory, storage_path)
-        self.conn = sqlite3.connect(storage_path)
+        self.conn = sqlite3.connect(self.storage_path + ".db")
         self.cursor = self.conn.cursor()
         self.cursor.execute(
             "CREATE TABLE IF NOT EXISTS data (key TEXT PRIMARY KEY, value TEXT)"
@@ -265,3 +281,11 @@ class LRUDBDict(EffiDictBase):
                 "REPLACE INTO data (key, value) VALUES (?, ?)",
                 items_to_insert,
             )
+
+    def destroy(self):
+        """
+        Destroy the cache and remove the SQLite database file.
+        """
+        del self.memory
+        self.conn.close()
+        os.remove(self.storage_path + ".db")
