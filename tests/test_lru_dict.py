@@ -1,5 +1,4 @@
 import os
-import shutil
 
 import pytest
 
@@ -11,7 +10,6 @@ def lru_dict(tmp_path):
     """Fixture to create an LRUDict instance and clean up after tests."""
     cache = LRUDict(max_in_memory=2, storage_path=str(tmp_path / "lrudict_cache"))
     yield cache
-    shutil.rmtree(str(tmp_path / "lrudict_cache"), ignore_errors=True)
 
 
 def test_lrudict_set_and_get_item(lru_dict):

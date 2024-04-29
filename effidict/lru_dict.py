@@ -1,7 +1,10 @@
+import inspect
 import json
 import os
 import pickle
+import shutil
 import sqlite3
+import warnings
 
 from ._base import EffiDictBase
 
@@ -144,12 +147,15 @@ class LRUDict(EffiDictBase):
         """
         Destroy the cache and remove all serialized files on disk.
         """
+        # Problem with joblib: don't delete the storage_path if called by joblib
+        called_by_joblib = any(
+            record.function == "_process_worker" for record in inspect.stack()
+        )
+
+        if not called_by_joblib:
+            shutil.rmtree(self.storage_path)
+
         del self.memory
-        for filename in os.listdir(self.storage_path):
-            path = os.path.join(self.storage_path, filename)
-            if os.path.isfile(path):
-                os.remove(path)
-        os.rmdir(self.storage_path)
 
 
 class LRUDBDict(EffiDictBase):
