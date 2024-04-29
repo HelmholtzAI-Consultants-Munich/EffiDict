@@ -66,6 +66,47 @@ class EffiDictBase:
         for key in self.keys():
             yield self[key]
 
+    def __contains__(self, key):
+        """
+        Check if the key is in the cache.
+
+        :param key: The key to check for.
+        :return: True if the key is in the cache, otherwise False.
+        """
+        return key in self.keys()
+
+    def pop(self, key, default=None):
+        """
+        Remove the specified key and return the corresponding value.
+        If the key is not found, return the default value. If the key is in memory, it is removed from there;
+        if it is only on disk, it should also be removed from there.
+
+        :param key: Key for which the value needs to be popped.
+        :type key: Any hashable
+        :param default: Default value to return if the key is not found.
+        :type default: Any
+        :return: Value associated with the key, or the default if the key is not found.
+        :rtype: Any
+        """
+        try:
+            value = self.memory.pop(key)
+        except KeyError:
+            if key in self.keys():
+                value = self[key]
+                self.__delitem__(key)
+            else:
+                return default
+
+        return value
+
+    def clear(self):
+        """
+        Remove all items from the cache.
+        """
+        self.memory.clear()
+        for key in self.keys():
+            self.__delitem__(key)
+
     @abstractmethod
     def keys(self):
         pass
