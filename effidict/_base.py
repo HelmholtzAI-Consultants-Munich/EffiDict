@@ -112,6 +112,22 @@ class EffiDictBase:
         for key in self.keys():
             self.__delitem__(key)
 
+    def __del__(self):
+        self.destroy()
+
+    def __eq__(self, other):
+        if not isinstance(other, EffiDictBase):
+            return False
+
+        if len(self) != len(other):
+            return False
+
+        for key, value in self.items():
+            if key not in other or other[key] != value:
+                return False
+
+        return True
+
     @abstractmethod
     def keys(self):
         pass
@@ -143,25 +159,3 @@ class EffiDictBase:
     @abstractmethod
     def destroy(self):
         pass
-
-    def __del__(self):
-        self.destroy()
-
-    def pop(self, key, default=None):
-        """
-        Remove an item from the cache and return its value.
-
-        This method attempts to use the __getitem__ and __delitem__ methods to
-        access and remove the item, respectively. If the key is not found, it
-        returns a default value if provided, or raises a KeyError.
-
-        :param key: The key of the item to remove.
-        :param default: The default value to return if the key is not found.
-        :return: The value of the removed item if the key is found or the default value if not.
-        """
-        try:
-            value = self[key]
-            del self[key]
-            return value
-        except KeyError:
-            return default
