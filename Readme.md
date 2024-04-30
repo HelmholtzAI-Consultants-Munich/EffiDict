@@ -21,18 +21,24 @@ pip install effidict
 ```
 
 ## Usage
+Importing the package
 ```
 from effidict import LRUDBDict, LRUDict, DBDict
+```
 
-# Using LRUDict
+Using `LRUDict` for persistent storage on `pickle` files
+```
 cache_dict = LRUDict(max_in_memory=100, storage_path="cache")
 cache_dict['key'] = 'value'
+```
 
-# Using LRUDBDict for persistent storage
+Using `LRUDBDict` for persistent storage on `sqlite`
+```
 db_cache_dict = LRUDBDict(max_in_memory=100, storage_path="cache.db")
 db_cache_dict['key'] = 'value'
-
-# Standard DBDict
+```
+Standard `DBDict` (`sqlite` only)
+```
 db_dict = DBDict(storage_path="cache.db")
 db_dict['key'] = 'value'
 ```
