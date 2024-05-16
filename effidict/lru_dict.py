@@ -154,6 +154,11 @@ class LRUDict(EffiDictBase):
 
         if not called_by_joblib:
             shutil.rmtree(self.storage_path)
+        else:
+            try:
+                shutil.rmtree(self.storage_path)
+            except:
+                pass
 
         del self.memory
 
