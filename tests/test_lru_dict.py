@@ -2,13 +2,13 @@ import os
 
 import pytest
 
-from effidict import LRUDBDict, LRUDict
+from effidict import DBDict, LRUPickleDict
 
 
 @pytest.fixture
 def lru_dict(tmp_path):
     """Fixture to create an LRUDict instance and clean up after tests."""
-    cache = LRUDict(max_in_memory=2, storage_path=str(tmp_path / "lrudict_cache"))
+    cache = LRUPickleDict(max_in_memory=2, storage_path=str(tmp_path / "lrudict_cache"))
     yield cache
 
 
@@ -73,7 +73,7 @@ def test_lrudict_load_from_dict(lru_dict):
 def lrudb_dict(tmp_path):
     """Fixture to create an LRUDBDict instance and clean up after tests."""
     db_path = str(tmp_path / "lrudbdict_cache.db")
-    cache = LRUDBDict(max_in_memory=2, storage_path=db_path)
+    cache = DBDict(max_in_memory=2, storage_path=db_path)
     yield cache
     cache.conn.close()
 

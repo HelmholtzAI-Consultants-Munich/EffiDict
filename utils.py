@@ -8,7 +8,7 @@ from types import FunctionType, ModuleType
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-from effidict import LRUDict
+from effidict import PickleDict
 
 sns.set()
 
@@ -38,7 +38,7 @@ def total_size(o, handlers={}):
         dict: dict_handler,
         set: iter,
         frozenset: iter,
-        LRUDict: lrudict_handler,
+        PickleDict: lrudict_handler,
     }
 
     all_handlers.update(handlers)  # user handlers take precedence
