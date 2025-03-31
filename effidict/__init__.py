@@ -1,12 +1,20 @@
-from ._base import EffiDictBase, PickleDict, SqliteDict
-from ._lru import LRUPickleDict, LRUSqliteDict
-from ._sqlite import DBDict
+from .effidict import EffiDict
+from .disk_backend import DiskBackend, PickleBackend, Hdf5Backend, JSONBackend, SqliteBackend
+from .replacement_strategies import ReplacementStrategy, RandomReplacement, FIFOReplacement, LIFOReplacement, LRUReplacement, MRUReplacement, LFUReplacement, MFUReplacement
 
 __all__ = [
-    "EffiDictBase",
-    "PickleDict",
-    "SqliteDict",
-    "DBDict",
-    "LRUPickleDict",
-    "LRUSqliteDict",
+    "EffiDict",
+    "DiskBackend",
+    "PickleBackend",
+    "Hdf5Backend",
+    "JSONBackend",
+    "SqliteBackend",
+    "ReplacementStrategy",
+    "RandomReplacement",
+    "FIFOReplacement",
+    "LIFOReplacement",
+    "LRUReplacement",
+    "MRUReplacement",
+    "LFUReplacement",
+    "MFUReplacement",
 ]
