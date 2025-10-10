@@ -1,6 +1,5 @@
 class EffiDict:
-    def __init__(self, max_in_memory=100, disk_backend=None, replacement_strategy=None):
-        self.max_in_memory = max_in_memory
+    def __init__(self, disk_backend=None, replacement_strategy=None):
         self.disk_backend = disk_backend
         self.replacement_strategy = replacement_strategy
         self.memory = replacement_strategy.memory
