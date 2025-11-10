@@ -48,7 +48,7 @@ class BenchmarkConfig:
         if self.dataset_sizes is None:
             self.dataset_sizes = [
                 1000,
-                2000,
+                # 2000,
                 # 5000,
                 # 10000,
                 # 20000,

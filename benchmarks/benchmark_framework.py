@@ -9,13 +9,12 @@ import time
 import json
 import csv
 import os
+import statistics
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, asdict
 from collections import defaultdict
-
-from memory_profiler import memory_usage
 
 
 @dataclass
@@ -26,7 +25,7 @@ class BenchmarkResult:
     dataset_size: int
     implementation: str
     time_seconds: float
-    memory_mb: Optional[float] = None
+    memory_mb: Optional[float] = None  # RAM usage in MB
     cache_hits: Optional[int] = None
     cache_misses: Optional[int] = None
     metadata: Optional[Dict[str, Any]] = None
@@ -42,179 +41,14 @@ class BenchmarkResult:
         return result
 
 
-class Timer:
-    """Simple timer context manager."""
-
-    def __init__(self):
-        self.start_time = None
-        self.end_time = None
-        self.elapsed = None
-
-    def __enter__(self):
-        self.start_time = time.perf_counter()
-        return self
-
-    def __exit__(self, *args):
-        self.end_time = time.perf_counter()
-        self.elapsed = self.end_time - self.start_time
-
-    def elapsed_seconds(self) -> float:
-        """Get elapsed time in seconds."""
-        if self.elapsed is None:
-            raise RuntimeError("Timer not stopped yet")
-        return self.elapsed
-
-
-class MemoryTracker:
-    """Track memory usage during operations."""
-
-    def __init__(self):
-        self.initial_memory = None
-        self.peak_memory = None
-        self.final_memory = None
-        self._memory_samples = []
-
-    def start(self):
-        """Record initial memory usage."""
-        # memory_usage(proc=-1) returns current process memory usage in MB as a list
-        mem_usage = memory_usage(proc=-1)
-        self.initial_memory = mem_usage[0]
-        self._memory_samples = [self.initial_memory]
-
-    def stop(self) -> float:
-        """Record final memory and return peak usage in MB."""
-        # memory_usage(proc=-1) returns current process memory usage in MB as a list
-        mem_usage = memory_usage(proc=-1)
-        self.final_memory = mem_usage[0]
-        self._memory_samples.append(self.final_memory)
-        self.peak_memory = max(self._memory_samples) if self._memory_samples else self.final_memory
-
-        return self.peak_memory - self.initial_memory
-
-    def get_peak_mb(self) -> float:
-        """Get peak memory usage in MB."""
-        return self.peak_memory
-
-
 class BenchmarkRunner:
     """Main benchmark runner that orchestrates benchmarks."""
 
-    def __init__(self, output_dir: str = "benchmark_results"):
+    def __init__(self, results: List[BenchmarkResult], output_dir: str = "benchmark_results"):
+
+        self.results = results
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.results: List[BenchmarkResult] = []
-
-    def run_benchmark(
-        self,
-        operation: str,
-        dataset_size: int,
-        implementation: str,
-        func: Callable,
-        repetitions: int = 1,
-        *args,
-        **kwargs,
-    ) -> BenchmarkResult:
-        """
-        Run a benchmark operation, optionally with repetitions.
-
-        Args:
-            operation: Name of the operation (e.g., 'write', 'read', 'delete')
-            dataset_size: Size of the dataset
-            implementation: Name of implementation ('dict', 'shelve', 'effidict')
-            func: Function to benchmark
-            repetitions: Number of times to repeat the benchmark (default: 1)
-            *args, **kwargs: Arguments to pass to func
-
-        Returns:
-            BenchmarkResult with timing and memory information (aggregated if repetitions > 1)
-        """
-        if repetitions > 1:
-            return self.run_benchmark_repeated(
-                operation, dataset_size, implementation, func, repetitions, *args, **kwargs
-            )
-        memory_tracker = MemoryTracker()
-        memory_tracker.start()
-
-        timer = Timer()
-        with timer:
-            # memory_usage with a function tuple calls the function and tracks memory
-            # interval=0.1 samples every 0.01 seconds
-            mem_samples, result = memory_usage((func, args, kwargs), interval=0.01, retval=True)
-
-        # Calculate peak memory from samples
-        peak_memory = max(mem_samples)
-        memory_mb = max(0.0, peak_memory - memory_tracker.initial_memory)
-
-        benchmark_result = BenchmarkResult(
-            operation=operation,
-            dataset_size=dataset_size,
-            implementation=implementation,
-            time_seconds=timer.elapsed_seconds(),
-            memory_mb=memory_mb,
-        )
-
-        self.results.append(benchmark_result)
-        return benchmark_result
-
-    def run_benchmark_repeated(
-        self,
-        operation: str,
-        dataset_size: int,
-        implementation: str,
-        func: Callable,
-        repetitions: int = 3,
-        *args,
-        **kwargs,
-    ) -> BenchmarkResult:
-        """
-        Run a benchmark operation multiple times and aggregate results.
-
-        Args:
-            operation: Name of the operation (e.g., 'write', 'read', 'delete')
-            dataset_size: Size of the dataset
-            implementation: Name of implementation ('dict', 'shelve', 'effidict')
-            func: Function to benchmark
-            repetitions: Number of times to repeat the benchmark
-            *args, **kwargs: Arguments to pass to func
-
-        Returns:
-            BenchmarkResult with aggregated timing and memory information (mean ± std)
-        """
-        import statistics
-
-        times = []
-        memories = []
-
-        for _ in range(repetitions):
-            result = self.run_benchmark(operation, dataset_size, implementation, func, *args, **kwargs)
-            times.append(result.time_seconds)
-            if result.memory_mb is not None:
-                memories.append(result.memory_mb)
-
-        # Remove the individual results (keep only aggregated)
-        self.results = self.results[:-repetitions]
-
-        # Calculate statistics
-        mean_time = statistics.mean(times)
-        time_std = statistics.stdev(times) if len(times) > 1 else 0.0
-
-        mean_memory = statistics.mean(memories) if memories else None
-        memory_std = statistics.stdev(memories) if len(memories) > 1 else None
-
-        # Create aggregated result
-        aggregated_result = BenchmarkResult(
-            operation=operation,
-            dataset_size=dataset_size,
-            implementation=implementation,
-            time_seconds=mean_time,
-            memory_mb=mean_memory,
-            time_std=time_std,
-            memory_std=memory_std,
-            metadata={"repetitions": repetitions, "individual_times": times, "individual_memories": memories},
-        )
-
-        self.results.append(aggregated_result)
-        return aggregated_result
 
     def save_results(self, filename: Optional[str] = None):
         """Save results to JSON and CSV files."""

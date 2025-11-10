@@ -89,8 +89,8 @@ def plot_runtime_operations(
     ax.set_title(title or f"{operation.capitalize()} Operations Runtime", fontsize=14)
     ax.legend(fontsize=10)
     ax.grid(True, alpha=0.3)
-    ax.set_xscale("log")
-    ax.set_yscale("log")
+    # ax.set_xscale("log")
+    # ax.set_yscale("log")
 
     plt.tight_layout()
 
@@ -122,10 +122,9 @@ def plot_memory_usage(
         return
 
     # Create DataFrame
-    pseudo_count = 1
     data = {
         "dataset_size": [r.dataset_size for r in memory_results],
-        "memory_mb": [r.memory_mb + pseudo_count for r in memory_results],
+        "memory_mb": [r.memory_mb for r in memory_results],
         "implementation": [r.implementation for r in memory_results],
     }
     df = pd.DataFrame(data)
@@ -166,8 +165,8 @@ def plot_memory_usage(
     ax.set_title(title or "Memory Usage", fontsize=14)
     ax.legend(fontsize=10)
     ax.grid(True, alpha=0.3)
-    ax.set_xscale("log")
-    ax.set_yscale("log")
+    # ax.set_xscale("log")
+    # ax.set_yscale("log")
 
     plt.tight_layout()
 

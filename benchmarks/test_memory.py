@@ -171,7 +171,7 @@ def measure_memory_usage(
             memories.append(mem)
 
         # Calculate statistics
-        mean_memory = statistics.mean(memories)
+        mean_memory = statistics.median(memories)
         memory_std = statistics.stdev(memories) if len(memories) > 1 else 0.0
 
         result = BenchmarkResult(

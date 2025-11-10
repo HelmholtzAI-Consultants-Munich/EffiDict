@@ -16,8 +16,9 @@ if benchmarks_dir not in sys.path:
     sys.path.insert(0, benchmarks_dir)
 
 from benchmark_framework import BenchmarkRunner
-from test_runtime import run_all_runtime_benchmarks
-from test_memory import run_memory_benchmarks
+from test_runtime import run_all_runtime_benchmarks, benchmark_write_operations
+
+# from test_memory import run_memory_benchmarks
 from test_use_cases import run_use_case_benchmarks
 from visualize_results import plot_all_operations, create_comparison_table
 from config import DEFAULT_CONFIG, BenchmarkConfig
@@ -116,13 +117,25 @@ def main():
     config = DEFAULT_CONFIG
 
     # Run benchmarks
-    run_all_benchmarks(
-        config=config,
-        output_dir=args.output_dir,
-        skip_runtime=args.skip_runtime,
-        skip_memory=args.skip_memory,
-        skip_use_case=args.skip_use_case,
+    # run_all_benchmarks(
+    #     config=config,
+    #     output_dir=args.output_dir,
+    #     skip_runtime=args.skip_runtime,
+    #     skip_memory=args.skip_memory,
+    #     skip_use_case=args.skip_use_case,
+    # )
+
+    results = benchmark_write_operations(
+        dataset_sizes=[1000],
+        data_config={"small_uniform": [100]},
+        repetitions=10,
+        effidict_backends=["sqlite"],
+        effidict_strategies=["lru"],
     )
+
+    runner = BenchmarkRunner(results=results, output_dir=args.output_dir)
+    runner.save_results("write_operations")
+    plot_all_operations(runner, Path(args.output_dir))
 
 
 if __name__ == "__main__":
