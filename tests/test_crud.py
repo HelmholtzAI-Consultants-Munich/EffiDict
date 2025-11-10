@@ -48,7 +48,6 @@ class TestEffiDictCRUD:
         replacement_strategy = strategy_cls(disk_backend=disk_backend, max_in_memory=max_items)
         
         with EffiDict(
-            max_in_memory=max_items,
             disk_backend=disk_backend,
             replacement_strategy=replacement_strategy
         ) as effidict:
@@ -88,7 +87,6 @@ class TestEffiDictCRUD:
         replacement_strategy = strategy_cls(disk_backend=disk_backend, max_in_memory=max_items)
 
         with EffiDict(
-            max_in_memory=max_items,
             disk_backend=disk_backend,
             replacement_strategy=replacement_strategy
         ) as effidict:
