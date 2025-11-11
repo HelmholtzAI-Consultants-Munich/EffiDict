@@ -1,19 +1,20 @@
 # Additional dependencies for benchmarking
 
 # Memory tracking
-memory_profiler>=0.60.0
+memory_profiler>=0.60.0  # Used for memory usage measurement in test_memory.py
+psutil>=5.9.0  # Dependency of memory_profiler
 
-# Data manipulation
-pandas>=1.5.0
-numpy>=1.20.0
+# Data manipulation and analysis
+pandas>=1.5.0  # Used for data processing and CSV export in benchmark_framework.py
+numpy>=1.20.0  # Used for array generation in datasets.py
 
 # Statistical analysis and Zipf distribution
-scipy>=1.9.0
+scipy>=1.9.0  # Used for Zipf distribution in workloads.py (for future use)
 
 # Visualization
-matplotlib>=3.5.0
-seaborn>=0.12.0
+matplotlib>=3.5.0  # Used for plotting benchmark results
+seaborn>=0.12.0  # Used for plot styling
 
-# Progress bars
+# Progress bars (optional, for future use)
 tqdm>=4.64.0
 

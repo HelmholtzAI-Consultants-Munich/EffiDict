@@ -5,593 +5,298 @@ Measures total time for operations across increasing dataset sizes,
 comparing EffiDict, dict, and shelve.
 """
 
-import tempfile
-import os
 import statistics
 import time
-from typing import Dict, Any, List
-from pathlib import Path
-import sys
-from effidict import EffiDict
+import gc
+from typing import List, Callable
 
-from benchmark_framework import BenchmarkRunner, BenchmarkResult, open_shelve
+
+from benchmark_framework import BenchmarkResult
+from fixtures import (
+    open_shelve,
+    DataStructureFactory,
+    get_max_in_memory_for_value_size,
+)
 from datasets import generate_dataset
-from config import DEFAULT_CONFIG, get_backend_class, get_strategy_class, get_max_in_memory_for_value_size
 
 
-def benchmark_write_operations(
-    dataset_sizes: List[int],
-    data_config: Dict[str, Any],
-    repetitions: int,
-    effidict_backends: List[str],
-    effidict_strategies: List[str],
-) -> List[BenchmarkResult]:
-    results = []
-
-    def write_dict(dataset):
-        d = {}
-        for key, value in dataset.items():
-            d[key] = value
-        return d
-
-    def write_shelve(dataset, shelve_path):
-        with open_shelve(shelve_path, "c") as db:
-            for key, value in dataset.items():
-                db[key] = value
-        return db
-
-    def write_effidict(dataset, max_in_memory, backend, strategy):
-        ed = EffiDict(max_in_memory=max_in_memory, disk_backend=backend, replacement_strategy=strategy)
-        for key, value in dataset.items():
-            ed[key] = value
-        return ed
-
-    for value_type in data_config:
-        for value_size in data_config[value_type]:
-            max_in_memory = get_max_in_memory_for_value_size(value_type, value_size)
-
-            for dataset_size in dataset_sizes:
-                # Generate dataset
-                dataset = generate_dataset(dataset_size, value_type, value_size)
-
-                #########################################################
-                # Benchmark standard dict
-                #########################################################
-
-                times = []
-
-                for repetition in range(repetitions):
-                    time.sleep(1)
-                    start_time = time.perf_counter()
-                    result = write_dict(dataset=dataset)
-                    end_time = time.perf_counter()
-
-                    times.append(end_time - start_time)
-
-                result = BenchmarkResult(
-                    operation="write",
-                    dataset_size=dataset_size,
-                    implementation="dict",
-                    time_seconds=statistics.mean(times),
-                    time_std=statistics.stdev(times),
-                    memory_mb=None,
-                    memory_std=None,
-                    metadata={
-                        "repetitions": repetitions,
-                        "individual_times": times,
-                    },
-                )
-                results.append(result)
-
-                #########################################################
-                # Benchmark shelve
-                #########################################################
-
-                times = []
-
-                with tempfile.NamedTemporaryFile(delete=False, suffix="") as tmp:
-                    shelve_path = tmp.name
-
-                for repetition in range(repetitions):
-                    time.sleep(1)
-                    start_time = time.perf_counter()
-                    result = write_shelve(dataset=dataset, shelve_path=shelve_path)
-                    end_time = time.perf_counter()
-
-                    times.append(end_time - start_time)
-
-                result = BenchmarkResult(
-                    operation="write",
-                    dataset_size=dataset_size,
-                    implementation="shelve",
-                    time_seconds=statistics.mean(times),
-                    time_std=statistics.stdev(times),
-                    memory_mb=None,
-                    memory_std=None,
-                    metadata={
-                        "repetitions": repetitions,
-                        "individual_times": times,
-                    },
-                )
-                results.append(result)
-                if os.path.exists(shelve_path):
-                    os.remove(shelve_path)
-
-                #########################################################
-                # Benchmark EffiDict with different backend/strategy combinations
-                #########################################################
-
-                for backend_name in effidict_backends:
-                    for strategy_name in effidict_strategies:
-                        implementation_name = f"effidict_{strategy_name}_{backend_name}"
-                        BackendClass = get_backend_class(backend_name)
-                        StrategyClass = get_strategy_class(strategy_name)
-
-                        # Create temporary storage
-                        with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{backend_name}") as tmp:
-                            effidict_path = tmp.name
-
-                        backend = BackendClass(effidict_path)
-                        strategy = StrategyClass(disk_backend=backend, max_in_memory=max_in_memory)
-
-                        for repetition in range(repetitions):
-                            time.sleep(1)
-                            start_time = time.perf_counter()
-                            result = write_effidict(
-                                dataset=dataset,
-                                max_in_memory=max_in_memory,
-                                backend=backend,
-                                strategy=strategy,
-                            )
-                            end_time = time.perf_counter()
-                            times.append(end_time - start_time)
-
-                        result = BenchmarkResult(
-                            operation="write",
-                            dataset_size=dataset_size,
-                            implementation=implementation_name,
-                            time_seconds=statistics.mean(times),
-                            time_std=statistics.stdev(times),
-                            memory_mb=None,
-                            memory_std=None,
-                            metadata={
-                                "repetitions": repetitions,
-                                "individual_times": times,
-                            },
-                        )
-                        results.append(result)
-
-    return results
-
-
-def benchmark_read_operations(
-    runner: BenchmarkRunner,
-    dataset_sizes: List[int],
-    value_type: str = "small_uniform",
-    value_size: Any = None,
-    config: Any = None,
-    repetitions: int = 1,
-) -> List[BenchmarkResult]:
+def _create_structure_with_factory(
+    implementation: str,
+    populate: bool,
+    dataset: dict = None,
+    max_in_memory: int = None,
+    backend_name: str = None,
+    strategy_name: str = None,
+):
     """
-    Benchmark read operations (accesses) for different dataset sizes.
+    Create a data structure using DataStructureFactory.
 
     Args:
-        runner: Benchmark runner instance
-        dataset_sizes: List of dataset sizes to test
-        value_type: Type of values to generate
-        value_size: Size parameter for values
-        config: Benchmark configuration (uses DEFAULT_CONFIG if None)
+        implementation: 'dict', 'shelve', or 'effidict'
+        populate: Whether to populate with dataset
+        dataset: Dataset to populate with
+        max_in_memory: Max items in memory (for EffiDict)
+        backend_name: Backend name (for EffiDict)
+        strategy_name: Strategy name (for EffiDict)
 
     Returns:
-        List of benchmark results
+        Created data structure
     """
-    if config is None:
-        config = DEFAULT_CONFIG
+    return DataStructureFactory.create(
+        implementation=implementation,
+        populate=populate,
+        dataset=dataset,
+        max_in_memory=max_in_memory,
+        backend_name=backend_name,
+        strategy_name=strategy_name,
+    )
 
-    results = []
 
-    for dataset_size in dataset_sizes:
-        # Generate dataset
-        dataset = generate_dataset(dataset_size, value_type, value_size)
-        keys = list(dataset.keys())
+def measure_runtime_with_repetitions(
+    operation: str,
+    dataset_size: int,
+    dataset_value_size: int,
+    implementation: str,
+    repetitions: int,
+    benchmark_func: Callable,
+    benchmark_kwargs: dict,
+    populate: bool,
+    dataset: dict = None,
+    max_in_memory: int = None,
+    backend_name: str = None,
+    strategy_name: str = None,
+) -> BenchmarkResult:
 
-        # Benchmark standard dict
-        d = dict(dataset)
+    times = []
 
-        # Determine max_in_memory based on value type and size
-        max_in_memory = get_max_in_memory_for_value_size(value_type, value_size)
+    for repetition in range(repetitions):
 
-        def read_dict():
-            for key in keys:
-                _ = d[key]
+        structure = _create_structure_with_factory(
+            implementation=implementation,
+            populate=populate,
+            dataset=dataset,
+            max_in_memory=max_in_memory,
+            backend_name=backend_name,
+            strategy_name=strategy_name,
+        )
+        time.sleep(1)
 
-        result = runner.run_benchmark("read", dataset_size, "dict", read_dict)
-        results.append(result)
+        start_time = time.perf_counter()
+        benchmark_func(structure, **benchmark_kwargs)
+        end_time = time.perf_counter()
+        times.append(end_time - start_time)
 
-        # Benchmark shelve
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
-            shelve_path = tmp.name
+        del structure
+        gc.collect()
 
-        try:
-            # Pre-populate shelve
+    result = BenchmarkResult(
+        operation=operation,
+        dataset_size=dataset_size,
+        dataset_value_size=dataset_value_size,
+        implementation=implementation,
+        time_seconds=statistics.mean(times),
+        time_std=statistics.stdev(times) if len(times) > 1 else 0.0,
+        memory_mb=None,
+        memory_std=None,
+        metadata={
+            "repetitions": repetitions,
+            "individual_times": times,
+        },
+    )
+    return result
+
+
+def _create_operation_functions(operation: str):
+    """
+    Create operation-specific functions for dict, shelve, and effidict.
+
+    Args:
+        operation: Operation name ('write', 'read', 'delete', 'modify')
+
+    Returns:
+        Tuple of (dict_func, shelve_func, effidict_func)
+    """
+    if operation == "write":
+
+        def dict_func(d, dataset):
+            for key, value in dataset.items():
+                d[key] = value
+
+        def shelve_func(shelve_path, dataset):
             with open_shelve(shelve_path, "c") as db:
                 for key, value in dataset.items():
                     db[key] = value
 
-            def read_shelve():
-                with open_shelve(shelve_path, "r") as db:
-                    for key in keys:
-                        _ = db[key]
+        def effidict_func(ed, dataset):
+            for key, value in dataset.items():
+                ed[key] = value
 
-            result = runner.run_benchmark(
-                "read", dataset_size, "shelve", read_shelve, repetitions=repetitions
-            )
-            results.append(result)
-        finally:
-            if os.path.exists(shelve_path):
-                os.remove(shelve_path)
+        return dict_func, shelve_func, effidict_func
 
-        # Benchmark EffiDict with different backend/strategy combinations
-        from effidict import EffiDict
+    elif operation == "read":
 
-        for backend_name in config.backends:
-            for strategy_name in config.strategies:
-                BackendClass = get_backend_class(backend_name)
-                StrategyClass = get_strategy_class(strategy_name)
+        def dict_func(d, keys):
+            for key in keys:
+                _ = d[key]
 
-                if BackendClass is None or StrategyClass is None:
-                    continue
+        def shelve_func(shelve_path, keys):
+            with open_shelve(shelve_path, "r") as db:
+                for key in keys:
+                    _ = db[key]
 
-                # Create temporary storage
-                with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{backend_name}") as tmp:
-                    effidict_path = tmp.name
+        def effidict_func(ed, keys):
+            for key in keys:
+                _ = ed[key]
 
-                try:
-                    backend = BackendClass(effidict_path)
-                    strategy = StrategyClass(disk_backend=backend, max_in_memory=max_in_memory)
+        return dict_func, shelve_func, effidict_func
 
-                    # Pre-populate EffiDict
-                    ed = EffiDict(
-                        max_in_memory=max_in_memory, disk_backend=backend, replacement_strategy=strategy
-                    )
-                    for key, value in dataset.items():
-                        ed[key] = value
+    elif operation == "delete":
 
-                    def read_effidict():
-                        ed = EffiDict(
-                            max_in_memory=max_in_memory, disk_backend=backend, replacement_strategy=strategy
-                        )
-                        for key in keys:
-                            _ = ed[key]
-
-                    implementation_name = f"effidict_{strategy_name}_{backend_name}"
-                    result = runner.run_benchmark(
-                        "read", dataset_size, implementation_name, read_effidict, repetitions=repetitions
-                    )
-                    results.append(result)
-                except Exception as e:
-                    print(f"Error benchmarking {strategy_name}/{backend_name} for read: {e}")
-                finally:
-                    if os.path.exists(effidict_path):
-                        if backend_name == "sqlite" or backend_name == "hdf5":
-                            try:
-                                os.remove(effidict_path)
-                            except:
-                                pass
-                        else:
-                            import shutil
-
-                            try:
-                                shutil.rmtree(effidict_path)
-                            except:
-                                pass
-                    if backend:
-                        try:
-                            backend.destroy()
-                        except:
-                            pass
-
-    return results
-
-
-def benchmark_delete_operations(
-    runner: BenchmarkRunner,
-    dataset_sizes: List[int],
-    value_type: str = "small_uniform",
-    value_size: Any = None,
-    config: Any = None,
-    repetitions: int = 1,
-) -> List[BenchmarkResult]:
-    """
-    Benchmark delete operations for different dataset sizes.
-
-    Args:
-        runner: Benchmark runner instance
-        dataset_sizes: List of dataset sizes to test
-        value_type: Type of values to generate
-        value_size: Size parameter for values
-        config: Benchmark configuration (uses DEFAULT_CONFIG if None)
-
-    Returns:
-        List of benchmark results
-    """
-    if config is None:
-        config = DEFAULT_CONFIG
-
-    repetitions = getattr(config, "repetitions", 1)
-    results = []
-
-    for dataset_size in dataset_sizes:
-        # Generate dataset
-        dataset = generate_dataset(dataset_size, value_type, value_size)
-        keys = list(dataset.keys())
-
-        # Benchmark standard dict
-        d = dict(dataset)
-
-        # Determine max_in_memory based on value type and size
-        max_in_memory = get_max_in_memory_for_value_size(value_type, value_size)
-
-        def delete_dict():
+        def dict_func(d, keys):
             for key in keys:
                 if key in d:
                     del d[key]
 
-        result = runner.run_benchmark("delete", dataset_size, "dict", delete_dict, repetitions=repetitions)
-        results.append(result)
+        def shelve_func(shelve_path, keys):
+            with open_shelve(shelve_path, "w") as db:
+                for key in keys:
+                    if key in db:
+                        del db[key]
 
-        # Benchmark shelve
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
-            shelve_path = tmp.name
+        def effidict_func(ed, keys):
+            for key in keys:
+                if key in ed:
+                    del ed[key]
 
-        try:
-            # Pre-populate shelve
-            with open_shelve(shelve_path, "c") as db:
-                for key, value in dataset.items():
-                    db[key] = value
+        return dict_func, shelve_func, effidict_func
 
-            def delete_shelve():
-                with open_shelve(shelve_path, "w") as db:
-                    for key in keys:
-                        if key in db:
-                            del db[key]
+    elif operation == "modify":
 
-            result = runner.run_benchmark(
-                "delete", dataset_size, "shelve", delete_shelve, repetitions=repetitions
-            )
-            results.append(result)
-        finally:
-            if os.path.exists(shelve_path):
-                os.remove(shelve_path)
-
-        # Benchmark EffiDict with different backend/strategy combinations
-        from effidict import EffiDict
-
-        for backend_name in config.backends:
-            for strategy_name in config.strategies:
-                BackendClass = get_backend_class(backend_name)
-                StrategyClass = get_strategy_class(strategy_name)
-
-                if BackendClass is None or StrategyClass is None:
-                    continue
-
-                # Create temporary storage
-                with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{backend_name}") as tmp:
-                    effidict_path = tmp.name
-
-                try:
-                    backend = BackendClass(effidict_path)
-                    strategy = StrategyClass(disk_backend=backend, max_in_memory=max_in_memory)
-
-                    # Pre-populate EffiDict
-                    ed = EffiDict(
-                        max_in_memory=max_in_memory, disk_backend=backend, replacement_strategy=strategy
-                    )
-                    for key, value in dataset.items():
-                        ed[key] = value
-
-                    def delete_effidict():
-                        ed = EffiDict(
-                            max_in_memory=max_in_memory, disk_backend=backend, replacement_strategy=strategy
-                        )
-                        for key in keys:
-                            if key in ed:
-                                del ed[key]
-
-                    implementation_name = f"effidict_{strategy_name}_{backend_name}"
-                    result = runner.run_benchmark(
-                        "delete", dataset_size, implementation_name, delete_effidict, repetitions=repetitions
-                    )
-                    results.append(result)
-                except Exception as e:
-                    print(f"Error benchmarking {strategy_name}/{backend_name} for delete: {e}")
-                finally:
-                    if os.path.exists(effidict_path):
-                        if backend_name == "sqlite" or backend_name == "hdf5":
-                            try:
-                                os.remove(effidict_path)
-                            except:
-                                pass
-                        else:
-                            import shutil
-
-                            try:
-                                shutil.rmtree(effidict_path)
-                            except:
-                                pass
-                    if backend:
-                        try:
-                            backend.destroy()
-                        except:
-                            pass
-
-    return results
-
-
-def benchmark_modify_operations(
-    runner: BenchmarkRunner,
-    dataset_sizes: List[int],
-    value_type: str = "small_uniform",
-    value_size: Any = None,
-    config: Any = None,
-    repetitions: int = 1,
-) -> List[BenchmarkResult]:
-    """
-    Benchmark modification operations (updates) for different dataset sizes.
-
-    Args:
-        runner: Benchmark runner instance
-        dataset_sizes: List of dataset sizes to test
-        value_type: Type of values to generate
-        value_size: Size parameter for values
-        config: Benchmark configuration (uses DEFAULT_CONFIG if None)
-
-    Returns:
-        List of benchmark results
-    """
-    if config is None:
-        config = DEFAULT_CONFIG
-
-    repetitions = getattr(config, "repetitions", 1)
-    results = []
-
-    for dataset_size in dataset_sizes:
-        # Generate dataset
-        dataset = generate_dataset(dataset_size, value_type, value_size)
-        keys = list(dataset.keys())
-
-        # Benchmark standard dict
-        d = dict(dataset)
-
-        # Determine max_in_memory based on value type and size
-        max_in_memory = get_max_in_memory_for_value_size(value_type, value_size)
-
-        def modify_dict():
+        def dict_func(d, keys):
             for key in keys:
                 if key in d:
                     d[key] = {"modified": True, "original": d[key]}
 
-        result = runner.run_benchmark("modify", dataset_size, "dict", modify_dict, repetitions=repetitions)
-        results.append(result)
+        def shelve_func(shelve_path, keys):
+            with open_shelve(shelve_path, "w") as db:
+                for key in keys:
+                    if key in db:
+                        db[key] = {"modified": True, "original": db[key]}
 
-        # Benchmark shelve
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
-            shelve_path = tmp.name
+        def effidict_func(ed, keys):
+            for key in keys:
+                if key in ed:
+                    ed[key] = {"modified": True, "original": ed[key]}
 
-        try:
-            # Pre-populate shelve
-            with open_shelve(shelve_path, "c") as db:
-                for key, value in dataset.items():
-                    db[key] = value
+        return dict_func, shelve_func, effidict_func
 
-            def modify_shelve():
-                with open_shelve(shelve_path, "w") as db:
-                    for key in keys:
-                        if key in db:
-                            db[key] = {"modified": True, "original": db[key]}
-
-            result = runner.run_benchmark(
-                "modify", dataset_size, "shelve", modify_shelve, repetitions=repetitions
-            )
-            results.append(result)
-        finally:
-            if os.path.exists(shelve_path):
-                os.remove(shelve_path)
-
-        # Benchmark EffiDict with different backend/strategy combinations
-        from effidict import EffiDict
-
-        for backend_name in config.backends:
-            for strategy_name in config.strategies:
-                BackendClass = get_backend_class(backend_name)
-                StrategyClass = get_strategy_class(strategy_name)
-
-                if BackendClass is None or StrategyClass is None:
-                    continue
-
-                # Create temporary storage
-                with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{backend_name}") as tmp:
-                    effidict_path = tmp.name
-
-                try:
-                    backend = BackendClass(effidict_path)
-                    strategy = StrategyClass(disk_backend=backend, max_in_memory=max_in_memory)
-
-                    # Pre-populate EffiDict
-                    ed = EffiDict(
-                        max_in_memory=max_in_memory, disk_backend=backend, replacement_strategy=strategy
-                    )
-                    for key, value in dataset.items():
-                        ed[key] = value
-
-                    def modify_effidict():
-                        ed = EffiDict(
-                            max_in_memory=max_in_memory, disk_backend=backend, replacement_strategy=strategy
-                        )
-                        for key in keys:
-                            if key in ed:
-                                ed[key] = {"modified": True, "original": ed[key]}
-
-                    implementation_name = f"effidict_{strategy_name}_{backend_name}"
-                    result = runner.run_benchmark(
-                        "modify", dataset_size, implementation_name, modify_effidict, repetitions=repetitions
-                    )
-                    results.append(result)
-                except Exception as e:
-                    print(f"Error benchmarking {strategy_name}/{backend_name} for modify: {e}")
-                finally:
-                    if os.path.exists(effidict_path):
-                        if backend_name == "sqlite" or backend_name == "hdf5":
-                            try:
-                                os.remove(effidict_path)
-                            except:
-                                pass
-                        else:
-                            import shutil
-
-                            try:
-                                shutil.rmtree(effidict_path)
-                            except:
-                                pass
-                    if backend:
-                        try:
-                            backend.destroy()
-                        except:
-                            pass
-
-    return results
+    else:
+        raise ValueError(f"Unknown operation: {operation}")
 
 
-def run_all_runtime_benchmarks(config: Any = None, output_dir: str = "benchmark_results") -> BenchmarkRunner:
+def benchmark_operations(
+    operation: str,
+    dataset_sizes: List[int],
+    dataset_value_sizes: List[int],
+    repetitions: int,
+    effidict_backends: List[str],
+    effidict_strategies: List[str],
+) -> List[BenchmarkResult]:
     """
-    Run all runtime benchmarks.
+    Generic function to benchmark any operation (write, read, delete, modify).
 
     Args:
-        config: Benchmark configuration (uses DEFAULT_CONFIG if None)
-        output_dir: Output directory for results
+        operation: Operation name ('write', 'read', 'delete', 'modify')
+        dataset_sizes: List of dataset sizes to test
+        dataset_value_sizes: List of value sizes in MB
+        repetitions: Number of repetitions for each benchmark
+        effidict_backends: List of backend names for EffiDict
+        effidict_strategies: List of strategy names for EffiDict
 
     Returns:
-        BenchmarkRunner with all results
+        List of BenchmarkResult objects
     """
-    if config is None:
-        config = DEFAULT_CONFIG
+    dict_func, shelve_func, effidict_func = _create_operation_functions(operation)
+    results = []
 
-    runner = BenchmarkRunner(output_dir=output_dir)
+    # Determine if operation needs dataset or keys
+    needs_keys = operation != "write"
 
-    # Run benchmarks for each operation type
-    print("Running write operation benchmarks...")
-    benchmark_write_operations(runner, config.dataset_sizes, config=config)
+    for dataset_value_size in dataset_value_sizes:
+        max_in_memory = get_max_in_memory_for_value_size(dataset_value_size)
 
-    print("Running read operation benchmarks...")
-    benchmark_read_operations(runner, config.dataset_sizes, config=config)
+        for dataset_size in dataset_sizes:
+            print(
+                f"Running {operation} operation benchmarks on {dataset_value_size} MB for {dataset_size} items for {repetitions} repetitions..."
+            )
 
-    print("Running delete operation benchmarks...")
-    benchmark_delete_operations(runner, config.dataset_sizes, config=config)
+            dataset = generate_dataset(dataset_size, dataset_value_size)
 
-    print("Running modify operation benchmarks...")
-    benchmark_modify_operations(runner, config.dataset_sizes, config=config)
+            # Prepare benchmark kwargs and populate flag based on operation type
+            if needs_keys:
+                keys = list(dataset.keys())
+                benchmark_kwargs = {"keys": keys}
+                populate = True
+            else:
+                benchmark_kwargs = {"dataset": dataset}
+                populate = False
 
-    # Save results
-    runner.save_results("runtime_benchmarks")
+            #########################################################
+            # Benchmark standard dict
+            #########################################################
 
-    return runner
+            result = measure_runtime_with_repetitions(
+                operation=operation,
+                dataset_size=dataset_size,
+                dataset_value_size=dataset_value_size,
+                implementation="dict",
+                benchmark_func=dict_func,
+                benchmark_kwargs=benchmark_kwargs,
+                populate=populate,
+                dataset=dataset if populate else None,
+                repetitions=repetitions,
+            )
+            results.append(result)
+
+            #########################################################
+            # Benchmark shelve
+            #########################################################
+
+            result = measure_runtime_with_repetitions(
+                operation=operation,
+                dataset_size=dataset_size,
+                dataset_value_size=dataset_value_size,
+                implementation="shelve",
+                benchmark_func=shelve_func,
+                benchmark_kwargs=benchmark_kwargs,
+                populate=populate,
+                dataset=dataset if populate else None,
+                repetitions=repetitions,
+            )
+            results.append(result)
+
+            #########################################################
+            # Benchmark EffiDict with different backend/strategy combinations
+            #########################################################
+
+            for backend_name in effidict_backends:
+                for strategy_name in effidict_strategies:
+                    implementation_name = f"effidict_{strategy_name}_{backend_name}"
+
+                    result = measure_runtime_with_repetitions(
+                        operation=operation,
+                        dataset_size=dataset_size,
+                        dataset_value_size=dataset_value_size,
+                        implementation=implementation_name,
+                        benchmark_func=effidict_func,
+                        benchmark_kwargs=benchmark_kwargs,
+                        populate=populate,
+                        dataset=dataset if populate else None,
+                        max_in_memory=max_in_memory,
+                        backend_name=backend_name,
+                        strategy_name=strategy_name,
+                        repetitions=repetitions,
+                    )
+                    results.append(result)
+
+    return results
