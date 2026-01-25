@@ -1,5 +1,6 @@
 import time
 from abc import abstractmethod
+from threading import Lock
 import sqlite3  
 import json
 import os
@@ -17,6 +18,7 @@ except Exception:
 class DiskBackend:
     def __init__(self, storage_path):
         self.storage_path = storage_path + f"{int(time.time())}_{id(self)}"
+        self.storage_lock = Lock()
         
     @abstractmethod
     def serialize(self, key, value):
@@ -46,7 +48,7 @@ class DiskBackend:
 class SqliteBackend(DiskBackend):
     def __init__(self, storage_path):
         super().__init__(storage_path)
-        self.conn = sqlite3.connect(self.storage_path)
+        self.conn = sqlite3.connect(self.storage_path, check_same_thread=False)
         self.cursor = self.conn.cursor()
         self.cursor.execute(
             "CREATE TABLE IF NOT EXISTS data (key TEXT PRIMARY KEY, value TEXT)"
@@ -54,65 +56,76 @@ class SqliteBackend(DiskBackend):
 
     def serialize(self, key, value):
         json_value = json.dumps(value)
-        self.cursor.execute(
-            "REPLACE INTO data (key, value) VALUES (?, ?)", (key, json_value)
-        )
-        self.conn.commit()
+        with self.storage_lock:
+            self.cursor.execute(
+                "REPLACE INTO data (key, value) VALUES (?, ?)", (key, json_value)
+            )
+            self.conn.commit()
 
     def deserialize(self, key):
-        self.cursor.execute("SELECT value FROM data WHERE key=?", (key,))
-        result = self.cursor.fetchone()
+        with self.storage_lock:
+            self.cursor.execute("SELECT value FROM data WHERE key=?", (key,))
+            result = self.cursor.fetchone()
         if result:
             return json.loads(result[0])
         raise KeyError(key)
     
     def del_item(self, key):
-        self.cursor.execute("DELETE FROM data WHERE key=?", (key,))
-        self.conn.commit()
+        with self.storage_lock:
+            self.cursor.execute("DELETE FROM data WHERE key=?", (key,))
+            self.conn.commit()
 
     def keys(self):
-        self.cursor.execute("SELECT key FROM data")
-        return [key[0] for key in self.cursor.fetchall()]
+        with self.storage_lock:
+            self.cursor.execute("SELECT key FROM data")
+            return [key[0] for key in self.cursor.fetchall()]
     
     def load_from_dict(self, dictionary):
-        with self.conn:
-            items_to_insert = [
-                (key, json.dumps(value)) for key, value in dictionary.items()
-            ]
-            self.cursor.executemany(
-                "REPLACE INTO data (key, value) VALUES (?, ?)",
-                items_to_insert,
-            )
+        items_to_insert = [
+            (key, json.dumps(value)) for key, value in dictionary.items()
+        ]
+        with self.storage_lock:
+            with self.conn:
+                self.cursor.executemany(
+                    "REPLACE INTO data (key, value) VALUES (?, ?)",
+                    items_to_insert,
+                )
 
     def destroy(self):
         self.conn.close()
         os.remove(self.storage_path)
 
 
+# Since each key is stored separately, Locking is not the fastest solution here.
+# However, it ensures thread safety for file for the same keys.
 class PickleBackend(DiskBackend):
     def __init__(self, storage_path):
         super().__init__(storage_path)
         os.makedirs(self.storage_path, exist_ok=True)
 
     def serialize(self, key, value):
-        with open(os.path.join(self.storage_path, key), "wb") as f:
-            pickle.dump(value, f)
+        with self.storage_lock:
+            with open(os.path.join(self.storage_path, key), "wb") as f:
+                pickle.dump(value, f)
 
     def deserialize(self, key):
-        try:
-            with open(os.path.join(self.storage_path, key), "rb") as f:
-                return pickle.load(f)
-        except FileNotFoundError:
-            raise KeyError(key)
+        with self.storage_lock:
+            try:
+                with open(os.path.join(self.storage_path, key), "rb") as f:
+                    return pickle.load(f)
+            except FileNotFoundError:
+                raise KeyError(key)
         
     def del_item(self, key):
-        try:
-            os.remove(os.path.join(self.storage_path, key))
-        except FileNotFoundError:
-            pass
+        with self.storage_lock:
+            try:
+                os.remove(os.path.join(self.storage_path, key))
+            except FileNotFoundError:
+                pass
 
     def keys(self):
-        return os.listdir(self.storage_path)
+        with self.storage_lock:
+            return os.listdir(self.storage_path)
 
     def destroy(self):
         shutil.rmtree(self.storage_path)
@@ -129,57 +142,62 @@ class Hdf5Backend(DiskBackend):
         """
         Store data and its Python type as an HDF5 attribute.
         """
-        if key in self.file:
-            del self.file[key] 
+        with self.storage_lock:
+            if key in self.file:
+                del self.file[key] 
 
-        type_name = type(value).__name__
-        
-        if value is None:
-            ds = self.file.create_dataset(key, data=h5py.Empty("f"))
-        elif isinstance(value, (dict, list, tuple)):
-            ds = self.file.create_dataset(key, data=repr(value))
-        else:
-            ds = self.file.create_dataset(key, data=value)
+            type_name = type(value).__name__
             
-        ds.attrs['python_type'] = type_name
+            if value is None:
+                ds = self.file.create_dataset(key, data=h5py.Empty("f"))
+            elif isinstance(value, (dict, list, tuple)):
+                ds = self.file.create_dataset(key, data=repr(value))
+            else:
+                ds = self.file.create_dataset(key, data=value)
+            
+            ds.attrs['python_type'] = type_name
 
     def deserialize(self, key):
         """
         Read data and use the 'python_type' attribute to cast it back correctly.
         """
         try:
-            dataset = self.file[key]
-            type_name = dataset.attrs.get('python_type')
+            with self.storage_lock:
+                dataset = self.file[key]
+                type_name = dataset.attrs.get('python_type')
 
-            if type_name is None:
-                raise TypeError(f"Dataset for key '{key}' is missing 'python_type' attribute.")
+                if type_name is None:
+                    raise TypeError(f"Dataset for key '{key}' is missing 'python_type' attribute.")
 
-            if type_name == 'NoneType':
-                return None
-            elif type_name in ('dict', 'list', 'tuple'):
-                str_data = dataset.asstr()[()]
-                return ast.literal_eval(str_data)
-            elif type_name == 'str':
-                return dataset.asstr()[()]
-            else: 
-                return dataset[()]
+                if type_name == 'NoneType':
+                    return None
+                elif type_name in ('dict', 'list', 'tuple'):
+                    str_data = dataset.asstr()[()]
+                    return ast.literal_eval(str_data)
+                elif type_name == 'str':
+                    return dataset.asstr()[()]
+                else: 
+                    return dataset[()]
 
         except KeyError:
             raise KeyError(key)
         
     def del_item(self, key):
         try:
-            del self.file[key]
+            with self.storage_lock:
+                del self.file[key]
         except KeyError:
             pass
 
     def keys(self):
-        return list(self.file.keys())
+        with self.storage_lock:
+            return list(self.file.keys())
     
     def destroy(self):
         self.file.close()
         os.remove(self.storage_path)    
 
+# Similarly to pickle, locking is not the most efficient here.
 class JSONBackend(DiskBackend):
     def __init__(self, storage_path):
         super().__init__(storage_path)
@@ -189,19 +207,22 @@ class JSONBackend(DiskBackend):
         return os.path.join(self.storage_path, f"{key}.json")
 
     def serialize(self, key, value):
-        with open(self._file_path(key), "w") as f:
-            json.dump(value, f)
+        with self.storage_lock:
+            with open(self._file_path(key), "w") as f:
+                json.dump(value, f)
 
     def deserialize(self, key):
         try:
-            with open(self._file_path(key), "r") as f:
-                return json.load(f)
+            with self.storage_lock:
+                with open(self._file_path(key), "r") as f:
+                    return json.load(f)
         except FileNotFoundError:
             raise KeyError(key)
         
     def del_item(self, key):
         try:
-            os.remove(self._file_path(key))
+            with self.storage_lock:
+                os.remove(self._file_path(key))
         except FileNotFoundError:
             pass
 

@@ -56,7 +56,7 @@ class TestEffiDictCRUD:
             effidict['a'] = 1
             effidict['b'] = {'data': [2, 3]}
             assert len(effidict) == 2
-            assert len(effidict.memory) == 2
+            assert len(effidict.replacement_strategy.memory) == 2
             assert len(effidict.disk_backend.keys()) == 0
 
             # READ
@@ -97,7 +97,7 @@ class TestEffiDictCRUD:
                 effidict[key] = value
 
             assert len(effidict) == num_to_add
-            assert len(effidict.memory) == max_items
+            assert len(effidict.replacement_strategy.memory) == max_items
             assert len(effidict.disk_backend.keys()) == num_to_add - max_items
 
             # READ from disk
