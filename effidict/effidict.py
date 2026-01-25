@@ -16,11 +16,7 @@ class EffiDict:
             self.disk_backend.destroy()
 
     def __iter__(self):
-        self._iter_keys = iter(self.keys())
-        return self
-
-    def __next__(self):
-        return next(self._iter_keys)
+        return iter(self.keys())
 
     def __len__(self):
         return len(self.keys())

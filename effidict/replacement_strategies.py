@@ -24,7 +24,7 @@ class ReplacementStrategy:
         pass
 
     def __contains__(self, key):
-        # When GIL is held, in is thread safe and no lock is needed
+        # When GIL is held, "in" is thread safe and no lock is needed
         return key in self.memory
 
     # --- NEW: Method for handling deletion from memory ---
@@ -47,7 +47,8 @@ class ReplacementStrategy:
 
     def keys(self):
         with self.memory_lock:
-            return self.memory.keys()
+            # view might not be thread safe
+            return set(self.memory.keys()) 
 
 
 class RandomReplacement(ReplacementStrategy):
@@ -227,16 +228,17 @@ class LFUReplacement(ReplacementStrategy):
     def get_memory(self):
         return {}  # Plain dict is fine here
 
-    # --- OVERRIDE: Also clean up the frequency counter ---
     def delete(self, key):
-        super().delete(key)
-        if key in self.secondary_memory:
-            del self.secondary_memory[key]
+        with self.memory_lock:
+            if key in self.memory:
+                del self.memory[key]
+            if key in self.secondary_memory:
+                del self.secondary_memory[key]
 
     def clear(self):
-        super().clear()
-        self.secondary_memory.clear()
-
+        with self.memory_lock:
+            self.memory.clear()
+            self.secondary_memory.clear()
 
 # Similar changes for MFUReplacement...
 class MFUReplacement(ReplacementStrategy):
