@@ -2,7 +2,6 @@ class EffiDict:
     def __init__(self, disk_backend=None, replacement_strategy=None):
         self.disk_backend = disk_backend
         self.replacement_strategy = replacement_strategy
-        self.memory = replacement_strategy.memory
 
     def __enter__(self):
         return self
@@ -16,11 +15,7 @@ class EffiDict:
             self.disk_backend.destroy()
 
     def __iter__(self):
-        self._iter_keys = iter(self.keys())
-        return self
-
-    def __next__(self):
-        return next(self._iter_keys)
+        return iter(self.keys())
 
     def __len__(self):
         return len(self.keys())
@@ -34,30 +29,23 @@ class EffiDict:
             yield self[key]
 
     def __contains__(self, key):
-        return key in self.memory or (self.disk_backend and key in self.disk_backend.keys())
+        return key in self.replacement_strategy or (
+            self.disk_backend and key in self.disk_backend.keys()
+        )
 
     def pop(self, key, default=None):
         try:
-            value = self.memory.pop(key)
-        except KeyError:
-            if key in self.keys():
-                value = self[key]
-                self.__delitem__(key)
-            else:
-                return default
-
-        return value
+            return self.replacement_strategy.get(key)
+        except KeyError:  # key not in memory & disk
+            return default
+        finally:
+            self.delete(key)
 
     def clear(self):
-        all_keys = self.keys()
-        self.memory.clear()
+        # already calls super().clear() internally
+        self.replacement_strategy.clear()
         if self.disk_backend:
-            for key in all_keys:
-                self.disk_backend.del_item(key)
-        # Also clear strategy-specific caches like LFU/MFU counts
-        if hasattr(self.replacement_strategy, 'clear'):
-            self.replacement_strategy.clear()
-
+            self.disk_backend.clear()
 
     def __del__(self):
         try:
@@ -79,8 +67,10 @@ class EffiDict:
 
     def keys(self):
         """Return a list of all unique keys known to the dictionary (memory + disk)."""
-        mem_keys = set(self.memory.keys())
-        disk_keys = set(self.disk_backend.keys() if self.disk_backend is not None else [])
+        mem_keys = set(self.replacement_strategy.keys())
+        disk_keys = set(
+            self.disk_backend.keys() if self.disk_backend is not None else []
+        )
         return list(mem_keys.union(disk_keys))
 
     def __getitem__(self, key):
@@ -89,14 +79,18 @@ class EffiDict:
     def __setitem__(self, key, value):
         self.replacement_strategy.put(key, value)
 
+    def delete(self, key):
+        # The strategy handles its own memory (and secondary_memory for LFU/MFU)
+        self.replacement_strategy.delete(key)
+        # Ensure it's also removed from the disk backend
+        if self.disk_backend:
+            self.disk_backend.del_item(key)
+
     def __delitem__(self, key):
         # Check existence first to raise KeyError properly
         if key not in self:
             raise KeyError(key)
-        # The strategy handles its own memory (and secondary_memory for LFU/MFU)
-        self.replacement_strategy.delete(key)
-        # Ensure it's also removed from the disk backend
-        self.disk_backend.del_item(key)
+        self.delete(key)
 
     def load_from_dict(self, dictionary):
         self.disk_backend.load_from_dict(dictionary)
