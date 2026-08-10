@@ -45,7 +45,7 @@ from effidict import EffiDict, SqliteBackend, LRUReplacement
 
 # A unique suffix is appended to avoid collisions, so a simple prefix is fine
 backend = SqliteBackend("cache.sqlite_")
-strategy = LRUReplacement(disk_backend=backend, max_in_memory=2)
+strategy = LRUReplacement(disk_backend=backend)
 store = EffiDict(max_in_memory=2, disk_backend=backend, replacement_strategy=strategy)
 
 store["a"] = 1
@@ -62,9 +62,7 @@ from effidict import EffiDict, JSONBackend, MRUReplacement
 
 backend = JSONBackend("cache_dir_")
 strategy = MRUReplacement(disk_backend=backend, max_in_memory=100)
-with EffiDict(
-	max_in_memory=100, disk_backend=backend, replacement_strategy=strategy
-) as d:
+with EffiDict(disk_backend=backend, replacement_strategy=strategy) as d:
 	d["k"] = "v"
 	print(d["k"])  # -> "v"
 # resources are cleaned up on exit
@@ -86,7 +84,7 @@ from effidict import (
 
 backend = SqliteBackend("cache.sqlite_")                  # or JSONBackend("cache_dir_"), PickleBackend("cache_dir_"), Hdf5Backend("cache.h5_")
 strategy = LRUReplacement(disk_backend=backend, max_in_memory=100)
-store = EffiDict(max_in_memory=100, disk_backend=backend, replacement_strategy=strategy)
+store = EffiDict(disk_backend=backend, replacement_strategy=strategy)
 ```
 
 Notes:
