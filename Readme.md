@@ -45,8 +45,8 @@ from effidict import EffiDict, SqliteBackend, LRUReplacement
 
 # A unique suffix is appended to avoid collisions, so a simple prefix is fine
 backend = SqliteBackend("cache.sqlite_")
-strategy = LRUReplacement(disk_backend=backend)
-store = EffiDict(max_in_memory=2, disk_backend=backend, replacement_strategy=strategy)
+strategy = LRUReplacement(disk_backend=backend, max_in_memory=2)
+store = EffiDict(disk_backend=backend, replacement_strategy=strategy)
 
 store["a"] = 1
 store["b"] = 2
