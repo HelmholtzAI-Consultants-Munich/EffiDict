@@ -5,3 +5,4 @@ dist/
 effidict/_version.py
 docs/_build
 .vscode/
+.claude/
