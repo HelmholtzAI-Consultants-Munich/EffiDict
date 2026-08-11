@@ -1,5 +1,8 @@
+from __future__ import annotations
+
 import time
-from abc import abstractmethod
+from abc import ABC, abstractmethod
+from typing import Dict, Iterator
 import sqlite3  
 import json
 import os
@@ -14,7 +17,7 @@ except Exception:
     h5py = None
     np = None
 
-class DiskBackend:
+class DiskBackend(ABC):
     def __init__(self, storage_path):
         self.storage_path = storage_path + f"{int(time.time())}_{id(self)}"
         
@@ -41,6 +44,59 @@ class DiskBackend:
     def load_from_dict(self, dictionary):
         for key, value in dictionary.items():
             self.serialize(key, value)
+
+    def has(self, key) -> bool:
+        """Return whether ``key`` exists in this backend."""
+        raise NotImplementedError("see issue #2.2")
+
+    def count(self) -> int:
+        """Return the number of keys in this backend."""
+        raise NotImplementedError("see issue #2.2")
+
+    def iter_keys(self) -> Iterator:
+        """Iterate over keys in this backend."""
+        raise NotImplementedError("see issue #4.2")
+
+    def read_many(self, keys) -> Dict:
+        """Read multiple keys from this backend."""
+        raise NotImplementedError("see issue #4.1")
+
+    def write_many(self, items) -> None:
+        """Write multiple items to this backend."""
+        raise NotImplementedError("see issue #4.1")
+
+    def delete_many(self, keys) -> None:
+        """Delete multiple keys from this backend."""
+        raise NotImplementedError("see issue #4.1")
+
+    def compact(self) -> None:
+        """Reclaim unused storage space."""
+        raise NotImplementedError("see issue #7.2")
+
+    @classmethod
+    def create(cls, path, **kwargs):
+        """Create a new backend at ``path``."""
+        raise NotImplementedError("see issue #2.1")
+
+    @classmethod
+    def open(cls, path, mode: str = "r+", **kwargs):
+        """Open a backend at ``path``.
+
+        ``mode`` follows the ``create``/``open``/``open_or_create``
+        distinction. The existing ``__init__`` behavior of deriving a unique
+        path from the clock and ``id(self)`` is a bug fixed in issue #2.1.
+        """
+        raise NotImplementedError("see issue #2.1")
+
+    @classmethod
+    def open_or_create(cls, path, **kwargs):
+        """Open an existing backend or create one at ``path``."""
+        raise NotImplementedError("see issue #2.1")
+
+    @classmethod
+    def temporary(cls, prefix: str = "effidict-"):
+        """Create a scratch backend at a unique path."""
+        raise NotImplementedError("see issue #2.1")
 
 
 class SqliteBackend(DiskBackend):

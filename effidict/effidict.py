@@ -1,7 +1,18 @@
+from __future__ import annotations
+
+from typing import Optional
+
+
 class EffiDict:
-    def __init__(self, disk_backend=None, replacement_strategy=None):
+    def __init__(self, disk_backend=None, replacement_strategy=None, *, max_bytes: Optional[int] = None):
+        """Create an EffiDict facade.
+
+        ``max_bytes`` is accepted as the future approximate cache byte budget,
+        but it is not enforced yet; see issue #1.4.
+        """
         self.disk_backend = disk_backend
         self.replacement_strategy = replacement_strategy
+        self.max_bytes = max_bytes
         self.memory = replacement_strategy.memory
 
     def __enter__(self):
@@ -47,6 +58,39 @@ class EffiDict:
                 return default
 
         return value
+
+    def get(self, key, default=None):
+        """Return ``key`` if present, otherwise ``default``."""
+        raise NotImplementedError("see issue #6.1")
+
+    def setdefault(self, key, default=None):
+        """Return ``key`` if present, otherwise set and return ``default``."""
+        raise NotImplementedError("see issue #6.1")
+
+    def popitem(self):
+        """Remove and return an arbitrary key/value pair."""
+        raise NotImplementedError("see issue #6.1")
+
+    def update(self, other=(), **kwargs):
+        """Update this dictionary from another mapping or iterable."""
+        raise NotImplementedError("see issue #6.1")
+
+    def iter_keys(self):
+        """Iterate over keys without materializing a list."""
+        raise NotImplementedError("see issue #4.2")
+
+    def flush(self):
+        """Flush dirty cached entries to storage."""
+        raise NotImplementedError("see issue #1.4")
+
+    def clone(self, new_path):
+        """Clone this dictionary to ``new_path``."""
+        raise NotImplementedError("see issue #3.2")
+
+    @property
+    def _store(self):
+        """Future Store facade used by white-box tier-invariant specs."""
+        raise NotImplementedError("see issue #1.2")
 
     def clear(self):
         all_keys = self.keys()
