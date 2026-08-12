@@ -6,3 +6,6 @@ effidict/_version.py
 docs/_build
 .vscode/
 .claude/
+.coverage
+coverage.xml
+.pytest_cache/
