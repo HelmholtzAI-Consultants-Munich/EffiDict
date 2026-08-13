@@ -113,7 +113,7 @@ def storage_leak_detector(request, storage_dir, _open_stores):
     yield
 
     for store in reversed(_open_stores):
-        _release(store)
+        release_store(store)
 
     if request.node.get_closest_marker("keeps_storage"):
         return
@@ -122,7 +122,7 @@ def storage_leak_detector(request, storage_dir, _open_stores):
     assert not leaked, f"storage left behind in {storage_dir}: {leaked}"
 
 
-def _release(store):
+def release_store(store):
     """Best-effort teardown that survives the pre-3.1 lifecycle semantics.
 
     ``destroy()`` is preferred once it exists (issue 3.1); today ``close()`` is
