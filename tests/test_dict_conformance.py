@@ -19,9 +19,21 @@ Three deliberate restrictions keep this test measuring what it claims to:
   all-rules machine would collapse five independent defects into one marker and
   give no signal when the first of them is fixed.
 
-The core machine runs the full 4 x 7 matrix at every ``max_in_memory``; the
-rule-group machines run the full matrix at one cache size, plus a deep ``slow``
-run. See ``_settings``.
+Every machine runs against all 4 x 7 = 28 backend/policy combinations. That sweep
+is marked ``slow`` because it is too slow for an edit-run loop; CI runs it, and
+locally ``-m "not slow"`` falls back to ``CROSS_SECTION`` -- every backend against
+LRU plus every policy against Pickle -- which touches each backend and each policy
+at least once. Concretely:
+
+===================  ==========================  ==================================
+machine              default run                 ``slow`` run
+===================  ==========================  ==================================
+Core, Clear          CROSS_SECTION x 4 sizes     full 28 x 4 sizes, + deep run
+Pop, MappingApi,     CROSS_SECTION, size 2       full 28, size 2
+Order
+===================  ==========================  ==================================
+
+``FAST`` and ``DEEP`` hold the hypothesis settings for the two effort levels.
 """
 
 from __future__ import annotations
@@ -406,6 +418,44 @@ def test_mapping_api_conformance(backend_cls, policy_cls, make_dict):
 )
 @pytest.mark.parametrize("backend_cls, policy_cls", CROSS_SECTION)
 def test_order_conformance(backend_cls, policy_cls, make_dict):
+    _run(OrderConformance, backend_cls, policy_cls, 2, make_dict)
+
+
+# -- rule groups, full 4 x 7 matrix: CI only -----------------------------
+#
+# Same machines and same xfail reasons as above, swept across every backend and
+# policy so issue #24's "runs against every backend x policy combination"
+# criterion holds for the rule groups too, not just Core and Clear.
+
+
+@pytest.mark.slow
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "two pop defects (issue 1.2): pop(key) with no default returns None "
+        "instead of raising KeyError, and pop removes only the memory copy so a "
+        "key present in both tiers survives"
+    ),
+)
+def test_pop_conformance_full_matrix(backend_cls, policy_cls, make_dict):
+    _run(PopConformance, backend_cls, policy_cls, 2, make_dict)
+
+
+@pytest.mark.slow
+@pytest.mark.xfail(
+    strict=True,
+    reason="get/setdefault/update/popitem raise NotImplementedError (issue 6.1)",
+)
+def test_mapping_api_conformance_full_matrix(backend_cls, policy_cls, make_dict):
+    _run(MappingApiConformance, backend_cls, policy_cls, 2, make_dict)
+
+
+@pytest.mark.slow
+@pytest.mark.xfail(
+    strict=True,
+    reason="keys() returns set-union order, not insertion order (issue 4.2)",
+)
+def test_order_conformance_full_matrix(backend_cls, policy_cls, make_dict):
     _run(OrderConformance, backend_cls, policy_cls, 2, make_dict)
 
 
