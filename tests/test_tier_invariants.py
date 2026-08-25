@@ -42,68 +42,39 @@ PROMOTING_POLICIES = {
 }
 
 
-def _force_onto_disk(effidict, key):
-    """Get ``key`` into the persistent tier, whatever the policy's victim rule.
+def _spill_to_disk(effidict, key):
+    """Put ``key``'s current value on disk and drop it from the cache.
 
-    Two strategies, because the policies split into two camps:
+    Both halves matter. Stopping at "a disk copy exists" would let a caller read
+    the still-cached value and pass without ever consulting the persistent tier --
+    and because a reassignment leaves the old value on disk until the new one is
+    written out, such a caller could read ``second`` from cache while ``first``
+    still sits on disk, proving nothing.
 
-    * Most policies evict an *older* entry, so adding filler pushes the target out.
-    * LIFO and MRU evict the *most recently inserted* entry, so filler evicts
-      itself and the target never spills. Once the cache is full, though,
-      rewriting the target spills it immediately -- which is what the second phase
-      does.
-
-    Returns False if neither works, so callers can skip rather than fail on an
-    unrelated policy quirk.
+    Deliberately bypasses the eviction policy rather than trying to provoke it.
+    Forcing a *chosen* key to be the victim is not achievable across all seven
+    policies: LFU and MFU break frequency ties by insertion order into their
+    counter, so a freshly rewritten key always loses the tie and is never
+    selected. Callers here need the resulting tier *state*, not the code path that
+    produced it. ``test_eviction_writes_the_current_value`` covers the real
+    eviction path.
     """
-    for filler in FILLER:
-        if on_disk(effidict, key):
-            return True
-        effidict[filler] = f"v-{filler}"
-
-    # Rewriting in place will not do it: the key is already resident, so the
-    # cache does not grow and no eviction fires. Remove it, fill the cache to
-    # capacity, then write it back -- now it is the newest entry in a full cache,
-    # which is exactly what LIFO and MRU evict.
-    #
-    # Retried, because RandomReplacement picks its victim by coin flip and may
-    # not choose the target on the first attempt.
-    capacity = effidict.replacement_strategy.max_in_memory
-    for _ in range(20):
-        if on_disk(effidict, key):
-            return True
-        value = effidict[key]
-        del effidict[key]
-        for filler in FILLER[:capacity]:
-            effidict[filler] = f"v-{filler}"
-        effidict[key] = value
-    return on_disk(effidict, key)
+    value = effidict[key]
+    effidict.disk_backend.serialize(key, value)
+    effidict.replacement_strategy.delete(key)
+    assert on_disk(effidict, key), "helper failed to place the key on disk"
+    assert not in_cache(effidict, key), "helper failed to clear the cache copy"
 
 
 def _seed_in_both_tiers(effidict, key, value):
-    """Arrange for ``key`` to exist in the cache *and* on disk.
+    """Arrange for ``key`` to exist in the cache *and* on disk, with one value.
 
-    Evict it, free a cache slot, then write it again: the fresh write lands in
-    the cache while the evicted copy stays on disk.
-
-    Freeing the slot is what makes this work for every policy. LIFO and MRU evict
-    the *most recent* insertion, so without a free slot they evict the very key
-    just written and it never becomes resident.
+    Spill it, then write it again. The spill leaves the cache with a free slot, so
+    the rewrite lands there without triggering an eviction, while the disk copy
+    stays put. Callers must pass a freshly built dict.
     """
     effidict[key] = value
-    if not _force_onto_disk(effidict, key):
-        pytest.skip(f"{type(effidict.replacement_strategy).__name__} never evicts {key!r}")
-
-    # Must free a *cache* slot, not just any key: deleting a filler that already
-    # spilled to disk leaves the cache full, so the rewrite below triggers another
-    # eviction and RandomReplacement may pick the target straight back out.
-    for filler in FILLER:
-        if in_cache(effidict, filler):
-            del effidict[filler]
-            break
-    else:  # pragma: no cover - defensive
-        pytest.skip("no cached filler available to evict")
-
+    _spill_to_disk(effidict, key)
     effidict[key] = value
     assert in_cache(effidict, key), "seeding failed: key is not cached"
     assert on_disk(effidict, key), "seeding failed: key is not on disk"
@@ -344,8 +315,7 @@ def test_membership_never_lists_the_keyspace(
     d["target"] = "payload"
 
     if resident:
-        if not _force_onto_disk(d, "target"):
-            pytest.skip(f"{policy_cls.__name__} never evicts the target key")
+        _spill_to_disk(d, "target")
         probe = "target"
     else:
         probe = "never-written"
@@ -385,32 +355,67 @@ def test_none_is_a_storable_value(backend_cls, policy_cls, make_dict):
 def test_none_survives_a_spill_to_disk(backend_cls, policy_cls, make_dict):
     """I1. A stored ``None`` must still read back as ``None`` from the disk tier.
 
-    Separate from the in-cache case because LIFO and MRU evict the newest entry,
-    so they never spill an early key and there is nothing to assert for them.
+    Separate from the in-cache case so the read genuinely comes from the backend
+    rather than short-circuiting on a cache hit.
     """
     d = make_dict(max_in_memory=2)
     d["nothing"] = None
 
-    if not _force_onto_disk(d, "nothing"):
-        pytest.skip(f"{policy_cls.__name__} never evicts the target key")
+    _spill_to_disk(d, "nothing")
 
     assert d["nothing"] is None
     assert "nothing" in d
     assert len(d.keys()) == len(set(d.keys()))
 
 
-def test_disk_copy_is_authoritative_after_reassignment(backend_cls, policy_cls, make_dict):
-    """I1. Overwriting a spilled key must not leave a stale copy on disk."""
+def test_eviction_writes_the_current_value(
+    backend_cls, policy_cls, make_dict, backend_spy
+):
+    """I1. Whatever the policy evicts, it must persist the value the cache held.
+
+    Covers the real eviction path, which ``_spill_to_disk`` deliberately bypasses.
+    Policy-agnostic: it asserts on whichever victim was chosen rather than trying
+    to dictate one.
+    """
+    d = make_dict(max_in_memory=2)
+    d["a"] = "va"
+    d["b"] = "vb"
+
+    with backend_spy(d.disk_backend) as spy:
+        d["c"] = "vc"
+        writes = [call for call in spy.calls if call[0] == "serialize"]
+
+    assert writes, "adding a third key to a 2-slot cache evicted nothing"
+    for _, (key, value), _ in writes:
+        assert value == f"v{key}", f"evicted {key!r} was written as {value!r}"
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "I1/I7: a reassigned key's stale disk copy can only be superseded by a "
+        "write-back, and flush() is still a stub (issue 1.4)"
+    ),
+)
+def test_reassignment_supersedes_the_stale_disk_copy(
+    backend_cls, policy_cls, make_dict
+):
+    """I1, I7. Overwriting a spilled key must not leave the old value on disk.
+
+    Immediately after the overwrite the disk copy is legitimately stale -- that is
+    what a dirty cache entry means (I2). The defect is that nothing can make disk
+    authoritative again on demand, because ``flush()`` is unimplemented.
+    """
     d = make_dict(max_in_memory=2)
     d["target"] = "first"
-    if not _force_onto_disk(d, "target"):
-        pytest.skip("policy would not evict the target key")
+    _spill_to_disk(d, "target")
+    assert d.disk_backend.deserialize("target") == "first"
 
     d["target"] = "second"
+    d.flush()
 
+    assert d.disk_backend.deserialize("target") == "second"
     assert d["target"] == "second"
-    assert _force_onto_disk(d, "target")
-    assert d["target"] == "second", "stale disk copy resurfaced after eviction"
 
 
 # --------------------------------------------------------------------------
