@@ -90,6 +90,25 @@ def is_lossy(backend_cls, kind):
     return kind in LOSSY[backend_cls]
 
 
+def in_cache(effidict, key):
+    """Whether ``key`` currently sits in the in-memory tier.
+
+    Reads today's internals. Issue 1.2 replaces the body with
+    ``effidict._store.in_cache(key)``; keeping the call site behind this helper
+    means the tier-invariant specs do not all need rewriting when it lands.
+    """
+    return key in effidict.replacement_strategy.memory
+
+
+def on_disk(effidict, key):
+    """Whether ``key`` currently sits in the persistent tier.
+
+    Uses ``keys()`` rather than ``has()`` because ``has()`` is still a contract
+    stub (issue 2.2). Becomes ``effidict._store.backend.has(key)`` in 1.2.
+    """
+    return key in effidict.disk_backend.keys()
+
+
 def assert_equal_value(actual, expected):
     """Assert two stored values are equal, handling arrays and DataFrames.
 

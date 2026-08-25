@@ -412,8 +412,14 @@ def test_mapping_api_conformance(backend_cls, policy_cls, make_dict):
     _run(MappingApiConformance, backend_cls, policy_cls, 2, make_dict)
 
 
+# Not strict, unlike every other xfail here. Whether the defect shows up depends
+# on hypothesis generating an example where the set-union order happens to differ
+# from insertion order, and with a small example budget it sometimes does not --
+# measured at roughly 1 XPASS per 6 runs of this parametrization, which would
+# redden CI at random. Issue 0.7's `test_iteration_order_is_insertion_order` is
+# the deterministic pin for #4.2 and carries the strict marker.
 @pytest.mark.xfail(
-    strict=True,
+    strict=False,
     reason="keys() returns set-union order, not insertion order (issue 4.2)",
 )
 @pytest.mark.parametrize("backend_cls, policy_cls", CROSS_SECTION)
@@ -452,7 +458,7 @@ def test_mapping_api_conformance_full_matrix(backend_cls, policy_cls, make_dict)
 
 @pytest.mark.slow
 @pytest.mark.xfail(
-    strict=True,
+    strict=False,  # probabilistic; see test_order_conformance above
     reason="keys() returns set-union order, not insertion order (issue 4.2)",
 )
 def test_order_conformance_full_matrix(backend_cls, policy_cls, make_dict):
