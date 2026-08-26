@@ -13,6 +13,7 @@ backend property.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import textwrap
@@ -282,3 +283,25 @@ def test_temporary_stores_are_unique(backend_cls):
     finally:
         for backend in (first, second):
             release_store(backend)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="temporary() is a contract stub (issue 2.1)",
+)
+def test_temporary_stores_clean_up_after_themselves(backend_cls):
+    """Releasing a temporary store must leave nothing on disk.
+
+    Asserted explicitly because ``temporary()`` puts storage outside
+    ``storage_dir`` -- somewhere under the system temp directory -- where
+    conftest's autouse leak detector cannot see it. Without this, a ``destroy()``
+    that removed only part of its storage would quietly accumulate files on
+    whatever machine ran the suite, and no test in the suite would notice.
+    """
+    backend = backend_cls.temporary()
+    path = backend.storage_path
+    assert os.path.exists(path), "temporary() did not create its storage"
+
+    release_store(backend)
+
+    assert not os.path.exists(path), f"temporary store left behind: {path}"
