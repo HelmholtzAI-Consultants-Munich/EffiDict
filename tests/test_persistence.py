@@ -13,7 +13,6 @@ backend property.
 
 from __future__ import annotations
 
-import gc
 import subprocess
 import sys
 import textwrap
@@ -22,6 +21,8 @@ from pathlib import Path
 import pytest
 
 from effidict import EffiDict, LRUReplacement
+
+from .conftest import release_store
 
 REPO_ROOT = str(Path(__file__).resolve().parents[1])
 
@@ -67,48 +68,41 @@ def test_storage_path_is_stable_across_instances(backend_cls, storage_dir):
         )
     finally:
         for backend in (first, second):
-            try:
-                backend.destroy()
-            except OSError:
-                pass
+            release_store(backend)
 
 
-@pytest.mark.keeps_storage  # deliberately abandons stores without destroy()
 @pytest.mark.xfail(
     strict=True,
     reason=(
-        "id() is recycled after GC, so a store created after an earlier one is "
-        "freed reuses its exact path (issue 2.1)"
+        "storage_path embeds id(self), which is only unique among live objects "
+        "and is recycled after GC (issue 2.1)"
     ),
 )
 def test_id_reuse_cannot_collide(backend_cls, storage_dir):
-    """Distinct stores must never be handed the same location.
+    """A store's location must not depend on a recyclable process-local address.
 
-    ``id(self)`` is only unique among *live* objects. Once the first backend is
-    collected its address is reused, and within the same clock second the derived
-    path is byte-identical -- measured at 197 collisions in 200 cycles.
+    Asserted structurally -- the path must not embed ``id(self)`` -- rather than by
+    provoking the reuse. Whether a freed address is handed straight back is
+    allocator-dependent: measured at 197 collisions in 200 cycles standalone, but
+    only about one run in three inside a test process. A probabilistic assertion
+    under ``strict=True`` would turn a lucky run into an XPASS and redden CI while
+    the defect was still present, so the mechanism is asserted instead of its
+    symptom.
 
-    What that costs, measured directly: a store abandoned without ``destroy()``
-    stays on disk, and the next store built from the same argument lands on its
-    path. Pickle, SQLite and JSON then read the previous store's values; HDF5
-    opens ``mode="w"`` and truncates it instead, so the data is destroyed rather
-    than leaked. Both are asserted here only through path uniqueness, because
-    provoking the address reuse on demand is not reliable inside a test process.
+    What the symptom costs, measured directly: a store abandoned without
+    ``destroy()`` stays on disk, and the next store built from the same argument
+    lands on its path. Pickle, SQLite and JSON then read the previous store's
+    values; HDF5 opens ``mode="w"`` and truncates it instead, destroying the data
+    rather than leaking it. Same root cause, two different failures.
     """
-    path = str(storage_dir / "cache")
-    seen = []
-
-    for _ in range(20):
-        backend = backend_cls(path)
-        seen.append(backend.storage_path)
-        del backend
-        gc.collect()
-
-    duplicates = len(seen) - len(set(seen))
-    assert duplicates == 0, (
-        f"{duplicates} of {len(seen)} sequential stores reused an earlier path; "
-        f"only {len(set(seen))} distinct locations"
-    )
+    backend = backend_cls(str(storage_dir / "cache"))
+    try:
+        assert str(id(backend)) not in backend.storage_path, (
+            f"storage path embeds id(self)={id(backend)}, so a later store can "
+            f"reuse it verbatim: {backend.storage_path}"
+        )
+    finally:
+        release_store(backend)
 
 
 # --------------------------------------------------------------------------
@@ -119,7 +113,7 @@ def test_id_reuse_cannot_collide(backend_cls, storage_dir):
 @pytest.mark.xfail(
     strict=True,
     reason=(
-        "create()/open() are contract stubs and close() destroys the storage rather than persisting it (issues 2.1, 3.1)"
+        "create()/open() and flush() are contract stubs, and close() destroys the storage rather than persisting it (issues 2.1, 1.4, 3.1)"
     ),
 )
 def test_reopen_after_close_returns_all_values(backend_cls, policy_cls, storage_dir):
@@ -142,7 +136,7 @@ def test_reopen_after_close_returns_all_values(backend_cls, policy_cls, storage_
             assert reader[key] == value, f"{key} did not survive the reopen"
         assert set(reader.keys()) == set(KEYS)
     finally:
-        reader.destroy()
+        release_store(reader)
 
 
 @pytest.mark.xfail(
@@ -161,14 +155,17 @@ def test_open_does_not_truncate_existing_store(backend_cls, storage_dir):
 
     first = backend_cls.create(path)
     first.serialize("kept", "value")
-    first.close()
-
+    # Deliberately not closed: Backend.close() does not exist, not even as a
+    # stub, and truncation happens on construction -- a second handle is enough
+    # to show it. Uses keys() rather than has(), which is a separate stub owned
+    # by issue 2.2; depending on it would keep this spec red after its own fix.
     second = backend_cls.open(path)
     try:
-        assert second.has("kept"), "opening the store truncated it"
+        assert "kept" in second.keys(), "opening the store truncated it"
         assert second.deserialize("kept") == "value"
     finally:
-        second.destroy()
+        for backend in (second, first):
+            release_store(backend)
 
 
 @pytest.mark.xfail(
@@ -197,7 +194,7 @@ def test_unflushed_writes_are_not_lost_on_close(backend_cls, policy_cls, storage
         for key, value in KEYS.items():
             assert reader[key] == value, f"{key} was lost on close()"
     finally:
-        reader.destroy()
+        release_store(reader)
 
 
 # --------------------------------------------------------------------------
@@ -257,7 +254,7 @@ def test_data_survives_process_restart(backend_cls, storage_dir):
         for key, value in KEYS.items():
             assert reader[key] == value, f"{key} did not survive the restart"
     finally:
-        reader.destroy()
+        release_store(reader)
 
 
 # --------------------------------------------------------------------------
@@ -284,7 +281,4 @@ def test_temporary_stores_are_unique(backend_cls):
         assert first.storage_path != second.storage_path
     finally:
         for backend in (first, second):
-            try:
-                backend.destroy()
-            except OSError:
-                pass
+            release_store(backend)
