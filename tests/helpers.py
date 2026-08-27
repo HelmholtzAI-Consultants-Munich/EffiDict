@@ -20,7 +20,27 @@ try:
 except ImportError:  # pragma: no cover - pandas is a dev dependency
     pd = None
 
-from effidict import Hdf5Backend, JSONBackend, PickleBackend, SqliteBackend
+from effidict import (
+    Hdf5Backend,
+    JSONBackend,
+    LFUReplacement,
+    LRUReplacement,
+    MFUReplacement,
+    MRUReplacement,
+    PickleBackend,
+    SqliteBackend,
+)
+
+#: Policies whose ``get`` writes a disk value back into the cache. Only these
+#: can mutate the cache during a read, so only these violate I6 -- several
+#: specs need to scope their expectations to this set rather than assuming the
+#: defect is universal.
+PROMOTING_POLICIES = {
+    LRUReplacement,
+    MRUReplacement,
+    LFUReplacement,
+    MFUReplacement,
+}
 
 
 def _ndarray():
