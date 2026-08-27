@@ -31,7 +31,7 @@ import shutil
 
 import pytest
 
-from effidict import EffiDict, LRUReplacement
+from effidict import EffiDict
 
 from .conftest import release_store
 

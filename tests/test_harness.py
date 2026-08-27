@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from .conftest import BACKENDS, POLICIES
+from .conftest import BACKENDS
 from .helpers import (
     UNSUPPORTED,
     VALUE_KINDS,
