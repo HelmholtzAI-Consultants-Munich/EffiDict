@@ -32,6 +32,49 @@ POLICY_NAMES = ["Random", "FIFO", "LIFO", "LRU", "MRU", "LFU", "MFU"]
 
 DETERMINISTIC = [name for name in POLICY_NAMES if name != "Random"]
 
+#: Constructor parameters a policy may accept. Empty on purpose: bookkeeping
+#: needs no configuration, and an empty allowlist is the only version of this
+#: check that cannot be walked around. If a policy ever needs something -- a
+#: ``seed`` for Random, say -- that is a deliberate amendment here, not an
+#: incidental widening.
+ALLOWED_INIT_PARAMS = frozenset()
+
+
+class _FakeBackend:
+    """Quacks like a ``DiskBackend`` so an accidental injection is detectable.
+
+    Every method records itself rather than raising, so a policy that both
+    accepts *and uses* a backend is reported with the call it made instead of
+    failing somewhere further down the stack.
+    """
+
+    def __init__(self):
+        self.calls = set()
+
+    def _record(self, name):
+        self.calls.add(name)
+
+    def serialize(self, key, value):
+        self._record("serialize")
+
+    def deserialize(self, key):
+        self._record("deserialize")
+        raise KeyError(key)
+
+    def del_item(self, key):
+        self._record("del_item")
+
+    def keys(self):
+        self._record("keys")
+        return []
+
+    def has(self, key):
+        self._record("has")
+        return False
+
+    def destroy(self):
+        self._record("destroy")
+
 
 def _policy_class(name):
     """Resolve ``effidict.policies.<name>Policy``, or explain what is missing.
@@ -184,27 +227,75 @@ def test_mfu_evicts_the_most_frequently_used():
 def test_policy_never_touches_the_backend(name):
     """A policy must have no way to reach storage.
 
-    Asserted structurally, because 'does not write to disk' is not observable
-    from the outside once the coupling exists: today every ``*Replacement`` takes
-    a backend and serializes its own victims, which is what makes them impossible
-    to unit-test without a filesystem.
+    Today every ``*Replacement`` takes a backend and serializes its own victims,
+    which is what makes them impossible to unit-test without a filesystem.
+
+    Checked four ways, because no single one is sufficient. A denylist of
+    parameter names is the weakest: it misses ``*args``/``**kwargs``, which can
+    smuggle a backend past any name check, and it misses an unlisted name like
+    ``be`` or ``sink``. So the signature checks use an allowlist, and the load
+    bearing assertion is the third -- actually attempting the injection and
+    demanding it be refused.
     """
     cls = _policy_class(name)
+    signature = inspect.signature(cls.__init__)
+    parameters = {
+        name: parameter
+        for name, parameter in signature.parameters.items()
+        if name != "self"
+    }
 
-    parameters = set(inspect.signature(cls.__init__).parameters) - {"self"}
-    forbidden = {"disk_backend", "backend", "storage", "store"}
-    assert not (parameters & forbidden), (
-        f"{cls.__name__}.__init__ accepts {sorted(parameters & forbidden)}"
-    )
+    # 1. No variadics. Without this the allowlist below means nothing, since
+    #    anything at all can be passed through *args/**kwargs. Skipped when the
+    #    class does not define __init__ at all: object.__init__ reports
+    #    (*args, **kwargs) but refuses every argument, which check 3 confirms.
+    if cls.__init__ is not object.__init__:
+        variadic = sorted(
+            name
+            for name, parameter in parameters.items()
+            if parameter.kind
+            in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+        )
+        assert not variadic, (
+            f"{cls.__name__}.__init__ accepts {variadic}, so a backend can be "
+            f"passed regardless of what the parameters are called"
+        )
 
+        # 2. Allowlist, not denylist: a policy needs no construction arguments.
+        unexpected = sorted(set(parameters) - ALLOWED_INIT_PARAMS)
+        assert not unexpected, (
+            f"{cls.__name__}.__init__ accepts {unexpected}; a pure bookkeeping "
+            f"policy takes no arguments"
+        )
+
+    # 3. Attempt the injection. This is what closes the *args/**kwargs loophole:
+    #    a policy that quietly swallows and stores a backend fails here even
+    #    though its signature looks clean.
+    fake = _FakeBackend()
+    attempts = {
+        "positionally": lambda: cls(fake),
+        "as disk_backend=": lambda: cls(disk_backend=fake),
+        "as backend=": lambda: cls(backend=fake),
+    }
+    for description, attempt in attempts.items():
+        with pytest.raises(TypeError):
+            attempt()
+        assert not fake.calls, (
+            f"{cls.__name__} accepted a backend {description} and called "
+            f"{sorted(fake.calls)} on it"
+        )
+
+    # 4. Nothing backend-like survives real use.
     policy = cls()
     policy.on_insert("a")
-    attributes = {
-        name: value
-        for name, value in vars(policy).items()
+    policy.on_access("a")
+    policy.victim()
+    held = sorted(
+        attribute
+        for attribute, value in vars(policy).items()
         if hasattr(value, "serialize") or hasattr(value, "deserialize")
-    }
-    assert not attributes, f"{cls.__name__} holds a backend-like object: {sorted(attributes)}"
+    )
+    assert not held, f"{cls.__name__} holds a backend-like object: {held}"
 
 
 @pytest.mark.xfail(
