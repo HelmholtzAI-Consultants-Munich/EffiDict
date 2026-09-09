@@ -267,12 +267,21 @@ def test_eq_does_not_mutate_either_operand(
     before_left = set(left.replacement_strategy.memory)
     before_right = set(right.replacement_strategy.memory)
 
-    with backend_spy(left.disk_backend) as spy:
-        assert left == right
+    # Both operands are spied. __eq__ walks self.items() *and* reads other[key],
+    # so the right-hand store is promoted too -- watching only the left would let
+    # a mutation of the right slip past the assertion this test makes.
+    with backend_spy(left.disk_backend) as left_spy:
+        with backend_spy(right.disk_backend) as right_spy:
+            assert left == right
 
-        assert spy.count("serialize") == 0, (
-            f"comparing issued {spy.count('serialize')} writes to the left operand"
-        )
+            assert left_spy.count("serialize") == 0, (
+                f"comparing issued {left_spy.count('serialize')} writes to the "
+                f"left operand"
+            )
+            assert right_spy.count("serialize") == 0, (
+                f"comparing issued {right_spy.count('serialize')} writes to the "
+                f"right operand"
+            )
 
     assert set(left.replacement_strategy.memory) == before_left, (
         "comparing changed the left operand's cache contents"
