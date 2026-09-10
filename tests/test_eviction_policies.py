@@ -48,6 +48,31 @@ KEY_ALPHA = "alpha-9f2c"
 KEY_BETA = "beta-9f2c"
 
 
+
+def _instance_state(obj):
+    """Attribute name -> value for ``obj``, covering ``__dict__`` and ``__slots__``.
+
+    ``vars()`` alone is not enough: a policy declaring ``__slots__`` for
+    compactness has no ``__dict__``, and ``vars()`` raises ``TypeError`` on it --
+    which would make these specs fail for a reason that has nothing to do with
+    state leaking.
+    """
+    state = {}
+    if hasattr(obj, "__dict__"):
+        try:
+            state.update(vars(obj))
+        except TypeError:  # pragma: no cover - defensive
+            pass
+    for klass in type(obj).__mro__:
+        slots = getattr(klass, "__slots__", ())
+        if isinstance(slots, str):
+            slots = (slots,)
+        for slot in slots or ():
+            if hasattr(obj, slot):
+                state[slot] = getattr(obj, slot)
+    return state
+
+
 def _residual_state(policy):
     """Attributes still holding anything after every key has been removed.
 
@@ -58,7 +83,7 @@ def _residual_state(policy):
     ``Sized`` covers all of those and anything else defining ``__len__``.
     """
     residual = {}
-    for attribute, value in vars(policy).items():
+    for attribute, value in _instance_state(policy).items():
         if isinstance(value, (str, bytes)):
             continue
         if isinstance(value, abc.Sized) and len(value) > 0:
@@ -105,10 +130,12 @@ def _reachable_keys(root, targets, max_depth=8):
                 stack.append((item, depth + 1))
             continue
 
-        state = getattr(obj, "__dict__", None)
-        if isinstance(state, dict):
-            for value in state.values():
-                stack.append((value, depth + 1))
+        # Pushed as a mapping rather than iterating its values, so attribute
+        # *names* are examined too: a policy doing setattr(self, key, ...) keeps
+        # every key as an attribute name, where a values-only walk sees nothing.
+        state = _instance_state(obj)
+        if state:
+            stack.append((state, depth + 1))
     return found
 
 
