@@ -391,7 +391,7 @@ def test_policy_never_touches_the_backend(name):
     policy.victim()
     held = sorted(
         attribute
-        for attribute, value in vars(policy).items()
+        for attribute, value in _instance_state(policy).items()
         if hasattr(value, "serialize") or hasattr(value, "deserialize")
     )
     assert not held, f"{cls.__name__} holds a backend-like object: {held}"
