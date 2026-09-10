@@ -19,27 +19,11 @@ import threading
 
 import pytest
 
-from effidict import (
-    DiskBackend,
-    EvictionPolicy,
-    LFUReplacement,
-    LRUReplacement,
-    MFUReplacement,
-    MRUReplacement,
-)
+from effidict import DiskBackend, EvictionPolicy
 
-from .helpers import in_cache, on_disk
+from .helpers import PROMOTING_POLICIES, in_cache, on_disk
 
 FILLER = [f"filler{i}" for i in range(12)]
-
-#: Policies whose ``get`` writes a disk value back into the cache. Only these can
-#: evict a clean entry, so only these violate I5 on a read-only pass.
-PROMOTING_POLICIES = {
-    LRUReplacement,
-    MRUReplacement,
-    LFUReplacement,
-    MFUReplacement,
-}
 
 
 def _spill_to_disk(effidict, key):
