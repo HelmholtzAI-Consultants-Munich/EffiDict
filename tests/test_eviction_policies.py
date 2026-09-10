@@ -25,6 +25,7 @@ The semantics being pinned:
 from __future__ import annotations
 
 import inspect
+from collections import abc
 
 import pytest
 
@@ -38,6 +39,77 @@ DETERMINISTIC = [name for name in POLICY_NAMES if name != "Random"]
 #: ``seed`` for Random, say -- that is a deliberate amendment here, not an
 #: incidental widening.
 ALLOWED_INIT_PARAMS = frozenset()
+
+
+#: Distinctive key names. Single letters would make the repr check below
+#: unusable: "a" appears in "defaultdict", so an empty defaultdict attribute
+#: would read as a leak.
+KEY_ALPHA = "alpha-9f2c"
+KEY_BETA = "beta-9f2c"
+
+
+def _residual_state(policy):
+    """Attributes still holding anything after every key has been removed.
+
+    Type-agnostic on purpose. Checking ``dict``/``set``/``list`` by name would
+    miss ``collections.deque`` -- the obvious way to implement FIFO and LIFO
+    ordering -- along with tuple, frozenset and any custom container, so a policy
+    could retain every key it was told to forget and this test would still pass.
+    ``Sized`` covers all of those and anything else defining ``__len__``.
+    """
+    residual = {}
+    for attribute, value in vars(policy).items():
+        if isinstance(value, (str, bytes)):
+            continue
+        if isinstance(value, abc.Sized) and len(value) > 0:
+            residual[attribute] = value
+    return residual
+
+
+
+def _reachable_keys(root, targets, max_depth=8):
+    """Which ``targets`` are still reachable from ``root``.
+
+    Walks mappings, sequences, sets and plain object ``__dict__``s. The Sized
+    check above misses state with no ``__len__`` -- a hand-rolled linked list of
+    nodes, for instance -- and a repr scan misses it too, because a custom class
+    with the default repr never shows the key it holds. Reachability is the only
+    formulation that does not depend on how the state is shaped.
+
+    Deliberately does not iterate arbitrary iterables: consuming a generator
+    would mutate the thing under test.
+    """
+    found = set()
+    seen = set()
+    stack = [(root, 0)]
+    while stack:
+        obj, depth = stack.pop()
+        if depth > max_depth or id(obj) in seen:
+            continue
+        seen.add(id(obj))
+
+        if isinstance(obj, str):
+            if obj in targets:
+                found.add(obj)
+            continue
+        if isinstance(obj, (bytes, bytearray, int, float, bool, type(None))):
+            continue
+
+        if isinstance(obj, abc.Mapping):
+            for key, value in obj.items():
+                stack.append((key, depth + 1))
+                stack.append((value, depth + 1))
+            continue
+        if isinstance(obj, (abc.Sequence, abc.Set)):
+            for item in obj:
+                stack.append((item, depth + 1))
+            continue
+
+        state = getattr(obj, "__dict__", None)
+        if isinstance(state, dict):
+            for value in state.values():
+                stack.append((value, depth + 1))
+    return found
 
 
 class _FakeBackend:
@@ -311,25 +383,30 @@ def test_forget_removes_all_policy_state(name):
     selected as a victim later, when the cache no longer holds it.
     """
     policy = _policy_class(name)()
-    for key in ("a", "b"):
+    for key in (KEY_ALPHA, KEY_BETA):
         policy.on_insert(key)
-    policy.on_access("a")
-    policy.on_access("a")
+    policy.on_access(KEY_ALPHA)
+    policy.on_access(KEY_ALPHA)
 
-    policy.on_remove("a")
+    policy.on_remove(KEY_ALPHA)
 
-    assert policy.victim() == "b", "a survived on_remove and was chosen as victim"
+    assert policy.victim() == KEY_BETA, (
+        f"{KEY_ALPHA} survived on_remove and was chosen as victim"
+    )
 
-    policy.on_remove("b")
+    policy.on_remove(KEY_BETA)
     with pytest.raises(KeyError):
         policy.victim()
 
-    leftovers = {
-        attribute: value
-        for attribute, value in vars(policy).items()
-        if isinstance(value, (dict, set, list)) and value
-    }
-    assert not leftovers, f"state survived removal of every key: {leftovers}"
+    residual = _residual_state(policy)
+    assert not residual, f"state survived removal of every key: {residual}"
+
+    # Catch-all for state that is not Sized -- a hand-rolled linked list, say --
+    # where the keys stay reachable but len() does not exist.
+    reachable = _reachable_keys(policy, {KEY_ALPHA, KEY_BETA})
+    assert not reachable, (
+        f"{sorted(reachable)} are still reachable from the policy after removal"
+    )
 
 
 @pytest.mark.xfail(
