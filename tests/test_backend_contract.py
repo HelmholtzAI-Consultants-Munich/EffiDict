@@ -19,7 +19,13 @@ from unittest import mock
 
 import pytest
 
-from effidict import Hdf5Backend, JSONBackend, PickleBackend, SqliteBackend
+from effidict import (
+    Hdf5Backend,
+    JSONBackend,
+    PickleBackend,
+    RandomReplacement,
+    SqliteBackend,
+)
 
 from .helpers import (
     UNSUPPORTED,
@@ -127,6 +133,12 @@ def test_value_domain_is_enforced(backend_cls, storage_dir):
             message = str(excinfo.value)
             assert backend_cls.__name__ in message, (
                 f"{kind}: error does not name the backend: {message}"
+            )
+            # Naming the backend alone is not actionable -- TypeError("SqliteBackend")
+            # would satisfy it. The caller also needs to know *what* was refused.
+            assert type(value).__name__ in message, (
+                f"{kind}: error does not name the rejected type "
+                f"{type(value).__name__!r}: {message}"
             )
     finally:
         try:
@@ -291,12 +303,21 @@ def test_batch_and_single_writes_are_equivalent(backend_cls, policy_cls, make_di
     # pulls it into the cache -- so asserting on cache size after the value
     # checks below would measure the reads this test performed rather than what
     # the bulk load did, and would pass on exactly the policies it should catch.
-    bulk_cached = len(in_bulk.replacement_strategy.memory)
-    individual_cached = len(one_at_a_time.replacement_strategy.memory)
-    assert bulk_cached == individual_cached, (
-        f"bulk load left {bulk_cached} entries in the cache where the equivalent "
-        f"individual writes left {individual_cached}"
-    )
+    bulk_cached = set(in_bulk.replacement_strategy.memory)
+    individual_cached = set(one_at_a_time.replacement_strategy.memory)
+    if policy_cls is RandomReplacement:
+        # Random picks its victims by coin flip, so two stores given identical
+        # writes legitimately retain different keys. Only the population size is
+        # a meaningful comparison.
+        assert len(bulk_cached) == len(individual_cached), (
+            f"bulk load left {len(bulk_cached)} entries in the cache where the "
+            f"equivalent individual writes left {len(individual_cached)}"
+        )
+    else:
+        assert bulk_cached == individual_cached, (
+            f"bulk load left {sorted(bulk_cached)} in the cache where the "
+            f"equivalent individual writes left {sorted(individual_cached)}"
+        )
 
     assert set(in_bulk.keys()) == set(one_at_a_time.keys())
     for key, value in items.items():
