@@ -19,8 +19,6 @@ import pytest
 
 from effidict import Hdf5Backend, JSONBackend, PickleBackend
 
-from .helpers import on_disk
-
 #: Keys that exercise the boundary between "key as data" and "key as location".
 KEY_PROBES = {
     "separator": "a/b",
@@ -147,34 +145,29 @@ def probe_backend(backend_cls, storage_dir):
 
 
 def _with_int_key_on_disk(make_dict, key=1):
-    """A store where ``key`` has reached the disk tier, whatever the policy.
+    """A store where ``key`` has reached the disk tier, deterministically.
 
-    Two write orders are needed, the same split as in the tier-invariant specs:
-    most policies evict an *older* entry, so writing the probe first and then
-    filler pushes it out; LIFO and MRU evict the entry just inserted, so the
-    cache has to be full *before* the probe is written. Returns ``None`` only if
-    neither order spills it.
+    The write goes through ``__setitem__`` first, so the dict-level path is
+    exercised and a backend that refuses the key still raises from here. The spill
+    itself is then forced by calling the backend and dropping the cache copy --
+    the same two operations an eviction performs -- rather than by provoking the
+    policy into choosing this key.
+
+    Provoking it is not viable. LIFO and MRU never evict an early key, and
+    ``RandomReplacement`` picks its victim by coin flip, so any bounded number of
+    filler writes leaves a nonzero chance the probe never spills. That would turn
+    a matrix case into a silent skip, which is worse than not having the test at
+    all. Same reasoning, and the same technique, as ``_spill_to_disk`` in the
+    tier-invariant specs.
 
     ``TypeError`` is deliberately allowed to propagate -- for Pickle and HDF5 that
     is the rejection path the caller wants to inspect.
     """
-    for fill_first in (False, True):
-        store = make_dict(max_in_memory=1)
-        if fill_first:
-            store["filler-pre"] = "v"
-        store[key] = "one"
-
-        # Keep filling and re-checking in *both* orders. RandomReplacement picks
-        # its victim by coin flip, so a fixed number of writes -- or a single
-        # check -- leaves whether the probe spills up to chance, and this contract
-        # check would silently skip a matrix case.
-        for index in range(40):
-            if on_disk(store, key) or on_disk(store, str(key)):
-                return store
-            store[f"filler{index}"] = "v"
-        if on_disk(store, key) or on_disk(store, str(key)):
-            return store
-    return None
+    store = make_dict(max_in_memory=4)
+    store[key] = "one"
+    store.disk_backend.serialize(key, "one")
+    store.replacement_strategy.delete(key)
+    return store
 
 
 def _xfail_if_broken(request, label, backend_cls):
@@ -229,14 +222,13 @@ def test_non_string_keys_are_rejected_or_roundtrip(backend_cls, policy_cls, make
         )
         return
 
-    if d is None:  # pragma: no cover - no policy should reach this
-        pytest.skip(f"{policy_cls.__name__} never spilled the probe key")
-
-    # Accepted, so it must have survived unchanged.
-    assert d[1] == "one"
-    assert 1 in d
+    # Accepted, so it must have survived unchanged. Membership is asserted before
+    # the value, so a coerced key fails cleanly here rather than raising KeyError
+    # out of the subscript.
+    assert 1 in d, "the integer key vanished once it reached disk"
     assert "1" not in d, "the integer key was coerced to a string"
     assert "1" not in d.keys(), f"keys() reports a coerced duplicate: {d.keys()}"
+    assert d[1] == "one"
 
 
 # --------------------------------------------------------------------------
