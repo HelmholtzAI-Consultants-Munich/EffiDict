@@ -221,12 +221,13 @@ def test_decode_failure_is_not_reported_as_missing_key(request, backend_cls, bac
         with pytest.raises(Exception) as excinfo:  # noqa: PT011 - type is the point
             backend.deserialize("present")
 
-    reported_as_missing = (
-        isinstance(excinfo.value, KeyError) and excinfo.value.args[0] == "present"
-    )
-    assert not reported_as_missing, (
-        "a decode failure was reported as KeyError('present'), indistinguishable "
-        "from the key simply not being there"
+    # The injected failure must reach the caller unchanged. Asserting only that
+    # it is not KeyError('present') would accept a backend that swallowed it and
+    # raised some other KeyError, or wrapped it in a way that still reads as a
+    # miss -- the payload was not decoded either way.
+    assert excinfo.value is sentinel, (
+        f"a decode failure surfaced as {excinfo.value!r} instead of propagating; "
+        f"the caller cannot tell it apart from the key simply not being there"
     )
 
 

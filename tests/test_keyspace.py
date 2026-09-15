@@ -48,18 +48,29 @@ BROKEN_KEYS = {
 TRAVERSAL_ESCAPES = {PickleBackend, JSONBackend}
 
 
-def _is_inside(path, root):
-    """Whether ``path`` lies within ``root``, comparing resolved paths.
+def _contains(root, path):
+    """Whether ``path`` lies within ``root``, comparing the paths as given.
 
     ``startswith`` is not containment: ``<root>-escaped`` shares the prefix but is
-    a sibling, and an unresolved symlink can point anywhere at all. Since this is
-    the traversal guard, it compares real paths via ``commonpath``.
+    a sibling, so this compares path components via ``commonpath``.
     """
-    root = os.path.realpath(root)
     try:
-        return os.path.commonpath([os.path.realpath(path), root]) == root
+        return os.path.commonpath([path, root]) == root
     except ValueError:  # different drives on Windows
         return False
+
+
+def _is_inside(path, root):
+    """Whether ``path`` is within ``root`` both lexically and after resolution.
+
+    Both halves are required. Resolution alone would skip a symlink planted
+    *beside* the store that points into it -- the entry was still created outside,
+    which is exactly what the traversal guard exists to catch. Lexical alone would
+    skip a symlink *inside* the store that points out of it.
+    """
+    return _contains(os.path.abspath(root), os.path.abspath(path)) and _contains(
+        os.path.realpath(root), os.path.realpath(path)
+    )
 
 
 def _entries_outside(backend):
@@ -78,7 +89,11 @@ def _entries_outside(backend):
     ``os.walk`` does not follow symlinks, so a symlinked directory is reported as
     an entry rather than silently traversed.
     """
-    store = os.path.realpath(backend.storage_path)
+    # Passed through unresolved: _is_inside normalises both sides itself, and
+    # handing it an already-resolved root would compare a realpath against an
+    # abspath. On macOS /var is a symlink to /private/var, so that mismatch makes
+    # every entry -- including the store -- look like an escape.
+    store = backend.storage_path
     root = os.path.dirname(os.path.dirname(backend.storage_path))
 
     # Ancestors are matched on the entry's own path, never on where it resolves
