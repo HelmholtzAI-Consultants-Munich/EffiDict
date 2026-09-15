@@ -43,8 +43,14 @@ BROKEN_KEYS = {
 }
 
 #: Backends that write a key's value *outside* the storage directory when the key
-#: contains ``..``. A containment failure, distinct from mere corruption: HDF5
-#: mangles such a key but keeps everything inside its single file.
+#: contains ``..``. A containment failure, distinct from mere corruption.
+#:
+#: HDF5 is not one of them, and the distinction is worth stating because the two
+#: failures look alike from the outside. ``create_dataset("../escaped", ...)``
+#: succeeds and builds a group literally named ``..`` inside the file --
+#: ``/.. (Group)``, ``/../escaped (Dataset)`` -- so ``keys()`` reports ``'..'``,
+#: the key does not round-trip, and nothing is written outside the store. Mangled
+#: but contained.
 TRAVERSAL_ESCAPES = {PickleBackend, JSONBackend}
 
 
@@ -223,7 +229,16 @@ def test_non_string_keys_are_rejected_or_roundtrip(backend_cls, policy_cls, make
     respectively, so the message says nothing about keys needing to be strings.
 
     Both outcomes in the name are accepted, because either is a defensible
-    contract; what is not acceptable is accepting the key and changing it. The
+    contract; what is not acceptable is accepting the key and changing it.
+
+    "Rejected" is pinned to one exact shape rather than left open: a ``TypeError``
+    whose message says that keys must be strings. ``TypeError`` is what ``dict``
+    itself raises for a key it cannot accept, and a spec that accepted any
+    exception with any wording would not constrain the implementation at all. If
+    issue 7.1 wants a different exception or phrasing, this assertion is the place
+    to change it deliberately.
+
+    The
     integer has to be pushed out to disk first: while it sits in the cache the
     in-memory dict preserves it perfectly, so a test that never evicts would
     report success on a store that corrupts the key the moment it spills.
@@ -254,9 +269,10 @@ def test_non_string_keys_are_rejected_or_roundtrip(backend_cls, policy_cls, make
 def test_keys_containing_path_separators(request, backend_cls, probe_backend):
     """``'a/b'`` is a legal dict key and must round-trip as one key.
 
-    HDF5 is the quiet one: ``/`` creates a nested group, so the write succeeds and
-    ``keys()`` reports ``'a'``. The value is still there, addressed by a key the
-    caller never used.
+    HDF5 is the quiet one. ``create_dataset`` creates missing parent groups, so
+    the write succeeds and the file ends up holding ``/a (Group)`` and
+    ``/a/b (Dataset)``; ``keys()`` then reports ``'a'``. The value is still there,
+    addressed by a key the caller never used.
     """
     _xfail_if_broken(request, "separator", backend_cls)
 

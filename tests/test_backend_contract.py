@@ -49,6 +49,24 @@ DECODE_HOOK = {
 MASKS_DECODE_FAILURE = {Hdf5Backend}
 
 
+
+def _policy_state(store):
+    """Everything that decides the policy's next victim.
+
+    Cached *membership* is not enough. FIFO, LIFO, LRU and MRU choose by position,
+    so two caches holding the same keys in a different order evict differently;
+    LFU and MFU choose by the counts in ``secondary_memory``, which membership
+    does not see at all. A bulk load could therefore match on keys and still
+    behave differently on the very next write.
+    """
+    policy = store.replacement_strategy
+    state = {"order": list(policy.memory.keys())}
+    frequencies = getattr(policy, "secondary_memory", None)
+    if frequencies is not None:
+        state["frequencies"] = dict(frequencies)
+    return state
+
+
 @pytest.fixture
 def backend(backend_cls, storage_dir):
     instance = backend_cls(str(storage_dir / "store"))
@@ -304,20 +322,22 @@ def test_batch_and_single_writes_are_equivalent(backend_cls, policy_cls, make_di
     # pulls it into the cache -- so asserting on cache size after the value
     # checks below would measure the reads this test performed rather than what
     # the bulk load did, and would pass on exactly the policies it should catch.
-    bulk_cached = set(in_bulk.replacement_strategy.memory)
-    individual_cached = set(one_at_a_time.replacement_strategy.memory)
+    bulk_state = _policy_state(in_bulk)
+    individual_state = _policy_state(one_at_a_time)
     if policy_cls is RandomReplacement:
         # Random picks its victims by coin flip, so two stores given identical
-        # writes legitimately retain different keys. Only the population size is
-        # a meaningful comparison.
-        assert len(bulk_cached) == len(individual_cached), (
-            f"bulk load left {len(bulk_cached)} entries in the cache where the "
-            f"equivalent individual writes left {len(individual_cached)}"
+        # writes legitimately retain different keys -- and therefore a different
+        # order. Only the population size is a meaningful comparison.
+        assert len(bulk_state["order"]) == len(individual_state["order"]), (
+            f"bulk load left {len(bulk_state['order'])} entries in the cache "
+            f"where the equivalent individual writes left "
+            f"{len(individual_state['order'])}"
         )
     else:
-        assert bulk_cached == individual_cached, (
-            f"bulk load left {sorted(bulk_cached)} in the cache where the "
-            f"equivalent individual writes left {sorted(individual_cached)}"
+        assert bulk_state == individual_state, (
+            f"bulk load left the policy in a different state:\n"
+            f"  bulk:       {bulk_state}\n"
+            f"  individual: {individual_state}"
         )
 
     assert set(in_bulk.keys()) == set(one_at_a_time.keys())
