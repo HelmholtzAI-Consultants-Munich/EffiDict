@@ -505,6 +505,14 @@ def test_pop_without_default_raises_keyerror(backend_cls, policy_cls, make_dict)
     with pytest.raises(KeyError):
         d.pop("never-written")
 
+    # An explicitly supplied None must still be returned, not raised. Without
+    # this, an implementation using `default is None` as its omission sentinel
+    # would satisfy the assertion above while breaking pop(key, None) -- which is
+    # the likely shape of a careless fix, since the signature is already
+    # pop(key, default=None).
+    assert d.pop("never-written", None) is None
+    assert d.pop("never-written", "fallback") == "fallback"
+
     # A stored None must stay distinguishable from a miss.
     d["nothing"] = None
     assert d.pop("nothing") is None

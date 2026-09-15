@@ -64,15 +64,47 @@ def _is_inside(path, root):
         return False
 
 
-def _files_outside(backend):
-    """Every file under the store's parent tree that is not inside the store."""
+def _entries_outside(backend):
+    """Every filesystem entry under the store's parent tree that is not the store.
+
+    Directories are scanned as well as files. A files-only walk cannot see an
+    escaped *empty* directory or a symlinked one, and a sharded layout that
+    creates a directory per key prefix is exactly the shape issue 7.1 may
+    introduce -- so the guard has to hold for the implementation that replaces
+    today's, not just for today's.
+
+    The store's own ancestors are exempt: they are how you reach the store, not
+    an escape. Without that exemption every run would report the store's parent
+    directory and the check would be useless.
+
+    ``os.walk`` does not follow symlinks, so a symlinked directory is reported as
+    an entry rather than silently traversed.
+    """
+    store = os.path.realpath(backend.storage_path)
     root = os.path.dirname(os.path.dirname(backend.storage_path))
-    return [
-        os.path.relpath(os.path.join(dirpath, filename), root)
-        for dirpath, _, filenames in os.walk(root)
-        for filename in filenames
-        if not _is_inside(os.path.join(dirpath, filename), backend.storage_path)
-    ]
+
+    # Ancestors are matched on the entry's own path, never on where it resolves
+    # to. Resolving first would exempt a symlink whose *target* is an ancestor,
+    # so planting a link beside the store would hide it from this check.
+    ancestors = set()
+    current = os.path.dirname(os.path.abspath(backend.storage_path))
+    while True:
+        ancestors.add(current)
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+
+    outside = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        for name in list(dirnames) + list(filenames):
+            entry = os.path.join(dirpath, name)
+            if _is_inside(entry, store):
+                continue
+            if os.path.abspath(entry) in ancestors:
+                continue
+            outside.append(os.path.relpath(entry, root))
+    return sorted(outside)
 
 
 def _roundtrip(backend, key, value="v"):
@@ -86,7 +118,7 @@ def _roundtrip(backend, key, value="v"):
     except Exception as exc:  # noqa: BLE001 - the exception type is the finding
         return type(exc).__name__
 
-    if _files_outside(backend):
+    if _entries_outside(backend):
         return "escapes"
     if key not in backend.keys():
         return "corrupt"
@@ -129,13 +161,17 @@ def _with_int_key_on_disk(make_dict, key=1):
     for fill_first in (False, True):
         store = make_dict(max_in_memory=1)
         if fill_first:
-            store["filler"] = "v"
+            store["filler-pre"] = "v"
         store[key] = "one"
-        if not fill_first:
-            for index in range(8):
-                if on_disk(store, key) or on_disk(store, str(key)):
-                    break
-                store[f"filler{index}"] = "v"
+
+        # Keep filling and re-checking in *both* orders. RandomReplacement picks
+        # its victim by coin flip, so a fixed number of writes -- or a single
+        # check -- leaves whether the probe spills up to chance, and this contract
+        # check would silently skip a matrix case.
+        for index in range(40):
+            if on_disk(store, key) or on_disk(store, str(key)):
+                return store
+            store[f"filler{index}"] = "v"
         if on_disk(store, key) or on_disk(store, str(key)):
             return store
     return None
@@ -247,7 +283,7 @@ def test_key_traversal_is_neutralised(request, backend_cls, probe_backend):
     except Exception:  # noqa: BLE001 - refusal is an acceptable outcome
         pass
 
-    outside = _files_outside(probe_backend)
+    outside = _entries_outside(probe_backend)
     assert not outside, f"a '..' key wrote outside the store: {outside}"
 
 
