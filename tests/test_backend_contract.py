@@ -101,15 +101,23 @@ def test_backend_declares_its_value_domain(backend_cls, backend):
     it and read the traceback. A ``supports()`` predicate makes the domain part of
     the contract -- and is cross-checked here against what ``serialize`` actually
     does, because a declaration nobody verifies drifts.
+
+    Called on the *instance*, not the class. Every other backend operation is an
+    instance method, so ``def supports(self, value)`` is the natural
+    implementation, and a class-level call would hand it ``value`` as ``self``.
+    Going through the instance also accepts a ``classmethod`` or ``staticmethod``,
+    so it constrains the signature less while still being correct -- and once
+    issue 4.3 makes the codec pluggable, the value domain genuinely depends on
+    which codec the instance was built with.
     """
-    assert hasattr(backend_cls, "supports"), (
+    assert hasattr(backend, "supports"), (
         f"{backend_cls.__name__} does not declare its value domain"
     )
 
     disagreements = []
     for kind in sorted(VALUE_KINDS):
         value = _value_for(kind)
-        declared = backend_cls.supports(value)
+        declared = backend.supports(value)
         try:
             backend.serialize(f"probe-{kind}", value)
             actual = True
