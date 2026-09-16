@@ -389,9 +389,27 @@ def test_clear_conformance_full_matrix(
 
 # -- rule groups: cross-section, one cache size --------------------------
 
+# A strict xfail on a state machine is a bet that hypothesis's search finds the
+# defect on every seed, within the example budget. It does not: the order machine
+# XPASSed about one run in six, and pop_conformance_full_matrix[Hdf5-LIFO] XPASSed
+# once in a full-suite run and then not again in 13 targeted runs. The
+# deterministic pin for each defect lives elsewhere and carries the strict marker:
+#
+#   pop, disk copy   -> 0.4  test_pop_removes_key_from_both_tiers     (28 combos)
+#   pop, missing key -> below test_pop_without_default_raises_keyerror (28 combos)
+#   mapping API      -> 0.7  test_mutablemapping_surface_is_complete  (28 combos)
+#   order            -> 0.7  test_iteration_order_is_insertion_order  (28 combos)
+#
+# PopConformance documents two defects and 0.4 only pins one of them, so the
+# missing-key case gets its own deterministic pin here rather than losing its
+# signal when this machine stops being strict.
+#
+# So these machines document the property and stay non-strict; losing an XPASS
+# signal here costs nothing, because the pin still flips.
+
 
 @pytest.mark.xfail(
-    strict=True,
+    strict=False,  # probabilistic; see the note above
     reason=(
         "two pop defects (issue 1.2): pop(key) with no default returns None "
         "instead of raising KeyError, and pop removes only the memory copy so a "
@@ -404,7 +422,7 @@ def test_pop_conformance(backend_cls, policy_cls, make_dict):
 
 
 @pytest.mark.xfail(
-    strict=True,
+    strict=False,  # probabilistic; see the note above
     reason="get/setdefault/update/popitem raise NotImplementedError (issue 6.1)",
 )
 @pytest.mark.parametrize("backend_cls, policy_cls", CROSS_SECTION)
@@ -436,7 +454,7 @@ def test_order_conformance(backend_cls, policy_cls, make_dict):
 
 @pytest.mark.slow
 @pytest.mark.xfail(
-    strict=True,
+    strict=False,  # probabilistic; see the note above
     reason=(
         "two pop defects (issue 1.2): pop(key) with no default returns None "
         "instead of raising KeyError, and pop removes only the memory copy so a "
@@ -449,7 +467,7 @@ def test_pop_conformance_full_matrix(backend_cls, policy_cls, make_dict):
 
 @pytest.mark.slow
 @pytest.mark.xfail(
-    strict=True,
+    strict=False,  # probabilistic; see the note above
     reason="get/setdefault/update/popitem raise NotImplementedError (issue 6.1)",
 )
 def test_mapping_api_conformance_full_matrix(backend_cls, policy_cls, make_dict):
@@ -463,6 +481,43 @@ def test_mapping_api_conformance_full_matrix(backend_cls, policy_cls, make_dict)
 )
 def test_order_conformance_full_matrix(backend_cls, policy_cls, make_dict):
     _run(OrderConformance, backend_cls, policy_cls, 2, make_dict)
+
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "pop() is declared pop(key, default=None), so a missing key returns None "
+        "where dict raises KeyError (issue 1.2)"
+    ),
+)
+def test_pop_without_default_raises_keyerror(backend_cls, policy_cls, make_dict):
+    """``pop`` with no default must raise ``KeyError``, as ``dict`` does.
+
+    The deterministic half of the pop contract, and the second of the two defects
+    PopConformance covers. Returning ``None`` is the dangerous shape: a caller
+    cannot tell an absent key from one whose stored value is ``None``, so a miss
+    reads as real data.
+    """
+    d = make_dict(max_in_memory=4)
+    d["present"] = "v"
+
+    with pytest.raises(KeyError):
+        d.pop("never-written")
+
+    # An explicitly supplied None must still be returned, not raised. Without
+    # this, an implementation using `default is None` as its omission sentinel
+    # would satisfy the assertion above while breaking pop(key, None) -- which is
+    # the likely shape of a careless fix, since the signature is already
+    # pop(key, default=None).
+    assert d.pop("never-written", None) is None
+    assert d.pop("never-written", "fallback") == "fallback"
+
+    # A stored None must stay distinguishable from a miss.
+    d["nothing"] = None
+    assert d.pop("nothing") is None
+    with pytest.raises(KeyError):
+        d.pop("nothing")
 
 
 # -- deep runs: one combination, many more examples ----------------------
