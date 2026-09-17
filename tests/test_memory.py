@@ -163,7 +163,12 @@ def test_full_scan_does_not_evict_the_working_set(make_dict, backend_spy):
     after = set(d.replacement_strategy.memory)
     survived = before & after
 
+    # Two separate properties, so a failure says which one broke. The write count
+    # is asserted rather than merely reported: a scan that preserved the cache but
+    # still wrote to disk would otherwise pass this guard while doing the very
+    # thing it is named for.
     assert survived == before, (
         f"a full scan evicted {len(before) - len(survived)} of {len(before)} "
-        f"cached keys and issued {writes} writes"
+        f"cached keys"
     )
+    assert writes == 0, f"a read-only scan issued {writes} writes"

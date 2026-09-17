@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import os
 import pickle
-import tempfile
 import time
 
 import pytest
@@ -223,7 +222,7 @@ def _store_bytes(path):
         "2.3x what the same data costs encoded as bytes (issue 4.3)"
     ),
 )
-def test_stored_payload_is_not_far_larger_than_the_data():
+def test_stored_payload_is_not_far_larger_than_the_data(tmp_path):
     """A stored value must not cost much more than the data it holds.
 
     Expressed against the same data pickled, in the same run, rather than a byte
@@ -234,7 +233,7 @@ def test_stored_payload_is_not_far_larger_than_the_data():
     value = list(range(10000))
     binary_size = len(pickle.dumps(value))
 
-    backend = SqliteBackend(os.path.join(tempfile.mkdtemp(), "store"))
+    backend = SqliteBackend(str(tmp_path / "store"))
     try:
         backend.serialize("payload", value)
         stored = _store_bytes(backend.storage_path)
@@ -258,7 +257,7 @@ def test_stored_payload_is_not_far_larger_than_the_data():
 SUPERLINEAR_BACKENDS = {Hdf5Backend}
 
 
-def test_stored_size_grows_linearly_with_the_data(request, backend_cls):
+def test_stored_size_grows_linearly_with_the_data(request, backend_cls, tmp_path):
     """Four times the data must not cost dramatically more than four times the space.
 
     A ratio within one run, so it says nothing about absolute efficiency -- that
@@ -281,7 +280,7 @@ def test_stored_size_grows_linearly_with_the_data(request, backend_cls):
 
     sizes = {}
     for count in (250, 1000):
-        backend = backend_cls(os.path.join(tempfile.mkdtemp(), "store"))
+        backend = backend_cls(str(tmp_path / f"store-{count}"))
         try:
             for i in range(count):
                 backend.serialize(f"k{i:05d}", "x" * 200)
