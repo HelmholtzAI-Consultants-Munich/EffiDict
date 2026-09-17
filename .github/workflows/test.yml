@@ -40,6 +40,22 @@ jobs:
         coverage xml -i
       env:
         PLATFORM: ${{ matrix.os }}
+
+    # The concurrency specs fail on scheduling, so a single green run says very
+    # little. Repeating surfaces the flakiness a one-shot run hides. No extra
+    # dependency: a shell loop is enough, and it stops at the first bad run.
+    - name: Stress the concurrency specs
+      # bash explicitly: the matrix includes windows-latest, where the default
+      # shell is PowerShell and a POSIX for-loop is a syntax error, so the step
+      # would fail before running a single test.
+      shell: bash
+      run: |
+        for attempt in 1 2 3 4 5; do
+          echo "--- stress attempt $attempt ---"
+          python -m pytest -m stress -q || exit 1
+        done
+      env:
+        PLATFORM: ${{ matrix.os }}
       
     - name: Upload coverage reports to Codecov
       uses: codecov/codecov-action@v4.0.1
