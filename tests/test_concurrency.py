@@ -116,9 +116,10 @@ def test_backend_is_usable_from_another_thread(request, backend_cls, storage_dir
             except Exception as exc:  # noqa: BLE001
                 observed["error"] = exc
 
-        reader = threading.Thread(target=read)
+        reader = threading.Thread(target=read, name="cross-thread-reader")
         reader.start()
         reader.join(10)
+        assert not reader.is_alive(), "the reading thread did not finish within 10s"
 
         assert "error" not in observed, (
             f"reading from another thread raised {observed['error']!r}"
@@ -161,11 +162,20 @@ def test_concurrent_writers_see_every_key(backend_cls, make_dict):
         except Exception as exc:  # noqa: BLE001
             failures.append(f"thread {index}: {type(exc).__name__}: {exc}")
 
-    threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+    threads = [
+        threading.Thread(target=worker, args=(i,), name=f"writer-{i}")
+        for i in range(8)
+    ]
     for thread in threads:
         thread.start()
     for thread in threads:
         thread.join(60)
+
+    # join() returning proves nothing on its own -- it also returns on timeout.
+    # Asserted before the failure list, because a hung writer means teardown is
+    # about to destroy a store that a live thread is still using.
+    still_running = [thread.name for thread in threads if thread.is_alive()]
+    assert not still_running, f"writers did not finish within 60s: {still_running}"
 
     assert not failures, f"{len(failures)} of 8 writers failed: {failures[:3]}"
 
@@ -225,9 +235,12 @@ def test_reader_never_observes_a_key_mid_eviction(backend_cls, make_dict):
             except Exception as exc:  # noqa: BLE001
                 observed["error"] = exc
 
-        reader = threading.Thread(target=read, daemon=True)
+        reader = threading.Thread(target=read, daemon=True, name="mid-eviction-reader")
         reader.start()
         reader.join(10)
+        assert not reader.is_alive(), (
+            "the reader blocked indefinitely while the write was held open"
+        )
 
         assert "error" not in observed, (
             f"a concurrent reader saw {key!r} as {observed['error']!r} while its "
@@ -442,19 +455,61 @@ _WRITER = textwrap.dedent(
 )
 
 
+def _writer_command(backend_cls, path, items):
+    return [
+        sys.executable,
+        "-c",
+        _WRITER.format(
+            repo=REPO_ROOT, backend=backend_cls.__name__, path=path, items=items
+        ),
+    ]
+
+
 def _run_writer(backend_cls, path, items):
+    """Run one writer to completion. For the specs that need ordering."""
     return subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            _WRITER.format(
-                repo=REPO_ROOT, backend=backend_cls.__name__, path=path, items=items
-            ),
-        ],
+        _writer_command(backend_cls, path, items),
         capture_output=True,
         text=True,
         timeout=120,
     )
+
+
+def _run_writers_concurrently(backend_cls, path, items_list):
+    """Start every writer *before* waiting on any of them.
+
+    ``subprocess.run`` waits, so collecting results with it runs the writers one
+    after another -- which tests sequential persistence, not the concurrent
+    contract these specs exist for. Sequential overwrites cannot tear, so an
+    implementation with no coordination at all would pass. ``Popen`` starts them
+    all first and only then collects.
+
+    Returns ``(returncode, stderr)`` pairs so callers can report the child's own
+    traceback rather than just a status.
+    """
+    processes = [
+        subprocess.Popen(
+            _writer_command(backend_cls, path, items),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for items in items_list
+    ]
+    results = []
+    for process in processes:
+        try:
+            _, stderr = process.communicate(timeout=120)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            _, stderr = process.communicate()
+            stderr = f"timed out after 120s\n{stderr}"
+        results.append((process.returncode, stderr))
+    return results
+
+
+def _writer_failures(results):
+    return [stderr.strip()[-400:] for code, stderr in results if code != 0]
 
 
 @pytest.mark.xfail(
@@ -469,11 +524,7 @@ def test_multiprocess_disjoint_writes_all_visible(backend_cls, storage_dir):
     path = str(storage_dir / "shared")
     ranges = [{f"p{p}_k{i}": f"v{i}" for i in range(4)} for p in range(3)]
 
-    failures = [
-        result.stderr.strip()[-400:]
-        for result in (_run_writer(backend_cls, path, items) for items in ranges)
-        if result.returncode != 0
-    ]
+    failures = _writer_failures(_run_writers_concurrently(backend_cls, path, ranges))
     assert not failures, "writer processes failed:\n" + "\n".join(failures)
 
     reader = _build(backend_cls.open(path), max_in_memory=4)
@@ -500,9 +551,15 @@ def test_multiprocess_same_key_writes_are_not_torn(backend_cls, storage_dir):
     path = str(storage_dir / "shared")
     candidates = {f"from-p{p}" for p in range(3)}
 
-    for value in sorted(candidates):
-        result = _run_writer(backend_cls, path, {"contended": value})
-        assert result.returncode == 0, result.stderr.strip()[-400:]
+    # Launched together, not in sequence: three sequential overwrites cannot tear,
+    # so a sequential version of this test would pass on an implementation with no
+    # write coordination whatsoever.
+    failures = _writer_failures(
+        _run_writers_concurrently(
+            backend_cls, path, [{"contended": value} for value in sorted(candidates)]
+        )
+    )
+    assert not failures, "writer processes failed:\n" + "\n".join(failures)
 
     reader = _build(backend_cls.open(path), max_in_memory=4)
     try:
@@ -527,14 +584,18 @@ def test_stale_cache_is_invalidated_after_external_write(backend_cls, storage_di
     coherence mechanism rather than just a lock: this process has the old value
     cached and nothing tells it the store moved on.
     """
+    # Deliberately sequential: the point is that the first value is *cached*
+    # before the second write happens, which needs ordering rather than overlap.
     path = str(storage_dir / "shared")
-    assert _run_writer(backend_cls, path, {"shared": "first"}).returncode == 0
+    first = _run_writer(backend_cls, path, {"shared": "first"})
+    assert first.returncode == 0, first.stderr.strip()[-400:]
 
     reader = _build(backend_cls.open(path), max_in_memory=4)
     try:
         assert reader["shared"] == "first"  # now cached
 
-        assert _run_writer(backend_cls, path, {"shared": "second"}).returncode == 0
+        second = _run_writer(backend_cls, path, {"shared": "second"})
+        assert second.returncode == 0, second.stderr.strip()[-400:]
 
         assert reader["shared"] == "second", (
             "the reader served a stale cached value after another process "
