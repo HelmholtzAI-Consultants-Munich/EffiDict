@@ -184,7 +184,9 @@ def test_concurrent_writers_see_every_key(backend_cls, make_dict):
     strict=True,
     reason=(
         "eviction drops the cache copy before the disk write completes, so a "
-        "concurrent reader sees the key as absent (issues 1.3, 5.1)"
+        "concurrent reader sees the key as absent (issues 1.3, 5.1). On SQLite "
+        "the evicting write additionally fails with the thread-affinity error, "
+        "which this probe asserts rather than swallows (issue 2.3)"
     ),
 )
 def test_reader_never_observes_a_key_mid_eviction(backend_cls, make_dict):
@@ -247,8 +249,21 @@ def test_reader_never_observes_a_key_mid_eviction(backend_cls, make_dict):
             f"write was still in flight"
         )
         assert observed["value"] == f"v{key[1:]}"
-    finally:
+
+        # The writer's own outcome is asserted too, and only after the reader
+        # checks above so the primary finding is reported first. Recording the
+        # error without asserting it would let this probe XPASS once the eviction
+        # ordering is fixed while SQLite's write was still failing on thread
+        # affinity -- a pass claiming more than it proved.
         release.set()
+        writer.join(10)
+        assert not writer.is_alive(), "the evicting writer did not finish within 10s"
+        assert "exc" not in writer_error, (
+            f"the eviction itself failed with {writer_error['exc']!r}, so this "
+            f"probe never observed a completed write"
+        )
+    finally:
+        release.set()  # idempotent; frees the writer if an assertion above failed
         writer.join(10)
         d.disk_backend.serialize = original
 
