@@ -33,6 +33,10 @@ pytestmark = pytest.mark.slow
 SMALL = 100
 LARGE = 4000
 
+#: Fixed so the binary reference size does not move with the interpreter.
+#: Protocol 5 is available from Python 3.8.
+REFERENCE_PICKLE_PROTOCOL = 5
+
 
 def _count_enumerated(backend):
     """Wrap ``keys()`` to record how many keys each call hands back.
@@ -42,16 +46,34 @@ def _count_enumerated(backend):
     the guard counts keys enumerated, which grows with N today and is zero once
     membership becomes a point lookup.
     """
-    enumerated = []
+    total = [0]
     original = backend.keys
 
     def counting_keys():
         result = original()
-        enumerated.append(len(result))
-        return result
+        if hasattr(result, "__len__"):
+            total[0] += len(result)
+            return result
+
+        # A lazy result is counted as the caller consumes it, rather than being
+        # materialised on its behalf: that keeps the metric honest if keys()
+        # becomes a generator while __contains__ still scans it.
+        def counting_proxy():
+            for item in result:
+                total[0] += 1
+                yield item
+
+        return counting_proxy()
 
     backend.keys = counting_keys
-    return enumerated, lambda: setattr(backend, "keys", original)
+
+    def restore():
+        # delattr, not setattr: the patch is an instance attribute shadowing the
+        # class method, so reassigning it would leave the instance permanently
+        # reshaped.
+        del backend.keys
+
+    return total, restore
 
 
 # --------------------------------------------------------------------------
@@ -80,12 +102,12 @@ def test_membership_cost_does_not_grow_with_the_store(backend_cls, policy_cls, m
         for i in range(size):
             d[f"k{i:05d}"] = "v"
 
-        enumerated, restore = _count_enumerated(d.disk_backend)
+        total, restore = _count_enumerated(d.disk_backend)
         try:
             assert ("absent" in d) is False
         finally:
             restore()
-        enumerated_by_size[size] = sum(enumerated)
+        enumerated_by_size[size] = total[0]
 
     assert enumerated_by_size[LARGE] == 0, (
         f"one membership check enumerated {enumerated_by_size[LARGE]} keys at "
@@ -231,7 +253,10 @@ def test_stored_payload_is_not_far_larger_than_the_data(tmp_path):
     same defect seen from the other side in ``test_backend_contract.py``.
     """
     value = list(range(10000))
-    binary_size = len(pickle.dumps(value))
+    # Protocol pinned: the default changes between interpreter versions, which
+    # would quietly move the reference size -- and therefore this ratio -- the
+    # next time the CI matrix upgrades Python.
+    binary_size = len(pickle.dumps(value, protocol=REFERENCE_PICKLE_PROTOCOL))
 
     backend = SqliteBackend(str(tmp_path / "store"))
     try:
