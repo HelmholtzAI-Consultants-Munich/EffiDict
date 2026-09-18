@@ -30,7 +30,7 @@ import inspect
 
 import pytest
 
-from effidict import Cache, EffiDict, Store
+from effidict import Cache, EffiDict, EvictionPolicy, Store
 
 #: The documented ``Store`` surface, as issue 0.1 wrote it. Each entry is the
 #: name plus the positional parameter names after ``self``, so a Phase 1
@@ -170,7 +170,7 @@ def test_unimplemented_methods_name_their_issue(owner):
     strict=True,
     reason="Store.__init__ and Cache.__init__ are contract stubs (issue 1.2)",
 )
-def test_store_can_be_built_over_a_backend_and_a_cache(backend_cls, make_policy, storage_dir):
+def test_store_can_be_built_over_a_backend_and_a_cache(backend_cls, storage_dir):
     """The composition root must actually compose.
 
     ``Store(backend, cache)`` is the whole point of Phase 1 -- one object owning
@@ -180,7 +180,7 @@ def test_store_can_be_built_over_a_backend_and_a_cache(backend_cls, make_policy,
     """
     backend = backend_cls(str(storage_dir / "store"))
     try:
-        cache = Cache(policy=make_policy(max_in_memory=4), max_items=4)
+        cache = Cache(policy=RecordingPolicy(), max_items=4)
         store = Store(backend=backend, cache=cache)
 
         assert store.backend is backend
@@ -228,14 +228,14 @@ def test_effidict_delegates_placement_to_a_store(make_dict):
     strict=True,
     reason="Cache is a contract stub; clean/dirty tagging does not exist (issue 1.3)",
 )
-def test_cache_tags_entries_clean_or_dirty(make_policy):
+def test_cache_tags_entries_clean_or_dirty():
     """I2. A cache entry must know whether disk already has it.
 
     The tag is what makes I5's "evicting a clean entry is a pure memory drop"
     decidable at all. Without it every eviction has to assume dirty, which is
     exactly the 500-writes-for-500-reads cost the complexity guards measure.
     """
-    cache = Cache(policy=make_policy(max_in_memory=4), max_items=4)
+    cache = Cache(policy=RecordingPolicy(), max_items=4)
 
     cache.put("written", "v", dirty=True)
     cache.put("loaded", "v", dirty=False)
@@ -249,33 +249,127 @@ def test_cache_tags_entries_clean_or_dirty(make_policy):
     assert list(cache.dirty_items()) == []
 
 
+#: A policy that records what it was told, so a spec can assert that a cache
+#: consulted it -- or did not. Real policies keep their bookkeeping private, and
+#: "peek did not promote" is a statement about a call that must *not* happen,
+#: which is unobservable from the outside.
+#:
+#: Used by every Cache spec here in place of the matrix ``policy_cls``, and not
+#: only for observability: ``Cache`` takes an ``EvictionPolicy``, while the
+#: matrix still supplies the legacy ``*Replacement`` classes, which do not grow
+#: ``on_insert``/``victim`` until issue 1.1. Handing one to a correct ``Cache``
+#: raises ``AttributeError``, so these specs were unsatisfiable by the very
+#: implementation they are meant to describe -- found by running them against a
+#: reference ``Cache`` rather than by reading them.
+class RecordingPolicy(EvictionPolicy):
+    def __init__(self):
+        self.calls = []
+        self.order = []
+
+    def on_insert(self, key):
+        self.calls.append(("on_insert", key))
+        self.order.append(key)
+
+    def on_access(self, key):
+        self.calls.append(("on_access", key))
+        if key in self.order:                      # move-to-most-recent
+            self.order.remove(key)
+            self.order.append(key)
+
+    def on_remove(self, key):
+        self.calls.append(("on_remove", key))
+        if key in self.order:
+            self.order.remove(key)
+
+    def victim(self):
+        if not self.order:
+            raise KeyError("empty")
+        return self.order[0]
+
+    def clear(self):
+        self.calls.append(("clear", None))
+        self.order.clear()
+
+
 @pytest.mark.xfail(
     strict=True,
     reason="Cache is a contract stub; neither budget is enforced (issue 1.4)",
 )
-def test_cache_enforces_item_and_byte_budgets_independently(make_policy):
-    """I8. Either budget alone must be able to trigger eviction.
+def test_cache_reports_what_must_be_shed_for_each_budget():
+    """I8. Either budget alone must put entries on the eviction list.
 
     Two budgets, two separate failure modes: today ``max_in_memory`` counts items
     and ``max_bytes`` is accepted and dropped, which is how a hundred 1 MB values
-    fit a "hundred-item" cache. The docstring on ``Cache.__init__`` already says
-    eviction happens while *either* budget is exceeded; this pins it.
+    fit a "hundred-item" cache.
+
+    Asserted as *what the cache says must go*, not as the cache having already
+    dropped it. An earlier version of this spec demanded ``len(cache) <= 2``
+    after over-filling, which encodes the opposite ownership model and is
+    unimplementable alongside I5: if ``put`` drops its own victim, a dirty value
+    is gone before anything could write it out, and ``Cache`` has no backend to
+    write it to. ``evict_candidates`` naming the surplus is the form that lets
+    ``Store`` peek, write, then discard.
     """
-    by_items = Cache(policy=make_policy(max_in_memory=2), max_items=2)
+    by_items = Cache(policy=RecordingPolicy(), max_items=2)
     for index in range(5):
         by_items.put(f"k{index}", "v")
-    assert len(by_items) <= 2, f"item budget ignored: {len(by_items)} entries resident"
+    assert len(by_items) == 5, (
+        f"put dropped entries by itself: {len(by_items)} of 5 held, so a dirty "
+        f"victim would be unrecoverable"
+    )
+    assert len(list(by_items.evict_candidates())) == 3, (
+        f"3 entries are over a 2-item budget but evict_candidates named "
+        f"{len(list(by_items.evict_candidates()))}"
+    )
 
     by_bytes = Cache(
-        policy=make_policy(max_in_memory=1000),
+        policy=RecordingPolicy(),
         max_items=1000,
         max_bytes=4096,
     )
     for index in range(20):
         by_bytes.put(f"k{index}", "x" * 1024)
-    assert by_bytes.nbytes() <= 4096 * 1.5, (
-        f"byte budget ignored: {by_bytes.nbytes()} bytes resident in "
-        f"{len(by_bytes)} entries"
+    assert by_bytes.nbytes() > 4096, (
+        "nbytes() did not account the values it was given"
+    )
+    assert list(by_bytes.evict_candidates()), (
+        f"{by_bytes.nbytes()} bytes are resident against a 4096-byte budget and "
+        f"evict_candidates named nothing, so the byte budget is not tracked"
+    )
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="Cache is a contract stub; size_estimator is never consulted (issue 1.4)",
+)
+def test_cache_measures_values_with_the_size_estimator():
+    """``size_estimator`` must actually be used, not assumed to be ``len``.
+
+    It is the only way the byte budget can work for values whose footprint is
+    not their length -- an ndarray, a DataFrame, anything where ``len`` is a row
+    count. Every other byte-budget guard in the suite uses strings, so all of
+    them pass against a hard-coded ``len``, and this parameter was on the public
+    contract with nothing exercising it.
+
+    The values here report ten bytes each through the estimator while ``len``
+    says one, so the two implementations cannot both satisfy this.
+    """
+    cache = Cache(
+        policy=RecordingPolicy(),
+        max_items=1000,
+        max_bytes=25,
+        size_estimator=lambda value: 10,
+    )
+    for index in range(4):
+        cache.put(f"k{index}", "x")
+
+    assert cache.nbytes() == 40, (
+        f"nbytes() reported {cache.nbytes()} for 4 values the estimator sizes at "
+        f"10 bytes each; len() would give 4"
+    )
+    assert list(cache.evict_candidates()), (
+        "40 estimated bytes against a 25-byte budget shed nothing, so eviction "
+        "ignores the estimator even if nbytes() honours it"
     )
 
 
@@ -283,20 +377,35 @@ def test_cache_enforces_item_and_byte_budgets_independently(make_policy):
     strict=True,
     reason="Cache is a contract stub (issue 1.2)",
 )
-def test_cache_peek_does_not_promote(make_policy):
+def test_cache_peek_does_not_promote():
     """I6. ``peek`` must read without telling the policy.
 
     The distinction between ``get`` and ``peek`` is the only way a flush or a
     full scan can walk the cache without reordering it -- the defect
     ``test_full_scan_does_not_evict_the_working_set`` measures from the outside.
+
+    Two things make this observable, and the earlier version of this spec had
+    neither. It compared ``evict_candidates()`` before and after on a cache
+    holding exactly its budget, where the correct answer is ``[]`` both times --
+    so ``[] == []`` passed however much ``peek`` had reordered. Here the cache is
+    deliberately over budget, so the candidate order is non-empty and visible,
+    and the policy records its calls, so "did not tell the policy" is asserted
+    directly rather than inferred.
     """
-    policy = make_policy(max_in_memory=2)
+    policy = RecordingPolicy()
     cache = Cache(policy=policy, max_items=2)
-    cache.put("a", "va")
-    cache.put("b", "vb")
+    for key in ("a", "b", "c", "d"):
+        cache.put(key, f"v{key}")
 
     before = list(cache.evict_candidates())
+    assert before, "precondition: an over-budget cache has candidates to name"
+
+    policy.calls.clear()
     assert cache.peek("a") == "va"
+
+    promoted = [call for call in policy.calls if call[0] == "on_access"]
+    assert not promoted, f"peek told the policy about the access: {promoted}"
     assert list(cache.evict_candidates()) == before, (
-        "peek reordered the eviction queue, so it is not a pure read"
+        f"peek reordered the eviction queue: {before} -> "
+        f"{list(cache.evict_candidates())}"
     )

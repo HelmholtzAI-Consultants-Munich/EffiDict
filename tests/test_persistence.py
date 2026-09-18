@@ -157,17 +157,23 @@ def test_open_does_not_truncate_existing_store(backend_cls, storage_dir):
 
     first = backend_cls.create(path)
     first.serialize("kept", "value")
-    # Deliberately not closed: Backend.close() does not exist, not even as a
-    # stub, and truncation happens on construction -- a second handle is enough
-    # to show it. Uses keys() rather than has(), which is a separate stub owned
-    # by issue 2.2; depending on it would keep this spec red after its own fix.
+    first.close()
+
+    # Closed before reopening, so this stays a sequential reopen test. An
+    # earlier version held both handles at once -- written when ``close()`` did
+    # not exist on the backend contract -- which quietly required every backend
+    # to permit concurrent opens. HDF5 and any lock-taking backend may refuse
+    # the second handle while being perfectly durable, so the spec would have
+    # failed them for something it never meant to assert.
+    #
+    # Uses keys() rather than has(), which is a separate stub owned by issue
+    # 2.2; depending on it would keep this spec red after its own fix.
     second = backend_cls.open(path)
     try:
         assert "kept" in second.keys(), "opening the store truncated it"
         assert second.deserialize("kept") == "value"
     finally:
-        for backend in (second, first):
-            release_store(backend)
+        release_store(second)
 
 
 @pytest.mark.xfail(
@@ -306,3 +312,36 @@ def test_temporary_stores_clean_up_after_themselves(backend_cls):
     release_store(backend)
 
     assert not os.path.exists(path), f"temporary store left behind: {path}"
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="close() is a contract stub on the backend (issue 3.1)",
+)
+def test_backend_close_is_idempotent_and_keeps_the_storage(backend_cls, storage_dir):
+    """``close()`` must release handles, survive a second call, and keep the data.
+
+    All three halves are load-bearing, and none were pinned: ``close()`` was
+    added to the ``DiskBackend`` contract with its idempotence promised only in a
+    docstring, and the facade-level close specs are satisfied by a backend that
+    raises on the second call. Idempotence is what lets ``Store.close()`` be safe
+    to call from both ``__exit__`` and ``__del__`` -- which is exactly the path
+    that makes ``__del__`` destructive today (issue 3.1).
+    """
+    path = str(storage_dir / "store")
+
+    backend = backend_cls.create(path)
+    backend.serialize("kept", "value")
+    stored_at = backend.storage_path
+
+    backend.close()
+    backend.close()  # idempotent: the second call must not raise
+
+    assert os.path.exists(stored_at), "close() removed the storage"
+
+    reopened = backend_cls.open(path)
+    try:
+        assert "kept" in reopened.keys(), "the store was empty after close/open"
+        assert reopened.deserialize("kept") == "value"
+    finally:
+        release_store(reopened)

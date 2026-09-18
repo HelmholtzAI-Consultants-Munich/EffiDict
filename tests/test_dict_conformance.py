@@ -292,6 +292,35 @@ class MappingApiConformance(CoreConformance):
         value = data.draw(self._value_strategy)
         self._mirror(lambda d: d.update({key: copy.deepcopy(value)}))
 
+    # update() accepts three call forms and this machine only drove the first,
+    # so an implementation that took a mapping and ignored ``**kwargs`` passed
+    # both the surface test and the oracle. Keyword form is restricted to keys
+    # that are valid identifiers -- ``dict(**{...})`` requires it -- so the
+    # bundle is not used here.
+    @rule(key=st.text(alphabet="abcdefghijklmnopqrstuvwxyz_", min_size=1, max_size=6),
+          data=st.data())
+    def update_from_pairs(self, key, data):
+        value = data.draw(self._value_strategy)
+        self._mirror(lambda d: d.update([(key, copy.deepcopy(value))]))
+
+    @rule(key=st.text(alphabet="abcdefghijklmnopqrstuvwxyz_", min_size=1, max_size=6),
+          data=st.data())
+    def update_from_keywords(self, key, data):
+        value = data.draw(self._value_strategy)
+        self._mirror(lambda d: d.update(**{key: copy.deepcopy(value)}))
+
+    @rule(key=st.text(alphabet="abcdefghijklmnopqrstuvwxyz_", min_size=1, max_size=6),
+          data=st.data())
+    def update_mapping_and_keywords(self, key, data):
+        """Keywords win over the positional mapping for the same key."""
+        first = data.draw(self._value_strategy)
+        second = data.draw(self._value_strategy)
+        self._mirror(
+            lambda d: d.update(
+                {key: copy.deepcopy(first)}, **{key: copy.deepcopy(second)}
+            )
+        )
+
     @rule()
     def popitem(self):
         self._mirror(lambda d: d.popitem())

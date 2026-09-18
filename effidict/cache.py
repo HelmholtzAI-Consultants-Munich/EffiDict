@@ -7,9 +7,20 @@ class Cache:
     def __init__(self, policy, max_items=None, max_bytes=None, size_estimator=None):
         """Create a cache constrained by independent item and byte budgets.
 
-        ``max_items`` and ``max_bytes`` are independent budgets; eviction
-        happens while either budget is exceeded. ``max_bytes=None`` means
-        item-count only. ``size_estimator`` is approximate by design.
+        ``max_items`` and ``max_bytes`` are independent budgets: either being
+        exceeded means entries have to go. ``max_bytes=None`` means item-count
+        only. ``size_estimator`` maps a value to its approximate byte size and
+        defaults to something like ``len``; it is approximate by design, and a
+        ``Cache`` must actually consult it rather than assume ``len``.
+
+        **The cache does not evict on its own.** ``put`` may take the cache over
+        budget; ``evict_candidates`` then names what has to be shed, and the
+        owner -- ``Store`` -- peeks each candidate, writes it out if it is dirty,
+        and calls ``discard``. That split is forced by I5: a dirty victim has to
+        reach disk *before* it leaves memory, and a ``Cache`` holds no backend to
+        write it to, so a cache that dropped its own victims would make
+        write-before-drop impossible to implement. It is also why the surface
+        includes ``peek``, ``is_dirty``, ``dirty_items`` and ``discard`` at all.
         """
         raise NotImplementedError("see issue #1.2")
 
@@ -58,5 +69,11 @@ class Cache:
         raise NotImplementedError("see issue #1.3")
 
     def evict_candidates(self) -> Iterator:
-        """Iterate over keys to shed until cache budgets are met."""
+        """Iterate over keys that must be shed to get back inside budget.
+
+        In the policy's victim order, most-evictable first, and empty when both
+        budgets are satisfied. Yielding a key does not remove it: the cache is
+        unchanged until the caller calls ``discard``, which is what lets the
+        caller write a dirty value out first.
+        """
         raise NotImplementedError("see issue #1.2")
