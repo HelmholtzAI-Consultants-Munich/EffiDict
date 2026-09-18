@@ -14,7 +14,6 @@ EffiDict is a fast, dictionary-like cache with pluggable on-disk backends and mu
   - Pickle folder (one pickle file per key)
   - HDF5 file (requires optional dependencies; best for numeric arrays)
 - Dict-like API: get/set, delete, `in`, `len`, `keys/items/values`, `pop`, `clear`, and iteration
-- Context manager support and explicit `close()` to release disk resources
 
 ## Installation
 
