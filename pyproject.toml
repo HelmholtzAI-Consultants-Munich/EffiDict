@@ -33,7 +33,24 @@ classifiers = [
 
 
 [project.optional-dependencies]
-dev = ["pytest"]
+dev = [
+    "pytest",
+    "hypothesis",
+    "pandas",
+    "numpy",
+    "h5py",
+    "joblib",
+    "coverage",
+]
+
+[tool.pytest.ini_options]
+addopts = "--strict-markers"
+testpaths = ["tests"]
+markers = [
+    "slow: long-running guard; skip locally with -m 'not slow', always run in CI",
+    "stress: repeated or concurrent; always run in CI",
+    "keeps_storage: opts out of the storage-leak detector (storage outlives the test)",
+]
 
 [project.urls]
 documentation = "https://oligo-designer-toolsuite.readthedocs.io/"
