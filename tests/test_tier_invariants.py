@@ -480,11 +480,18 @@ def test_cache_respects_byte_budget(backend_cls, policy_cls, make_dict):
     to keep the suite fast; the failure mode is identical.
     """
     budget = 512 * 1024
-    payload = "x" * (64 * 1024)
+    size = 64 * 1024
 
+    # A distinct object per key, never one shared buffer. Forty references to a
+    # single 64 KiB string occupy 64 KiB of memory while ``cached_bytes`` -- which
+    # sums ``len`` -- reports 2.5 MB, so the shared-payload version of this guard
+    # would fail a cache that correctly accounted *resident* bytes and stayed
+    # inside its budget. ``test_memory.py`` opens with the same warning; this
+    # spec was not honouring it.
     d = make_dict(max_in_memory=100, max_bytes=budget)
     for i in range(40):
-        d[f"k{i}"] = payload
+        tail = f"{i:08d}"
+        d[f"k{i}"] = "x" * (size - len(tail)) + tail
 
     held = cached_bytes(d)
     assert held <= budget * 2, (

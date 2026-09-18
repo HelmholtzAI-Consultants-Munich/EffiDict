@@ -225,6 +225,50 @@ def test_mutablemapping_surface_is_complete(backend_cls, policy_cls, make_dict):
     assert key not in d and value is not None
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "__reversed__, __or__ and fromkeys are absent from EffiDict, so three "
+        "entries in MAPPING_METHODS were only ever hasattr-checked (issue 6.1)"
+    ),
+)
+def test_dict_extras_behave_like_dict(backend_cls, policy_cls, make_dict):
+    """The three non-``Mapping`` entries in the surface list must actually work.
+
+    ``MAPPING_METHODS`` claims ``__reversed__``, ``__or__`` and ``fromkeys``, but
+    the surface test above only checks they exist and the differential oracle
+    never calls them -- so a stub, or a wrong answer, satisfied the "complete
+    mapping surface" spec. None of the three come from ``MutableMapping``; they
+    are ``dict`` features, which is exactly why inheriting the ABC does not
+    supply them and why they need exercising rather than listing.
+
+    Each is compared against ``dict``'s own answer. ``fromkeys`` is asserted on
+    *contents* only: where the new store's storage lives is a real open question
+    (``clone`` takes a path, ``dict.fromkeys`` takes none) and belongs to issue
+    6.1, so pinning a signature here would be inventing a decision.
+    """
+    d = make_dict(max_in_memory=10)
+    reference = {}
+    for index, key in enumerate(["a", "b", "c"]):
+        d[key] = f"v{index}"
+        reference[key] = f"v{index}"
+
+    assert list(reversed(d)) == list(reversed(reference)), (
+        f"reversed() gave {list(reversed(d))}, dict gives "
+        f"{list(reversed(reference))}"
+    )
+
+    merged = d | {"c": "override", "e": "new"}
+    expected = reference | {"c": "override", "e": "new"}
+    assert dict(merged) == expected, f"| gave {dict(merged)}, dict gives {expected}"
+    assert dict(d) == reference, "| mutated the left operand"
+
+    filled = d.fromkeys(["x", "y"], "z")
+    assert dict(filled) == dict.fromkeys(["x", "y"], "z"), (
+        f"fromkeys gave {dict(filled)}, dict gives {dict.fromkeys(['x', 'y'], 'z')}"
+    )
+
+
 # --------------------------------------------------------------------------
 # equality and hashing
 # --------------------------------------------------------------------------

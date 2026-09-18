@@ -68,7 +68,12 @@ class EffiDict:
         raise NotImplementedError("see issue #6.1")
 
     def popitem(self):
-        """Remove and return an arbitrary key/value pair."""
+        """Remove and return the **most recently inserted** key/value pair.
+
+        LIFO, not arbitrary: ``dict.popitem`` has been last-in-first-out since
+        3.7 and the differential oracle compares against ``dict``, so returning
+        an arbitrary pair would fail conformance. Raises ``KeyError`` when empty.
+        """
         raise NotImplementedError("see issue #6.1")
 
     def update(self, other=(), **kwargs):

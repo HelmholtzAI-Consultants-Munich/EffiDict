@@ -3,6 +3,23 @@ from __future__ import annotations
 from typing import Iterator
 
 
+class _Missing:
+    """Sentinel for "no default was given".
+
+    ``pop(key, default=None)`` cannot tell ``pop(key)`` from ``pop(key, None)``,
+    so a ``Store`` written against that signature would have to guess -- and
+    guessing "return None" is precisely the defect
+    ``test_pop_without_default_raises_keyerror`` pins at the facade (issue 1.2).
+    The contract has to be able to express the distinction that ``dict`` makes.
+    """
+
+    def __repr__(self):  # pragma: no cover - debugging aid
+        return "<no default>"
+
+
+MISSING = _Missing()
+
+
 class Store:
     """The single owner of where a key lives.
 
@@ -57,8 +74,13 @@ class Store:
         """Remove ``key`` from all tiers."""
         raise NotImplementedError("see issue #1.2")
 
-    def pop(self, key, default=None):
-        """Remove ``key`` and return its value, or ``default`` if absent."""
+    def pop(self, key, default=MISSING):
+        """Remove ``key`` and return its value.
+
+        Returns ``default`` if the key is absent and a default was given; raises
+        ``KeyError`` if it is absent and none was. ``dict`` semantics, including
+        ``pop(key, None)`` returning ``None`` rather than raising.
+        """
         raise NotImplementedError("see issue #1.2")
 
     def clear(self) -> None:

@@ -223,6 +223,15 @@ def test_reader_never_observes_a_key_mid_eviction(backend_cls, make_dict):
     blocked indefinitely" for both a compliant and a non-compliant store. What
     must never happen is the reader returning an error, which is exactly what it
     does today.
+
+    Nothing here waits on a clock to decide *which* of those happened. Two events
+    do it: the reader announces that it has entered the read path, and announces
+    again when it leaves. A short grace period would be a scheduling assumption --
+    a reader that had not been scheduled yet looks identical to one that
+    blocked, and releasing the writer at that point lets a drop-then-write
+    implementation answer from post-write state and XPASS a strict marker, five
+    times per stress run. The waits below are 10s liveness bounds, the same ones
+    used elsewhere in this file, not timing discriminators.
     """
     d = make_dict(max_in_memory=2)
     d["k0"] = "v0"
@@ -257,23 +266,38 @@ def test_reader_never_observes_a_key_mid_eviction(backend_cls, make_dict):
         key = victim["key"]
 
         observed = {}
+        entered = threading.Event()
+        finished = threading.Event()
 
         def read():
+            entered.set()
             try:
                 observed["value"] = d[key]
             except Exception as exc:  # noqa: BLE001
                 observed["error"] = exc
+            finally:
+                finished.set()
 
         reader = threading.Thread(target=read, daemon=True, name="mid-eviction-reader")
         reader.start()
 
-        # A short grace period, not a deadline. If the reader comes back within
-        # it, that answer was formed mid-eviction and is the observation this
-        # probe is named for. If it is still running, it is waiting on the Store
-        # lock -- the correct post-1.2 behaviour -- so the writer is released and
-        # the reader is judged on whether it *eventually* succeeded.
-        reader.join(0.5)
-        observed_mid_eviction = not reader.is_alive()
+        # Distinguishes "not scheduled yet" from "blocked on the lock", which a
+        # timer cannot. If this fails the machine is wedged, not the store.
+        assert entered.wait(10), "the reader thread never reached the read path"
+
+        # The write is still held, so whatever the reader returns here it formed
+        # mid-eviction. If it has not returned, it is waiting on the Store lock.
+        #
+        # This is the one wait that costs something: once a lock exists the
+        # reader legitimately never returns, so each backend spends the full
+        # bound here -- about 40s for the matrix, and the stress step repeats it
+        # five times. Deliberate. Shortening it would turn the bound back into a
+        # discriminator, and the probe would then pass a drop-then-write store
+        # whose reader simply had not been scheduled yet. Verified both ways:
+        # unlocked, a drop-then-write store is caught in 0.0s with KeyError;
+        # locked, both orderings pass, which is correct because the lock hides
+        # the gap from readers and the ordering itself is 0.4's to pin.
+        answered_mid_eviction = finished.wait(10)
 
         assert "error" not in observed, (
             f"a concurrent reader saw {key!r} as {observed['error']!r} while its "
@@ -281,8 +305,7 @@ def test_reader_never_observes_a_key_mid_eviction(backend_cls, make_dict):
         )
 
         release.set()
-        reader.join(10)
-        assert not reader.is_alive(), (
+        assert finished.wait(10), (
             "the reader never finished, even after the eviction was released"
         )
         assert "error" not in observed, (
@@ -291,7 +314,7 @@ def test_reader_never_observes_a_key_mid_eviction(backend_cls, make_dict):
         )
         assert observed["value"] == f"v{key[1:]}", (
             f"reader saw {observed['value']!r}, expected {f'v{key[1:]}'!r} "
-            f"(observed mid-eviction: {observed_mid_eviction})"
+            f"(answered mid-eviction: {answered_mid_eviction})"
         )
 
         # The writer's own outcome is asserted too, and only after the reader
@@ -482,6 +505,15 @@ def test_worker_write_raises_clearly(backend_cls, storage_dir):
             assert "read" in message.lower() or "writ" in message.lower(), (
                 f"refusal does not explain that workers are read-only: {message}"
             )
+
+        # Refusing is not the same as not writing. A store that persisted the
+        # value and *then* raised would satisfy every assertion above while
+        # breaking the read-only contract in the way that actually costs the
+        # caller something, so check the parent never saw the keys.
+        leaked = [f"from-worker-{i}" for i in range(2) if f"from-worker-{i}" in d]
+        assert not leaked, (
+            f"a worker write was refused but still reached the store: {leaked}"
+        )
     finally:
         release_store(backend)
 

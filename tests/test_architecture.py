@@ -36,6 +36,12 @@ from effidict import Cache, EffiDict, Store
 #: name plus the positional parameter names after ``self``, so a Phase 1
 #: implementation that keeps the name but changes the contract still trips.
 STORE_SURFACE = {
+    # The constructor is part of the surface. Both tests that *call* these
+    # constructors are expected failures, so without this row a Phase 1
+    # implementation that renamed or dropped ``cache`` would stay XFAIL rather
+    # than trip a passing guard -- the composition root would be wrong and
+    # nothing would say so.
+    "__init__": ["backend", "cache", "lock", "owns_storage"],
     "get": ["key"],
     "set": ["key", "value"],
     "delete": ["key"],
@@ -58,6 +64,7 @@ STORE_PROPERTIES = ["backend", "cache", "owns_storage"]
 
 #: The documented ``Cache`` surface.
 CACHE_SURFACE = {
+    "__init__": ["policy", "max_items", "max_bytes", "size_estimator"],
     "has": ["key"],
     "get": ["key"],
     "peek": ["key"],

@@ -18,6 +18,20 @@ except Exception:
     np = None
 
 class DiskBackend(ABC):
+    """Base contract for the persistent tier.
+
+    Note the ``ABC`` base. Before issue 0.1 this class carried
+    ``@abstractmethod`` decorators without ``ABCMeta``, which makes them inert:
+    the base could be instantiated and an incomplete subclass was never
+    checked. Activating it is deliberate and is pinned by
+    ``test_abstract_bases_cannot_be_instantiated``, but it is a real
+    behaviour change and the only one in Phase 0 -- an out-of-tree subclass that
+    omits ``serialize``, ``deserialize``, ``del_item``, ``keys`` or ``destroy``
+    used to construct and will now raise ``TypeError`` at instantiation. The
+    four shipped backends are unaffected, which
+    ``test_concrete_backends_remain_instantiable`` pins.
+    """
+
     def __init__(self, storage_path):
         self.storage_path = storage_path + f"{int(time.time())}_{id(self)}"
         
@@ -68,6 +82,20 @@ class DiskBackend(ABC):
     def delete_many(self, keys) -> None:
         """Delete multiple keys from this backend."""
         raise NotImplementedError("see issue #4.1")
+
+    def close(self) -> None:
+        """Release handles and flush buffers, leaving the storage in place.
+
+        Distinct from ``destroy``, which deletes it. Without this, a
+        non-destructive ``Store.close()`` cannot be built on the backend
+        contract at all: SQLite holds a live ``sqlite3.Connection`` and HDF5 an
+        open ``h5py.File``, and today the only method that closes either is
+        ``destroy`` -- which also removes the data. That is why ``close()`` on
+        the facade currently destroys the store (issue 3.1).
+
+        Must be idempotent, and must leave the store reopenable via ``open``.
+        """
+        raise NotImplementedError("see issue #3.1")
 
     def compact(self) -> None:
         """Reclaim unused storage space."""

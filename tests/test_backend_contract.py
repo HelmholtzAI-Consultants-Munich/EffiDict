@@ -498,3 +498,31 @@ def test_count_agrees_with_keys(backend):
         f"after one removal count() said {backend.count()} and keys() reports "
         f"{len(backend.keys())}; expected {len(BATCH_ITEMS) - 1}"
     )
+
+
+@pytest.mark.xfail(strict=True, reason="iter_keys is a contract stub (issue 4.2)")
+def test_iter_keys_streams_the_same_keys_as_keys(backend):
+    """``iter_keys`` must yield what ``keys`` returns, without building a list.
+
+    The whole point of the method is that walking a ten-million-key store does
+    not require holding ten million keys at once (issue 4.2), so "returns the
+    right keys" is only half the contract -- a one-line implementation that does
+    ``return iter(self.keys())`` satisfies the key set and none of the intent.
+    Asserted structurally, because the size at which the memory cost shows up is
+    far too large for a test: the object handed back must be an iterator, and
+    consuming it must not be repeatable the way a list would be.
+    """
+    for key, value in BATCH_ITEMS.items():
+        backend.serialize(key, value)
+
+    stream = backend.iter_keys()
+    assert iter(stream) is stream, (
+        f"iter_keys returned {type(stream).__name__}, not an iterator"
+    )
+
+    streamed = list(stream)
+    assert sorted(streamed) == sorted(backend.keys()), (
+        f"iter_keys yielded {sorted(streamed)}, keys() reports "
+        f"{sorted(backend.keys())}"
+    )
+    assert list(stream) == [], "the iterator restarted, so it was a sequence"
