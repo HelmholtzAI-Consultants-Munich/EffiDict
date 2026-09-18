@@ -58,6 +58,12 @@ def _policy_state(store):
     LFU and MFU choose by the counts in ``secondary_memory``, which membership
     does not see at all. A bulk load could therefore match on keys and still
     behave differently on the very next write.
+
+    Reads the policy's own attributes, which issue 1.1 moves: the ``*Policy``
+    classes keep the ordering and the counts but the cache dict belongs to
+    ``Cache``. Update this reader then -- ``test_eviction_policies._instance_state``
+    already walks policy state generically and is the model to follow. Left
+    concrete here because the generic walk needs the post-1.1 shape to be useful.
     """
     policy = store.replacement_strategy
     state = {"order": list(policy.memory.keys())}

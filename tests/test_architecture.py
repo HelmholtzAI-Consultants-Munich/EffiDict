@@ -152,7 +152,7 @@ def test_unimplemented_methods_name_their_issue(owner):
     strict=True,
     reason="Store.__init__ and Cache.__init__ are contract stubs (issue 1.2)",
 )
-def test_store_can_be_built_over_a_backend_and_a_cache(backend_cls, policy_cls, storage_dir):
+def test_store_can_be_built_over_a_backend_and_a_cache(backend_cls, make_policy, storage_dir):
     """The composition root must actually compose.
 
     ``Store(backend, cache)`` is the whole point of Phase 1 -- one object owning
@@ -162,7 +162,7 @@ def test_store_can_be_built_over_a_backend_and_a_cache(backend_cls, policy_cls, 
     """
     backend = backend_cls(str(storage_dir / "store"))
     try:
-        cache = Cache(policy=policy_cls(disk_backend=None, max_in_memory=4), max_items=4)
+        cache = Cache(policy=make_policy(max_in_memory=4), max_items=4)
         store = Store(backend=backend, cache=cache)
 
         assert store.backend is backend
@@ -210,14 +210,14 @@ def test_effidict_delegates_placement_to_a_store(make_dict):
     strict=True,
     reason="Cache is a contract stub; clean/dirty tagging does not exist (issue 1.3)",
 )
-def test_cache_tags_entries_clean_or_dirty(policy_cls):
+def test_cache_tags_entries_clean_or_dirty(make_policy):
     """I2. A cache entry must know whether disk already has it.
 
     The tag is what makes I5's "evicting a clean entry is a pure memory drop"
     decidable at all. Without it every eviction has to assume dirty, which is
     exactly the 500-writes-for-500-reads cost the complexity guards measure.
     """
-    cache = Cache(policy=policy_cls(disk_backend=None, max_in_memory=4), max_items=4)
+    cache = Cache(policy=make_policy(max_in_memory=4), max_items=4)
 
     cache.put("written", "v", dirty=True)
     cache.put("loaded", "v", dirty=False)
@@ -235,7 +235,7 @@ def test_cache_tags_entries_clean_or_dirty(policy_cls):
     strict=True,
     reason="Cache is a contract stub; neither budget is enforced (issue 1.4)",
 )
-def test_cache_enforces_item_and_byte_budgets_independently(policy_cls):
+def test_cache_enforces_item_and_byte_budgets_independently(make_policy):
     """I8. Either budget alone must be able to trigger eviction.
 
     Two budgets, two separate failure modes: today ``max_in_memory`` counts items
@@ -243,13 +243,13 @@ def test_cache_enforces_item_and_byte_budgets_independently(policy_cls):
     fit a "hundred-item" cache. The docstring on ``Cache.__init__`` already says
     eviction happens while *either* budget is exceeded; this pins it.
     """
-    by_items = Cache(policy=policy_cls(disk_backend=None, max_in_memory=2), max_items=2)
+    by_items = Cache(policy=make_policy(max_in_memory=2), max_items=2)
     for index in range(5):
         by_items.put(f"k{index}", "v")
     assert len(by_items) <= 2, f"item budget ignored: {len(by_items)} entries resident"
 
     by_bytes = Cache(
-        policy=policy_cls(disk_backend=None, max_in_memory=1000),
+        policy=make_policy(max_in_memory=1000),
         max_items=1000,
         max_bytes=4096,
     )
@@ -265,14 +265,14 @@ def test_cache_enforces_item_and_byte_budgets_independently(policy_cls):
     strict=True,
     reason="Cache is a contract stub (issue 1.2)",
 )
-def test_cache_peek_does_not_promote(policy_cls):
+def test_cache_peek_does_not_promote(make_policy):
     """I6. ``peek`` must read without telling the policy.
 
     The distinction between ``get`` and ``peek`` is the only way a flush or a
     full scan can walk the cache without reordering it -- the defect
     ``test_full_scan_does_not_evict_the_working_set`` measures from the outside.
     """
-    policy = policy_cls(disk_backend=None, max_in_memory=2)
+    policy = make_policy(max_in_memory=2)
     cache = Cache(policy=policy, max_items=2)
     cache.put("a", "va")
     cache.put("b", "vb")

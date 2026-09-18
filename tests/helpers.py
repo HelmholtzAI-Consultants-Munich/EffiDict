@@ -8,6 +8,8 @@ they cannot drift.
 
 from __future__ import annotations
 
+import inspect
+
 import math
 
 try:
@@ -110,6 +112,31 @@ def is_lossy(backend_cls, kind):
     return kind in LOSSY[backend_cls]
 
 
+def build_policy(policy_cls, disk_backend=None, max_in_memory=2, **extra):
+    """Construct ``policy_cls`` with whatever arguments it actually declares.
+
+    Issue 1.1 replaces the ``*Replacement`` classes -- which require
+    ``disk_backend`` and ``max_in_memory`` -- with ``*Policy`` classes that own
+    bookkeeping only and take **no** constructor arguments;
+    ``test_eviction_policies.py`` pins that as ``ALLOWED_INIT_PARAMS =
+    frozenset()``. Hard-coding today's arguments would make every call site raise
+    ``TypeError`` the moment 1.1 lands, and on a strict xfail that reads as
+    "still failing" rather than "failing for a new reason" -- so the guard would
+    never flip green when the defect it pins is actually fixed.
+
+    Only declared parameters are passed, so this spans the change without a flag
+    day. The ``make_policy`` fixture wraps this for specs that take the policy
+    from the matrix; module-level builders call it directly.
+    """
+    accepted = inspect.signature(policy_cls.__init__).parameters
+    candidates = {
+        "disk_backend": disk_backend,
+        "max_in_memory": max_in_memory,
+        **extra,
+    }
+    return policy_cls(**{k: v for k, v in candidates.items() if k in accepted})
+
+
 def in_cache(effidict, key):
     """Whether ``key`` currently sits in the in-memory tier.
 
@@ -118,6 +145,34 @@ def in_cache(effidict, key):
     means the tier-invariant specs do not all need rewriting when it lands.
     """
     return key in effidict.replacement_strategy.memory
+
+
+def cached_keys(effidict):
+    """The set of keys currently resident in the cache.
+
+    Companion to :func:`in_cache` for the specs that need the whole set rather
+    than one membership test -- "did this operation change what is cached?".
+    Issue 1.2 replaces the body with ``set(effidict._store.cache)``.
+
+    Behind a helper for the same reason as :func:`in_cache`, and the reason is
+    sharper than tidiness: a spec that reads ``replacement_strategy.memory``
+    directly raises ``AttributeError`` once 1.2 removes that alias, and a strict
+    xfail cannot tell "still broken" from "broken differently". Those guards
+    would stay red on a correct implementation instead of flipping.
+    """
+    return set(effidict.replacement_strategy.memory)
+
+
+def cached_bytes(effidict):
+    """Approximate number of bytes the cache is holding.
+
+    Issue 1.4 gives the cache a real byte budget and ``Cache.nbytes()`` becomes
+    the contract; this becomes ``effidict._store.cache.nbytes()`` then. Until
+    the cache exists, summing ``len`` over the resident values is the only
+    measure available, which is why the budget specs assert with generous
+    headroom rather than an exact figure.
+    """
+    return sum(len(value) for value in effidict.replacement_strategy.memory.values())
 
 
 def on_disk(effidict, key):

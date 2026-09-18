@@ -35,6 +35,8 @@ from effidict import (
     SqliteBackend,
 )
 
+from .helpers import build_policy
+
 try:
     import h5py
 except ImportError:  # pragma: no cover - h5py is a dev dependency
@@ -84,6 +86,25 @@ def policy_cls(request):
     receives the ``*Replacement`` classes.
     """
     return request.param
+
+
+@pytest.fixture
+def make_policy(policy_cls):
+    """Build the active matrix policy, whatever its constructor currently wants.
+
+    Thin wrapper over ``helpers.build_policy``, which explains why the
+    indirection exists: issue 1.1 removes both of today's constructor arguments.
+    """
+
+    def factory(max_in_memory=4, disk_backend=None, **extra):
+        return build_policy(
+            policy_cls,
+            disk_backend=disk_backend,
+            max_in_memory=max_in_memory,
+            **extra,
+        )
+
+    return factory
 
 
 @pytest.fixture

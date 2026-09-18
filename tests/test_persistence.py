@@ -24,6 +24,7 @@ import pytest
 from effidict import EffiDict, LRUReplacement
 
 from .conftest import release_store
+from .helpers import build_policy
 
 REPO_ROOT = str(Path(__file__).resolve().parents[1])
 
@@ -34,8 +35,8 @@ def _build(backend, policy_cls=LRUReplacement, max_in_memory=2):
     """Wrap an already-constructed backend in an EffiDict."""
     return EffiDict(
         disk_backend=backend,
-        replacement_strategy=policy_cls(
-            disk_backend=backend, max_in_memory=max_in_memory
+        replacement_strategy=build_policy(
+            policy_cls, disk_backend=backend, max_in_memory=max_in_memory
         ),
     )
 

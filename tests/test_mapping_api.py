@@ -23,7 +23,7 @@ from pathlib import Path
 
 import pytest
 
-from .helpers import PROMOTING_POLICIES
+from .helpers import PROMOTING_POLICIES, cached_keys
 
 REPO_ROOT = str(Path(__file__).resolve().parents[1])
 
@@ -264,8 +264,8 @@ def test_eq_does_not_mutate_either_operand(
         left[key] = key
         right[key] = key
 
-    before_left = set(left.replacement_strategy.memory)
-    before_right = set(right.replacement_strategy.memory)
+    before_left = cached_keys(left)
+    before_right = cached_keys(right)
 
     # Both operands are spied. __eq__ walks self.items() *and* reads other[key],
     # so the right-hand store is promoted too -- watching only the left would let
@@ -283,10 +283,10 @@ def test_eq_does_not_mutate_either_operand(
                 f"right operand"
             )
 
-    assert set(left.replacement_strategy.memory) == before_left, (
+    assert cached_keys(left) == before_left, (
         "comparing changed the left operand's cache contents"
     )
-    assert set(right.replacement_strategy.memory) == before_right, (
+    assert cached_keys(right) == before_right, (
         "comparing changed the right operand's cache contents"
     )
 

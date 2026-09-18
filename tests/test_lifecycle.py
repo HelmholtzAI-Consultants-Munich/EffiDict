@@ -34,6 +34,7 @@ import pytest
 from effidict import EffiDict
 
 from .conftest import release_store
+from .helpers import build_policy
 
 
 def _build_unregistered(backend_cls, policy_cls, storage_dir, name="store", **kwargs):
@@ -46,7 +47,7 @@ def _build_unregistered(backend_cls, policy_cls, storage_dir, name="store", **kw
     backend = backend_cls(str(storage_dir / name))
     effidict = EffiDict(
         disk_backend=backend,
-        replacement_strategy=policy_cls(disk_backend=backend, max_in_memory=2),
+        replacement_strategy=build_policy(policy_cls, disk_backend=backend),
         **kwargs,
     )
     return effidict, backend.storage_path
@@ -309,7 +310,7 @@ def test_temporary_store_is_destroyed_on_close(backend_cls, policy_cls):
     try:
         d = EffiDict(
             disk_backend=backend,
-            replacement_strategy=policy_cls(disk_backend=backend, max_in_memory=2),
+            replacement_strategy=build_policy(policy_cls, disk_backend=backend),
         )
         d["k"] = "v"
 

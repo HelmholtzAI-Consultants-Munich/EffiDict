@@ -21,7 +21,13 @@ import pytest
 
 from effidict import DiskBackend, EvictionPolicy
 
-from .helpers import PROMOTING_POLICIES, in_cache, on_disk
+from .helpers import (
+    PROMOTING_POLICIES,
+    cached_bytes,
+    cached_keys,
+    in_cache,
+    on_disk,
+)
 
 FILLER = [f"filler{i}" for i in range(12)]
 
@@ -473,10 +479,10 @@ def test_cache_respects_byte_budget(backend_cls, policy_cls, make_dict):
     for i in range(40):
         d[f"k{i}"] = payload
 
-    held = sum(len(v) for v in d.replacement_strategy.memory.values())
+    held = cached_bytes(d)
     assert held <= budget * 2, (
         f"cache holds ~{held // 1024} KiB against a {budget // 1024} KiB budget; "
-        f"{len(d.replacement_strategy.memory)} items resident"
+        f"{len(cached_keys(d))} items resident"
     )
 
 

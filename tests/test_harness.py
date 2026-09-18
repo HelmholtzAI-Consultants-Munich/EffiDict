@@ -17,6 +17,7 @@ from .helpers import (
     UNSUPPORTED,
     VALUE_KINDS,
     assert_equal_value,
+    cached_keys,
     is_lossy,
     is_unsupported,
     supported_kinds,
@@ -103,7 +104,7 @@ def test_make_dict_honours_max_in_memory(make_dict):
     for key in ("a", "b", "c"):
         d[key] = key
 
-    assert len(d.replacement_strategy.memory) == 2
+    assert len(cached_keys(d)) == 2
     assert len(d.keys()) == 3
 
 

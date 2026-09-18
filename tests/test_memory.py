@@ -18,6 +18,12 @@ from pathlib import Path
 
 import pytest
 
+# Cache contents go through helpers, never through the policy's dict: the alias
+# disappears at issue 1.2, and a strict xfail cannot distinguish "still broken"
+# from "now raising AttributeError" -- these guards would stay red on a correct
+# byte-budget implementation instead of flipping when 1.4 lands.
+from .helpers import cached_bytes, cached_keys
+
 try:
     import resource
 except ImportError:  # pragma: no cover - Windows has no resource module
@@ -49,10 +55,6 @@ needs_rss = pytest.mark.skipif(
 )
 
 
-def _cached_bytes(store):
-    return sum(len(value) for value in store.replacement_strategy.memory.values())
-
-
 # --------------------------------------------------------------------------
 # the cache must honour a byte budget
 # --------------------------------------------------------------------------
@@ -76,10 +78,10 @@ def test_cache_respects_max_bytes(make_dict):
     for index in range(100):
         d[f"k{index}"] = _distinct(index)
 
-    held = _cached_bytes(d)
+    held = cached_bytes(d)
     assert held <= budget * 1.5, (
         f"the cache holds {held / MIB:.0f} MiB against a {budget / MIB:.0f} MiB "
-        f"budget, in {len(d.replacement_strategy.memory)} items"
+        f"budget, in {len(cached_keys(d))} items"
     )
 
 
@@ -226,7 +228,7 @@ def test_full_scan_does_not_evict_the_working_set(make_dict, backend_spy):
     working_set = [f"k{index:04d}" for index in range(195, 200)]
     for key in working_set:
         _ = d[key]
-    before = set(d.replacement_strategy.memory)
+    before = cached_keys(d)
     assert before, "precondition: something is cached"
 
     with backend_spy(d.disk_backend) as spy:
@@ -234,7 +236,7 @@ def test_full_scan_does_not_evict_the_working_set(make_dict, backend_spy):
             pass
         writes = spy.count("serialize") + spy.count("write_many")
 
-    after = set(d.replacement_strategy.memory)
+    after = cached_keys(d)
     survived = before & after
 
     # Two separate properties, so a failure says which one broke. The write count
