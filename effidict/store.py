@@ -82,7 +82,14 @@ class Store:
         raise NotImplementedError("see issue #4.2")
 
     def in_cache(self, key) -> bool:
-        """White-box hook for tier-invariant specs to assert preconditions."""
+        """White-box hook for tier-invariant specs to assert preconditions.
+
+        Must **not** acquire the store lock. The I5 specs use this to observe
+        tier residency while an eviction is deliberately held open; if this
+        blocked behind that eviction it could only ever report state from after
+        the write completed, at which point a drop-then-write implementation
+        looks identical to a compliant one.
+        """
         raise NotImplementedError("see issue #1.2")
 
     def flush(self) -> None:

@@ -179,6 +179,23 @@ def test_concurrent_writers_see_every_key(backend_cls, make_dict):
 
     assert not failures, f"{len(failures)} of 8 writers failed: {failures[:3]}"
 
+    # Each writer's in-loop read-back only proves the key survived until the next
+    # statement in that thread. A sibling can clobber or drop it a moment later
+    # and every worker still finishes clean, so the name of this test was a
+    # stronger claim than its assertions. Re-read the whole keyspace now that
+    # nothing is writing.
+    expected = {f"t{index}_{i}": f"t{index}_{i}" for index in range(8) for i in range(200)}
+    missing = sorted(key for key in expected if key not in d)
+    assert not missing, (
+        f"{len(missing)} of {len(expected)} keys did not survive the race "
+        f"(first few: {missing[:5]})"
+    )
+    wrong = {key: d[key] for key in expected if d[key] != expected[key]}
+    assert not wrong, (
+        f"{len(wrong)} of {len(expected)} keys read back wrong "
+        f"(first few: {dict(list(wrong.items())[:3])})"
+    )
+
 
 @pytest.mark.xfail(
     strict=True,
@@ -196,6 +213,16 @@ def test_reader_never_observes_a_key_mid_eviction(backend_cls, make_dict):
     event and the reader runs while the write is held open, so there is no timing
     assumption. Complements 0.4's version of this invariant -- that one asserts
     the tier state, this one asserts what a concurrent reader observes.
+
+    A reader that *blocks* is a pass, not a failure. ``Store`` holds a lock
+    across tier updates (I4), so after issue 1.2 the correct behaviour is for
+    this reader to wait for the eviction and then succeed -- it never observes
+    the key as absent, which is the whole claim. An earlier version of this probe
+    asserted ``not reader.is_alive()`` and therefore failed on a *correct* locked
+    implementation: measured against a simulated one, it failed with "the reader
+    blocked indefinitely" for both a compliant and a non-compliant store. What
+    must never happen is the reader returning an error, which is exactly what it
+    does today.
     """
     d = make_dict(max_in_memory=2)
     d["k0"] = "v0"
@@ -239,16 +266,33 @@ def test_reader_never_observes_a_key_mid_eviction(backend_cls, make_dict):
 
         reader = threading.Thread(target=read, daemon=True, name="mid-eviction-reader")
         reader.start()
-        reader.join(10)
-        assert not reader.is_alive(), (
-            "the reader blocked indefinitely while the write was held open"
-        )
+
+        # A short grace period, not a deadline. If the reader comes back within
+        # it, that answer was formed mid-eviction and is the observation this
+        # probe is named for. If it is still running, it is waiting on the Store
+        # lock -- the correct post-1.2 behaviour -- so the writer is released and
+        # the reader is judged on whether it *eventually* succeeded.
+        reader.join(0.5)
+        observed_mid_eviction = not reader.is_alive()
 
         assert "error" not in observed, (
             f"a concurrent reader saw {key!r} as {observed['error']!r} while its "
             f"write was still in flight"
         )
-        assert observed["value"] == f"v{key[1:]}"
+
+        release.set()
+        reader.join(10)
+        assert not reader.is_alive(), (
+            "the reader never finished, even after the eviction was released"
+        )
+        assert "error" not in observed, (
+            f"a concurrent reader blocked through the eviction and then still "
+            f"failed with {observed.get('error')!r}"
+        )
+        assert observed["value"] == f"v{key[1:]}", (
+            f"reader saw {observed['value']!r}, expected {f'v{key[1:]}'!r} "
+            f"(observed mid-eviction: {observed_mid_eviction})"
+        )
 
         # The writer's own outcome is asserted too, and only after the reader
         # checks above so the primary finding is reported first. Recording the

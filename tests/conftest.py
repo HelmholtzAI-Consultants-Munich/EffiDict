@@ -199,8 +199,13 @@ def make_dict(request, storage_dir, _open_stores):
 
         effidict = EffiDict(
             disk_backend=disk_backend,
-            replacement_strategy=policy(
-                disk_backend=disk_backend, max_in_memory=max_in_memory
+            # Through build_policy, like every other construction site: issue
+            # 1.1 drops both of these arguments, and this is the fixture nearly
+            # every spec in the suite goes through -- hard-coding them here would
+            # fail the whole suite at fixture construction rather than let each
+            # spec fail on the thing it actually pins.
+            replacement_strategy=build_policy(
+                policy, disk_backend=disk_backend, max_in_memory=max_in_memory
             ),
             # Passed unconditionally: silently dropping it would let issue 0.4's
             # byte-budget spec pass a budget that never arrives.

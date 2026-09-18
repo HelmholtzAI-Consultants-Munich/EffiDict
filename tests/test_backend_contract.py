@@ -357,3 +357,144 @@ def test_batch_and_single_writes_are_equivalent(backend_cls, policy_cls, make_di
     assert set(in_bulk.keys()) == set(one_at_a_time.keys())
     for key, value in items.items():
         assert in_bulk[key] == value
+
+
+# --------------------------------------------------------------------------
+# the batch and lookup API added in issue 0.1
+# --------------------------------------------------------------------------
+#
+# ``read_many``, ``write_many``, ``delete_many``, ``has`` and ``count`` were
+# added to DiskBackend as part of the target contract and then specified
+# nowhere: before these tests, ``read_many``, ``delete_many`` and ``count`` had
+# zero references in the suite and ``write_many`` appeared only inside spy call
+# counts. All five could ship as stubs, or return wrong results, without a
+# single strict xfail ever flipping.
+#
+# Every guard below is stated as *equivalence with the single-item operation*
+# rather than as freshly invented semantics. The single-item behaviour is
+# already pinned above -- ``deserialize`` on a missing key raises ``KeyError``,
+# a stored value round-trips -- so equivalence both defines the batch contract
+# and keeps the two halves of the API from drifting. It also decides the
+# question the stub docstrings leave open: a batch operation is not licensed to
+# be quieter about a missing key than the single-key call it replaces.
+
+BATCH_ITEMS = {f"b{i}": f"v{i}" for i in range(6)}
+
+
+def _single_write(backend_cls, storage_dir, items, name):
+    """Reference state: the same items written one at a time."""
+    reference = backend_cls(str(storage_dir / name))
+    for key, value in items.items():
+        reference.serialize(key, value)
+    return reference
+
+
+@pytest.mark.xfail(strict=True, reason="write_many is a contract stub (issue 4.1)")
+def test_write_many_matches_individual_writes(backend_cls, backend, storage_dir):
+    """A batched write must leave exactly what the same writes would leave."""
+    backend.write_many(dict(BATCH_ITEMS))
+
+    reference = _single_write(backend_cls, storage_dir, BATCH_ITEMS, "reference")
+    try:
+        assert sorted(backend.keys()) == sorted(reference.keys()), (
+            f"write_many stored {sorted(backend.keys())}, the same writes one "
+            f"at a time stored {sorted(reference.keys())}"
+        )
+        for key, value in BATCH_ITEMS.items():
+            assert_equal_value(backend.deserialize(key), value)
+    finally:
+        try:
+            reference.destroy()
+        except OSError:
+            pass
+
+
+@pytest.mark.xfail(strict=True, reason="read_many is a contract stub (issue 4.1)")
+def test_read_many_matches_individual_reads(backend):
+    """A batched read must return what the same reads would return."""
+    for key, value in BATCH_ITEMS.items():
+        backend.serialize(key, value)
+
+    keys = sorted(BATCH_ITEMS)
+    result = backend.read_many(keys)
+
+    assert isinstance(result, dict), f"read_many returned {type(result).__name__}"
+    assert sorted(result) == keys, (
+        f"read_many returned keys {sorted(result)}, asked for {keys}"
+    )
+    for key in keys:
+        assert_equal_value(result[key], backend.deserialize(key))
+
+
+@pytest.mark.xfail(strict=True, reason="read_many is a contract stub (issue 4.1)")
+def test_read_many_is_not_quieter_than_deserialize(backend):
+    """A missing key in a batch must not be silently dropped.
+
+    ``deserialize`` raises ``KeyError``, so a batch that omitted the key instead
+    would leave the caller unable to tell "absent" from "stored as None" -- and
+    would make the batch path the lossy one to use.
+    """
+    backend.serialize("present", "v")
+
+    with pytest.raises(KeyError):
+        backend.read_many(["present", "absent"])
+
+
+@pytest.mark.xfail(strict=True, reason="delete_many is a contract stub (issue 4.1)")
+def test_delete_many_matches_individual_deletes(backend):
+    """A batched delete must remove exactly the keys named, and no others."""
+    for key, value in BATCH_ITEMS.items():
+        backend.serialize(key, value)
+
+    doomed = sorted(BATCH_ITEMS)[:3]
+    survivors = sorted(BATCH_ITEMS)[3:]
+    backend.delete_many(doomed)
+
+    assert sorted(backend.keys()) == survivors, (
+        f"delete_many left {sorted(backend.keys())}, expected {survivors}"
+    )
+    for key in survivors:
+        assert_equal_value(backend.deserialize(key), BATCH_ITEMS[key])
+
+
+@pytest.mark.xfail(strict=True, reason="has is a contract stub (issue 2.2)")
+def test_has_agrees_with_keys(backend):
+    """``has`` must answer what ``keys`` reports, without enumerating it.
+
+    The point of ``has`` is that ``__contains__`` stops being a linear scan
+    (issue 2.2); a version that answers correctly by calling ``keys()`` would
+    satisfy this guard, which is why ``test_membership_cost_does_not_grow_with_the_store``
+    counts the enumeration separately.
+    """
+    for key, value in BATCH_ITEMS.items():
+        backend.serialize(key, value)
+
+    for key in BATCH_ITEMS:
+        assert backend.has(key) is True, f"has({key!r}) said False for a stored key"
+    assert backend.has("absent") is False, "has() said True for a key never written"
+
+
+@pytest.mark.xfail(strict=True, reason="count is a contract stub (issue 2.2)")
+def test_count_agrees_with_keys(backend):
+    """``count`` must agree with ``len(keys())`` before and after a removal.
+
+    Removal goes through ``del_item``, which is the single-key name the backends
+    actually have -- the batch method added in 0.1 is ``delete_many``, so the
+    pair is spelled inconsistently. Worth aligning in issue 4.1; pinned here
+    against the name that exists so this guard fails on ``count`` rather than on
+    an attribute error.
+    """
+    for key, value in BATCH_ITEMS.items():
+        backend.serialize(key, value)
+    assert backend.count() == len(BATCH_ITEMS), (
+        f"count() said {backend.count()} with {len(BATCH_ITEMS)} keys written"
+    )
+    assert backend.count() == len(backend.keys()), (
+        f"count() said {backend.count()}, keys() reports {len(backend.keys())}"
+    )
+
+    backend.del_item(sorted(BATCH_ITEMS)[0])
+    assert backend.count() == len(backend.keys()) == len(BATCH_ITEMS) - 1, (
+        f"after one removal count() said {backend.count()} and keys() reports "
+        f"{len(backend.keys())}; expected {len(BATCH_ITEMS) - 1}"
+    )

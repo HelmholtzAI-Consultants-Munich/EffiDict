@@ -310,6 +310,26 @@ def test_key_traversal_is_neutralised(request, backend_cls, probe_backend):
     assert not outside, f"a '..' key wrote outside the store: {outside}"
 
 
+def test_traversal_key_round_trips(request, backend_cls, probe_backend):
+    """``'../escaped'`` is a legal dict key and must round-trip as one key.
+
+    The containment guard above is deliberately satisfied by a refusal and says
+    nothing about a write that *succeeds*, so on its own it cannot see HDF5:
+    ``serialize('../escaped', v)`` returns cleanly, builds a group literally
+    named ``..`` inside the file, and ``keys()`` then reports ``'..'``. Contained,
+    but the caller's key is gone -- exactly the corruption ``BROKEN_KEYS``
+    already records for this label and that nothing asserted.
+
+    Same shape as ``test_keys_containing_path_separators``: ``_roundtrip``
+    subsumes both properties, returning ``escapes`` for a containment failure and
+    ``corrupt`` for a mangled key, so this is the stricter statement of the two
+    and the containment test stays as the separate, more severe finding.
+    """
+    _xfail_if_broken(request, "traversal", backend_cls)
+
+    assert _roundtrip(probe_backend, KEY_PROBES["traversal"]) == "ok"
+
+
 @pytest.mark.parametrize("label", ["empty", "overlong", "dot", "dotdot", "nul"])
 def test_empty_and_overlong_keys(request, backend_cls, probe_backend, label):
     """Degenerate but legal string keys must round-trip.

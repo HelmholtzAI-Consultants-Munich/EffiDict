@@ -173,6 +173,16 @@ def test_no_key_is_ever_absent_from_both_tiers(backend_cls, policy_cls, make_dic
     the concurrency specs asserts what a concurrent reader observes. Both also
     assert that the held-open write eventually succeeded, so neither can pass by
     keeping a key addressable while its write was failing.
+
+    Residency is read through ``in_cache``/``on_disk``, never through ``key in
+    d``. That is not a stylistic choice: ``Store`` holds a lock across tier
+    updates (I4), so once issue 1.2 lands, ``key in d`` on this thread blocks
+    behind the eviction we are deliberately holding open. Measured against a
+    simulated locked store, the probe then stalls for the full 10s timeout and
+    inspects *post-write* state -- at which point a drop-then-write
+    implementation passes it too, and the probe no longer measures I5 at all.
+    The two tier readers touch the cache dict and the backend directly, so they
+    observe the gap while it is open.
     """
     d = make_dict(max_in_memory=2)
     d["k0"] = "v0"
@@ -207,21 +217,18 @@ def test_no_key_is_ever_absent_from_both_tiers(backend_cls, policy_cls, make_dic
         assert started.wait(10), "eviction never reached the backend"
         key = victim["key"]
 
-        assert key in d, (
+        cached, persisted = in_cache(d, key), on_disk(d, key)
+        assert cached or persisted, (
             f"{key!r} is in neither tier while its write is in flight "
-            f"(cache={in_cache(d, key)}, disk={on_disk(d, key)})"
+            f"(cache={cached}, disk={persisted})"
         )
-        assert d[key] == f"v{key[1:]}"
 
-        # The eviction's own outcome is asserted too, and only after the tier
-        # checks above so the primary finding is reported first. Recording the
-        # error without asserting it would let this probe XPASS once the
-        # ordering is fixed while the write itself was still failing -- on
-        # SQLite it fails with ProgrammingError on every run today (issue 2.3),
-        # so "the key stayed addressable" would be claiming a completed write
-        # that never happened. Same reasoning as the concurrency-spec twin.
+        # Released before reading through the public API, because that read may
+        # legitimately block on the Store lock after issue 1.2. The I5
+        # observation above already happened, while the write was still held.
         release.set()
         writer.join(10)
+        assert d[key] == f"v{key[1:]}"
         assert not writer.is_alive(), "the evicting writer did not finish within 10s"
         assert "exc" not in writer_error, (
             f"the eviction itself failed with {writer_error['exc']!r}, so this "

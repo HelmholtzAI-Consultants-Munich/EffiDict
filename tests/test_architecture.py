@@ -112,8 +112,19 @@ def test_surface_is_complete(owner, surface, properties):
     for name in properties:
         attribute = inspect.getattr_static(owner, name)
         assert isinstance(attribute, property), (
-            f"{owner.__name__}.{name} is no longer a read-only property "
+            f"{owner.__name__}.{name} is no longer a property "
             f"({type(attribute).__name__})"
+        )
+        # A property with a setter is still a property, so isinstance alone
+        # would not hold the "read-only" half of the claim. Where a key lives is
+        # the Store's to decide; letting a caller assign the backend or the cache
+        # out from under it puts key placement back in two places, which is the
+        # root cause this whole epic exists to remove.
+        assert attribute.fset is None, (
+            f"{owner.__name__}.{name} gained a setter, so callers can swap it"
+        )
+        assert attribute.fdel is None, (
+            f"{owner.__name__}.{name} gained a deleter"
         )
 
 

@@ -34,7 +34,7 @@ import pytest
 from effidict import EffiDict
 
 from .conftest import release_store
-from .helpers import build_policy
+from .helpers import build_policy, on_disk
 
 
 def _build_unregistered(backend_cls, policy_cls, storage_dir, name="store", **kwargs):
@@ -162,23 +162,57 @@ def test_copying_does_not_destroy_the_originals_storage(
 def test_clone_produces_independent_store(backend_cls, policy_cls, make_dict, storage_dir):
     """``clone(new_path)`` must produce a store that shares nothing.
 
-    Independence has to hold in both directions, so the test writes to each side
-    and checks the other did not move.
+    Independence has to hold in both directions *and* survive the caches. An
+    earlier version of this spec mutated each side and checked the other had not
+    moved -- but every key it touched was still in cache and nothing is flushed,
+    so a clone that copied the cache while sharing one backend satisfied all
+    three assertions. It then destroyed the original's storage on the way out and
+    the test still passed.
+
+    So: flush before comparing, so the comparison reaches the persistent tier;
+    and destroy the clone at the end, because sharing a backend is invisible
+    until one side is torn down.
     """
+    origin_path = None
     d = make_dict()
     d["shared"] = "original"
+    d.flush()
+    origin_path = d.disk_backend.storage_path
 
     duplicate = d.clone(str(storage_dir / "clone"))
     try:
+        assert duplicate.disk_backend.storage_path != origin_path, (
+            "the clone is pointed at the original's storage, so it is an alias"
+        )
         assert duplicate["shared"] == "original"
 
         duplicate["shared"] = "changed-in-clone"
         duplicate["clone-only"] = "x"
         d["origin-only"] = "y"
+        duplicate.flush()
+        d.flush()
 
+        # Read through the persistent tier: with both sides flushed, a shared
+        # backend shows up here even when the caches are separate.
+        assert on_disk(d, "shared") and not on_disk(d, "clone-only"), (
+            "the clone's writes reached the original's storage"
+        )
+        assert not on_disk(duplicate, "origin-only"), (
+            "the original's writes reached the clone's storage"
+        )
         assert d["shared"] == "original", "clone wrote through to the original"
         assert "clone-only" not in d
         assert "origin-only" not in duplicate
+
+        # The ownership half. A clone sharing a backend passes everything above
+        # and then takes the original down with it.
+        duplicate.destroy()
+        assert os.path.exists(origin_path), (
+            "destroying the clone destroyed the original's storage"
+        )
+        assert d["shared"] == "original", (
+            "the original stopped reading after the clone was destroyed"
+        )
     finally:
         release_store(duplicate)
 
