@@ -162,6 +162,11 @@ def test_no_key_is_ever_absent_from_both_tiers(backend_cls, policy_cls, make_dic
     Blocks inside ``serialize`` and asks for the victim while the write is in
     flight. Deterministic: the probe waits on an event rather than a sleep, and
     the victim is whichever key the policy actually chose.
+
+    Asserts the tier state; ``test_reader_never_observes_a_key_mid_eviction`` in
+    the concurrency specs asserts what a concurrent reader observes. Both also
+    assert that the held-open write eventually succeeded, so neither can pass by
+    keeping a key addressable while its write was failing.
     """
     d = make_dict(max_in_memory=2)
     d["k0"] = "v0"
@@ -201,8 +206,23 @@ def test_no_key_is_ever_absent_from_both_tiers(backend_cls, policy_cls, make_dic
             f"(cache={in_cache(d, key)}, disk={on_disk(d, key)})"
         )
         assert d[key] == f"v{key[1:]}"
-    finally:
+
+        # The eviction's own outcome is asserted too, and only after the tier
+        # checks above so the primary finding is reported first. Recording the
+        # error without asserting it would let this probe XPASS once the
+        # ordering is fixed while the write itself was still failing -- on
+        # SQLite it fails with ProgrammingError on every run today (issue 2.3),
+        # so "the key stayed addressable" would be claiming a completed write
+        # that never happened. Same reasoning as the concurrency-spec twin.
         release.set()
+        writer.join(10)
+        assert not writer.is_alive(), "the evicting writer did not finish within 10s"
+        assert "exc" not in writer_error, (
+            f"the eviction itself failed with {writer_error['exc']!r}, so this "
+            f"probe never observed a completed write"
+        )
+    finally:
+        release.set()  # idempotent; frees the writer if an assertion above failed
         writer.join(10)
         d.disk_backend.serialize = original
 

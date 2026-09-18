@@ -183,7 +183,15 @@ class CoreConformance(RuleBasedStateMachine):
 
     # -- rules -----------------------------------------------------------
 
-    @rule(target=keys, key=KEYS, data=st.data())
+    # The key is drawn from the bundle as well as fresh, so reassigning an
+    # existing key is exercised deliberately rather than by chance. Drawing only
+    # from KEYS left the bundle write-only for this one rule: measured at 0
+    # overwrites in 15 writes under FAST and 11 in 618 under DEEP. A store whose
+    # second write to a key reached disk but not the cache therefore survived
+    # both budgets; bundle-drawn it is 3 in 10 under FAST and that defect is
+    # caught at both. Overwrite is the scenario behind I2's clean/dirty tagging
+    # and the stale-disk-copy defect, so the oracle has to reach it.
+    @rule(target=keys, key=st.one_of(keys, KEYS), data=st.data())
     def setitem(self, key, data):
         value = data.draw(self._value_strategy)
         self.ref[key] = copy.deepcopy(value)
@@ -269,13 +277,17 @@ class MappingApiConformance(CoreConformance):
     def get_with_default(self, key):
         self._mirror(lambda d: d.get(key, "__missing__"))
 
-    @rule(target=KEY_BUNDLE, key=KEYS, data=st.data())
+    # ANY_KEY, not KEYS: setdefault on a key that is already present must
+    # return the stored value and leave it alone, which is the branch that can
+    # actually go wrong. Drawing only fresh keys exercised the insert path only.
+    @rule(target=KEY_BUNDLE, key=ANY_KEY, data=st.data())
     def setdefault(self, key, data):
         value = data.draw(self._value_strategy)
         self._mirror(lambda d: d.setdefault(key, copy.deepcopy(value)))
         return key
 
-    @rule(key=KEYS, data=st.data())
+    # ANY_KEY for the same reason: update over an existing key must replace it.
+    @rule(key=ANY_KEY, data=st.data())
     def update(self, key, data):
         value = data.draw(self._value_strategy)
         self._mirror(lambda d: d.update({key: copy.deepcopy(value)}))
