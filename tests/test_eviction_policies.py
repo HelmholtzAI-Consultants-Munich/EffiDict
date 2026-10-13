@@ -473,13 +473,65 @@ def test_random_policy_only_ever_names_tracked_keys():
 )
 @pytest.mark.parametrize("name", POLICY_NAMES)
 def test_clear_drops_everything(name):
-    """``clear()`` must leave the policy indistinguishable from a fresh one."""
-    policy = _policy_class(name)()
+    """``clear()`` must leave the policy indistinguishable from a fresh one.
+
+    "Indistinguishable" is the claim, so it is what gets asserted. An earlier
+    version checked only that ``victim()`` then raised ``KeyError``, which a
+    policy that drops its ordering while keeping its frequency counters
+    satisfies -- and LFU/MFU would then pick victims from counts belonging to
+    keys the cache no longer holds, the whole defect ``clear`` exists to avoid.
+    Compared against a fresh instance rather than against a list of attribute
+    names, so a counter added later is covered without anyone remembering to
+    extend this test.
+    """
+    cls = _policy_class(name)
+    policy = cls()
     for key in ("a", "b", "c"):
         policy.on_insert(key)
+    # Access twice: on LFU/MFU this is what separates a frequency table that was
+    # reset from one that merely lost its keys.
+    policy.on_access("a")
     policy.on_access("a")
 
     policy.clear()
 
     with pytest.raises(KeyError):
         policy.victim()
+
+    residual = _residual_state(policy)
+    assert not residual, (
+        f"{name} kept state after clear(): {residual}"
+    )
+    # Compared on comparable state only. The residual check above covers
+    # containers; this adds plain counters -- a ``self.tick`` left at 57 is not
+    # ``Sized``, so nothing else would see it. Attributes that do not compare by
+    # value (a lock, a handle) are skipped rather than failing: two fresh ones
+    # are never equal, which would make this fail for a reason that has nothing
+    # to do with clear().
+    comparable = (int, float, bool, str, bytes, type(None), abc.Sized)
+
+    def differs(left, right):
+        """``left != right`` as a plain bool, or ``False`` if it is not one.
+
+        An attribute whose ``!=`` returns something elementwise -- an ndarray is
+        ``Sized``, so it reaches here -- would raise ValueError on the truth
+        test and fail this spec for a reason unrelated to ``clear()``.
+        """
+        try:
+            return bool(left != right)
+        except Exception:  # noqa: BLE001 - uncomparable means "cannot judge"
+            return False
+
+    cleared_state = _instance_state(policy)
+    fresh_state = _instance_state(cls())
+    differing = {
+        attribute: (value, fresh_state.get(attribute))
+        for attribute, value in cleared_state.items()
+        if isinstance(value, comparable)
+        and isinstance(fresh_state.get(attribute), comparable)
+        and differs(value, fresh_state.get(attribute))
+    }
+    assert not differing, (
+        f"{name} after clear() differs from a fresh instance "
+        f"(attribute: cleared vs fresh): {differing}"
+    )

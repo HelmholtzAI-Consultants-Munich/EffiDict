@@ -293,7 +293,12 @@ class RecordingPolicy(EvictionPolicy):
 
 @pytest.mark.xfail(
     strict=True,
-    reason="Cache is a contract stub; neither budget is enforced (issue 1.4)",
+    reason=(
+        "Cache is a contract stub, so this dies at the constructor (issue 1.2) "
+        "before it can reach the thing it pins -- neither budget is enforced "
+        "(issue 1.4). It also exercises has/discard, which are 1.2 as well, so "
+        "it stays red until both land"
+    ),
 )
 def test_cache_reports_what_must_be_shed_for_each_budget():
     """I8. Either budget alone must put entries on the eviction list.
@@ -309,6 +314,13 @@ def test_cache_reports_what_must_be_shed_for_each_budget():
     is gone before anything could write it out, and ``Cache`` has no backend to
     write it to. ``evict_candidates`` naming the surplus is the form that lets
     ``Store`` peek, write, then discard.
+
+    The exact count is asserted, not a lower bound, and that is a real
+    constraint worth stating: ``Cache`` promises *keys that must be shed to get
+    back inside budget*, so shedding to a low-water mark to avoid thrashing
+    falls outside the contract as written. If issue 1.4 wants watermark
+    eviction, this assertion and that docstring change together -- which is the
+    point of pinning it here rather than discovering the disagreement later.
     """
     by_items = Cache(policy=RecordingPolicy(), max_items=2)
     for index in range(5):
@@ -317,9 +329,32 @@ def test_cache_reports_what_must_be_shed_for_each_budget():
         f"put dropped entries by itself: {len(by_items)} of 5 held, so a dirty "
         f"victim would be unrecoverable"
     )
-    assert len(list(by_items.evict_candidates())) == 3, (
+    candidates = list(by_items.evict_candidates())
+    # Distinct, and actually present. ``len(...) == 3`` alone is satisfied by a
+    # cache that names one key three times, which sheds a single entry and
+    # leaves the budget broken.
+    assert len(set(candidates)) == len(candidates), (
+        f"evict_candidates repeated a key: {candidates}"
+    )
+    assert all(by_items.has(key) for key in candidates), (
+        f"evict_candidates named keys the cache does not hold: "
+        f"{[key for key in candidates if not by_items.has(key)]}"
+    )
+    # And sufficient: discarding exactly what it named must reach the budget,
+    # which is the property the caller depends on. A list that is merely
+    # non-empty leaves the owner guessing how many times to ask.
+    assert len(candidates) == 3, (
         f"3 entries are over a 2-item budget but evict_candidates named "
-        f"{len(list(by_items.evict_candidates()))}"
+        f"{len(candidates)}: {candidates}"
+    )
+    for key in candidates:
+        by_items.discard(key)
+    assert len(by_items) <= 2, (
+        f"after discarding every named candidate the cache still holds "
+        f"{len(by_items)} entries against a 2-item budget"
+    )
+    assert not list(by_items.evict_candidates()), (
+        "the cache is inside its budget but still names candidates to shed"
     )
 
     by_bytes = Cache(
@@ -332,9 +367,24 @@ def test_cache_reports_what_must_be_shed_for_each_budget():
     assert by_bytes.nbytes() > 4096, (
         "nbytes() did not account the values it was given"
     )
-    assert list(by_bytes.evict_candidates()), (
+    byte_candidates = list(by_bytes.evict_candidates())
+    assert byte_candidates, (
         f"{by_bytes.nbytes()} bytes are resident against a 4096-byte budget and "
         f"evict_candidates named nothing, so the byte budget is not tracked"
+    )
+    assert len(set(byte_candidates)) == len(byte_candidates), (
+        f"evict_candidates repeated a key: {byte_candidates}"
+    )
+    # Non-empty is far too weak here: 20 KiB against a 4 KiB budget needs most
+    # of the entries gone, and a cache naming one victim would pass that alone.
+    for key in byte_candidates:
+        by_bytes.discard(key)
+    assert by_bytes.nbytes() <= 4096, (
+        f"after discarding every named candidate {by_bytes.nbytes()} bytes are "
+        f"still resident against a 4096-byte budget"
+    )
+    assert not list(by_bytes.evict_candidates()), (
+        "the cache is inside its byte budget but still names candidates to shed"
     )
 
 
