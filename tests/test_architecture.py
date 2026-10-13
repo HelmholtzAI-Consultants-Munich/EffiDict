@@ -41,11 +41,11 @@ STORE_SURFACE = {
     # implementation that renamed or dropped ``cache`` would stay XFAIL rather
     # than trip a passing guard -- the composition root would be wrong and
     # nothing would say so.
-    "__init__": ["backend", "cache", "lock", "owns_storage"],
+    "__init__": ["backend", "cache", "lock=", "owns_storage="],
     "get": ["key"],
     "set": ["key", "value"],
     "delete": ["key"],
-    "pop": ["key", "default"],
+    "pop": ["key", "default="],
     "clear": [],
     "update": ["items"],
     "contains": ["key"],
@@ -64,11 +64,11 @@ STORE_PROPERTIES = ["backend", "cache", "owns_storage"]
 
 #: The documented ``Cache`` surface.
 CACHE_SURFACE = {
-    "__init__": ["policy", "max_items", "max_bytes", "size_estimator"],
+    "__init__": ["policy", "max_items=", "max_bytes=", "size_estimator="],
     "has": ["key"],
     "get": ["key"],
     "peek": ["key"],
-    "put": ["key", "value", "dirty"],
+    "put": ["key", "value", "dirty="],
     "discard": ["key"],
     "clear": [],
     "__len__": [],
@@ -80,11 +80,49 @@ CACHE_SURFACE = {
 }
 
 
-def _positional_names(func):
-    """Parameter names after ``self``, excluding ``*args``/``**kwargs``."""
-    kinds = (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
-    parameters = list(inspect.signature(func).parameters.values())
-    return [p.name for p in parameters if p.name != "self" and p.kind in kinds]
+def _signature_spec(func):
+    """Every parameter after ``self``, with its kind and whether it has a default.
+
+    Names alone are not a signature. Three things the earlier name-only form
+    could not see, each of which changes what callers may write:
+
+    * **Defaults.** ``pop(key, default=MISSING)`` and ``pop(key, default)``
+      produce identical name lists, so Phase 1 could make the default required
+      and break ``pop(key)`` -- the precise ambiguity the ``MISSING`` sentinel
+      was added to remove -- without this guard noticing.
+    * **Catch-alls.** ``*args``/``**kwargs`` were filtered out, so every method
+      expecting no parameters -- eleven of them across the two tables -- was
+      satisfied by ``def method(self, *args, **kwargs)``.
+    * **Keyword-only.** Those parameters were dropped silently, so the table
+      could neither require nor forbid them.
+
+    Encoding, chosen to stay readable in the tables below::
+
+        key          positional-or-keyword, required
+        key=         positional-or-keyword, has a default
+        kw:key       keyword-only, required
+        kw:key=      keyword-only, has a default
+        pos:key      positional-only
+        *args        var-positional
+        **kwargs     var-keyword
+    """
+    parameter = inspect.Parameter
+    spec = []
+    for item in inspect.signature(func).parameters.values():
+        if item.name == "self":
+            continue
+        default = "=" if item.default is not parameter.empty else ""
+        if item.kind is parameter.VAR_POSITIONAL:
+            spec.append(f"*{item.name}")
+        elif item.kind is parameter.VAR_KEYWORD:
+            spec.append(f"**{item.name}")
+        elif item.kind is parameter.KEYWORD_ONLY:
+            spec.append(f"kw:{item.name}{default}")
+        elif item.kind is parameter.POSITIONAL_ONLY:
+            spec.append(f"pos:{item.name}{default}")
+        else:
+            spec.append(f"{item.name}{default}")
+    return spec
 
 
 # --------------------------------------------------------------------------
@@ -111,7 +149,7 @@ def test_surface_is_complete(owner, surface, properties):
 
     wrong = {}
     for name, expected in surface.items():
-        actual = _positional_names(getattr(owner, name))
+        actual = _signature_spec(getattr(owner, name))
         if actual != expected:
             wrong[name] = f"expected {expected}, got {actual}"
     assert not wrong, f"{owner.__name__} signatures changed: {wrong}"
@@ -152,7 +190,7 @@ def test_unimplemented_methods_name_their_issue(owner):
         if not callable(function):
             continue
         try:
-            function(object.__new__(owner), *[None] * len(_positional_names(function)))
+            function(object.__new__(owner), *[None] * len(_signature_spec(function)))
         except NotImplementedError as exc:
             if "issue #" not in str(exc):
                 unreferenced.append(f"{name}: {str(exc)!r}")
