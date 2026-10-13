@@ -29,6 +29,18 @@ from .helpers import (
     on_disk,
 )
 
+#: How long a probe keeps a write blocked inside ``serialize``, and how long it
+#: waits for anything to happen. HOLD must comfortably exceed the *sum* of the
+#: waits performed while the write is held, or the hold expires mid-inspection:
+#: the write completes, and the tier state the probe then examines is
+#: post-write, where a drop-then-write implementation is indistinguishable from
+#: a compliant one. Both numbers are liveness bounds, never discriminators --
+#: nothing here decides what happened by how long it took. The ``finally`` in
+#: each probe releases the hold, so HOLD is only ever reached if the test itself
+#: wedged.
+HOLD_SECONDS = 120
+WAIT_SECONDS = 10
+
 FILLER = [f"filler{i}" for i in range(12)]
 
 
@@ -196,7 +208,7 @@ def test_no_key_is_ever_absent_from_both_tiers(backend_cls, policy_cls, make_dic
     def blocking_serialize(key, value):
         victim["key"] = key
         started.set()
-        release.wait(10)
+        release.wait(HOLD_SECONDS)
         return original(key, value)
 
     writer_error = {}
@@ -214,7 +226,7 @@ def test_no_key_is_ever_absent_from_both_tiers(backend_cls, policy_cls, make_dic
     writer = threading.Thread(target=write, daemon=True)
     writer.start()
     try:
-        assert started.wait(10), "eviction never reached the backend"
+        assert started.wait(WAIT_SECONDS), "eviction never reached the backend"
         key = victim["key"]
 
         cached, persisted = in_cache(d, key), on_disk(d, key)
@@ -227,16 +239,18 @@ def test_no_key_is_ever_absent_from_both_tiers(backend_cls, policy_cls, make_dic
         # legitimately block on the Store lock after issue 1.2. The I5
         # observation above already happened, while the write was still held.
         release.set()
-        writer.join(10)
+        writer.join(WAIT_SECONDS)
         assert d[key] == f"v{key[1:]}"
-        assert not writer.is_alive(), "the evicting writer did not finish within 10s"
+        assert not writer.is_alive(), (
+            f"the evicting writer did not finish within {WAIT_SECONDS}s"
+        )
         assert "exc" not in writer_error, (
             f"the eviction itself failed with {writer_error['exc']!r}, so this "
             f"probe never observed a completed write"
         )
     finally:
         release.set()  # idempotent; frees the writer if an assertion above failed
-        writer.join(10)
+        writer.join(WAIT_SECONDS)
         d.disk_backend.serialize = original
 
 

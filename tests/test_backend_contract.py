@@ -506,21 +506,44 @@ def test_iter_keys_streams_the_same_keys_as_keys(backend):
 
     The whole point of the method is that walking a ten-million-key store does
     not require holding ten million keys at once (issue 4.2), so "returns the
-    right keys" is only half the contract -- a one-line implementation that does
-    ``return iter(self.keys())`` satisfies the key set and none of the intent.
-    Asserted structurally, because the size at which the memory cost shows up is
-    far too large for a test: the object handed back must be an iterator, and
-    consuming it must not be repeatable the way a list would be.
+    right keys" is only half the contract.
+
+    The other half needs proving rather than describing. An earlier version of
+    this spec checked only that an iterator came back and did not restart --
+    and said in its own docstring that ``return iter(self.keys())`` would
+    satisfy it, which is precisely the implementation that materialises
+    everything. So ``keys()`` is spied on: a streaming implementation must not
+    call it, because calling it *is* the materialisation. The size at which the
+    memory cost shows up directly is far too large for a test; this is the
+    structural statement of the same property.
     """
     for key, value in BATCH_ITEMS.items():
         backend.serialize(key, value)
 
-    stream = backend.iter_keys()
-    assert iter(stream) is stream, (
-        f"iter_keys returned {type(stream).__name__}, not an iterator"
-    )
+    calls = []
+    original_keys = backend.keys
 
-    streamed = list(stream)
+    def counting_keys():
+        calls.append(1)
+        return original_keys()
+
+    backend.keys = counting_keys
+    try:
+        stream = backend.iter_keys()
+        assert iter(stream) is stream, (
+            f"iter_keys returned {type(stream).__name__}, not an iterator"
+        )
+        streamed = list(stream)
+        assert not calls, (
+            f"iter_keys built its answer from keys() ({len(calls)} call(s)), so "
+            f"it materialised the whole keyspace before yielding anything"
+        )
+    finally:
+        # del, not reassignment: ``original_keys`` is a *bound* method, so
+        # assigning it back would leave a permanent instance attribute shadowing
+        # the class method rather than restoring the backend.
+        del backend.keys
+
     assert sorted(streamed) == sorted(backend.keys()), (
         f"iter_keys yielded {sorted(streamed)}, keys() reports "
         f"{sorted(backend.keys())}"

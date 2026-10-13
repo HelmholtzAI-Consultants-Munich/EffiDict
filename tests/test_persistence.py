@@ -214,11 +214,14 @@ _WRITER_SCRIPT = textwrap.dedent(
     import sys
     sys.path.insert(0, {repo!r})
     from effidict import EffiDict, {backend}, LRUReplacement
+    from tests.helpers import build_policy  # see the note in test_concurrency
 
     backend = {backend}.create({path!r})
     store = EffiDict(
         disk_backend=backend,
-        replacement_strategy=LRUReplacement(disk_backend=backend, max_in_memory=2),
+        replacement_strategy=build_policy(
+            LRUReplacement, disk_backend=backend, max_in_memory=2
+        ),
     )
     for key, value in {keys!r}.items():
         store[key] = value

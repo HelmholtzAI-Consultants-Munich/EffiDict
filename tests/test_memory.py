@@ -94,6 +94,7 @@ _RSS_PROBE = """
 import os, resource, sys
 sys.path.insert(0, sys.argv[1])
 from effidict import EffiDict, PickleBackend, LRUReplacement
+from tests.helpers import build_policy  # see the note in test_concurrency
 
 tmpdir, items, budget = sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
 MIB = 1024 * 1024
@@ -109,7 +110,9 @@ def distinct(index, size=MIB):
 backend = PickleBackend(os.path.join(tmpdir, "store"))
 store = EffiDict(
     disk_backend=backend,
-    replacement_strategy=LRUReplacement(disk_backend=backend, max_in_memory=items),
+    replacement_strategy=build_policy(
+        LRUReplacement, disk_backend=backend, max_in_memory=items
+    ),
     max_bytes=budget,
 )
 baseline = peak_bytes()

@@ -107,11 +107,14 @@ _ORDER_SCRIPT = textwrap.dedent(
     import sys
     sys.path.insert(0, {repo!r})
     from effidict import EffiDict, {backend}, FIFOReplacement
+    from tests.helpers import build_policy  # see the note in test_concurrency
 
     backend = {backend}({path!r})
     store = EffiDict(
         disk_backend=backend,
-        replacement_strategy=FIFOReplacement(disk_backend=backend, max_in_memory=4),
+        replacement_strategy=build_policy(
+            FIFOReplacement, disk_backend=backend, max_in_memory=4
+        ),
     )
     for key in {keys!r}:
         store[key] = key
@@ -229,7 +232,12 @@ def test_mutablemapping_surface_is_complete(backend_cls, policy_cls, make_dict):
     strict=True,
     reason=(
         "__reversed__, __or__ and fromkeys are absent from EffiDict, so three "
-        "entries in MAPPING_METHODS were only ever hasattr-checked (issue 6.1)"
+        "entries in MAPPING_METHODS were only ever hasattr-checked. Absent does "
+        "not mean inert: with no __reversed__, reversed() falls back to the "
+        "sequence protocol and subscripts the store with integers, so the "
+        "failure surfaces from inside the backend -- TypeError out of "
+        "os.path.join on Pickle/HDF5, KeyError on SQLite/JSON -- rather than as "
+        "a clean TypeError about reversal (issue 6.1)"
     ),
 )
 def test_dict_extras_behave_like_dict(backend_cls, policy_cls, make_dict):

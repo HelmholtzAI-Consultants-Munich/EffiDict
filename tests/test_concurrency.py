@@ -41,6 +41,7 @@ from effidict import (
 )
 
 from .conftest import release_store
+from .helpers import build_policy
 
 pytestmark = pytest.mark.stress
 
@@ -54,14 +55,26 @@ PICKLABLE_BACKENDS = {PickleBackend, JSONBackend}
 #: Backends whose handle is bound to the thread that opened it.
 THREAD_AFFINE_BACKENDS = {SqliteBackend}
 
+#: How long a probe keeps a write blocked inside ``serialize``, and how long it
+#: waits for anything to happen. HOLD must comfortably exceed the *sum* of the
+#: waits performed while the write is held, or the hold expires mid-inspection:
+#: the write completes, and the tier state the probe then examines is
+#: post-write, where a drop-then-write implementation is indistinguishable from
+#: a compliant one. Both numbers are liveness bounds, never discriminators --
+#: nothing here decides what happened by how long it took. The ``finally`` in
+#: each probe releases the hold, so HOLD is only ever reached if the test itself
+#: wedged.
+HOLD_SECONDS = 120
+WAIT_SECONDS = 10
+
 WORKER_KEYS = {f"k{i}": f"v{i}" for i in range(6)}
 
 
 def _build(backend, max_in_memory=2):
     return EffiDict(
         disk_backend=backend,
-        replacement_strategy=LRUReplacement(
-            disk_backend=backend, max_in_memory=max_in_memory
+        replacement_strategy=build_policy(
+            LRUReplacement, disk_backend=backend, max_in_memory=max_in_memory
         ),
     )
 
@@ -116,7 +129,12 @@ def test_backend_is_usable_from_another_thread(request, backend_cls, storage_dir
             except Exception as exc:  # noqa: BLE001
                 observed["error"] = exc
 
-        reader = threading.Thread(target=read, name="cross-thread-reader")
+        # daemon, like every other probe thread here. If the backend call
+        # deadlocks, join() below reports the timeout and the assertion fails --
+        # but a *non*-daemon thread then keeps the interpreter alive at exit
+        # while the fixture closes the backend underneath it, so the CI job
+        # hangs forever instead of reporting the failure it already found.
+        reader = threading.Thread(target=read, name="cross-thread-reader", daemon=True)
         reader.start()
         reader.join(10)
         assert not reader.is_alive(), "the reading thread did not finish within 10s"
@@ -163,7 +181,9 @@ def test_concurrent_writers_see_every_key(backend_cls, make_dict):
             failures.append(f"thread {index}: {type(exc).__name__}: {exc}")
 
     threads = [
-        threading.Thread(target=worker, args=(i,), name=f"writer-{i}")
+        # daemon: a writer wedged on a backend lock must not outlive the test
+        # and hang the interpreter at exit (see the cross-thread reader above).
+        threading.Thread(target=worker, args=(i,), name=f"writer-{i}", daemon=True)
         for i in range(8)
     ]
     for thread in threads:
@@ -185,14 +205,25 @@ def test_concurrent_writers_see_every_key(backend_cls, make_dict):
     # stronger claim than its assertions. Re-read the whole keyspace now that
     # nothing is writing.
     expected = {f"t{index}_{i}": f"t{index}_{i}" for index in range(8) for i in range(200)}
-    missing = sorted(key for key in expected if key not in d)
-    assert not missing, (
-        f"{len(missing)} of {len(expected)} keys did not survive the race "
-        f"(first few: {missing[:5]})"
-    )
-    wrong = {key: d[key] for key in expected if d[key] != expected[key]}
+
+    # Every lookup goes through this, membership included. Both ``in`` and
+    # ``[]`` consult the backend, and after eight threads have hammered it those
+    # calls themselves raise -- KeyError from the eviction gap, and on SQLite
+    # ProgrammingError from thread affinity (issue 2.3). A raw exception here
+    # replaces this test's diagnostic with a bare traceback: measured at 4 of 28
+    # matrix cases reporting nothing about what the race actually lost. Turning
+    # the exception into the observed value keeps it a finding and reports it
+    # alongside the keys that went missing.
+    def read(key):
+        try:
+            return d[key]
+        except Exception as exc:  # noqa: BLE001 - the failure is the finding
+            return f"<{type(exc).__name__}: {exc}>"
+
+    observed = {key: read(key) for key in expected}
+    wrong = {key: value for key, value in observed.items() if value != expected[key]}
     assert not wrong, (
-        f"{len(wrong)} of {len(expected)} keys read back wrong "
+        f"{len(wrong)} of {len(expected)} keys did not survive the race "
         f"(first few: {dict(list(wrong.items())[:3])})"
     )
 
@@ -246,7 +277,7 @@ def test_reader_never_observes_a_key_mid_eviction(backend_cls, make_dict):
     def blocking_serialize(key, value):
         victim["key"] = key
         started.set()
-        release.wait(10)
+        release.wait(HOLD_SECONDS)
         return original(key, value)
 
     def write():
@@ -262,7 +293,7 @@ def test_reader_never_observes_a_key_mid_eviction(backend_cls, make_dict):
     writer = threading.Thread(target=write, daemon=True)
     writer.start()
     try:
-        assert started.wait(10), "eviction never reached the backend"
+        assert started.wait(WAIT_SECONDS), "eviction never reached the backend"
         key = victim["key"]
 
         observed = {}
@@ -283,7 +314,7 @@ def test_reader_never_observes_a_key_mid_eviction(backend_cls, make_dict):
 
         # Distinguishes "not scheduled yet" from "blocked on the lock", which a
         # timer cannot. If this fails the machine is wedged, not the store.
-        assert entered.wait(10), "the reader thread never reached the read path"
+        assert entered.wait(WAIT_SECONDS), "the reader thread never reached the read path"
 
         # The write is still held, so whatever the reader returns here it formed
         # mid-eviction. If it has not returned, it is waiting on the Store lock.
@@ -297,7 +328,7 @@ def test_reader_never_observes_a_key_mid_eviction(backend_cls, make_dict):
         # unlocked, a drop-then-write store is caught in 0.0s with KeyError;
         # locked, both orderings pass, which is correct because the lock hides
         # the gap from readers and the ordering itself is 0.4's to pin.
-        answered_mid_eviction = finished.wait(10)
+        answered_mid_eviction = finished.wait(WAIT_SECONDS)
 
         assert "error" not in observed, (
             f"a concurrent reader saw {key!r} as {observed['error']!r} while its "
@@ -305,7 +336,7 @@ def test_reader_never_observes_a_key_mid_eviction(backend_cls, make_dict):
         )
 
         release.set()
-        assert finished.wait(10), (
+        assert finished.wait(WAIT_SECONDS), (
             "the reader never finished, even after the eviction was released"
         )
         assert "error" not in observed, (
@@ -323,15 +354,17 @@ def test_reader_never_observes_a_key_mid_eviction(backend_cls, make_dict):
         # ordering is fixed while SQLite's write was still failing on thread
         # affinity -- a pass claiming more than it proved.
         release.set()
-        writer.join(10)
-        assert not writer.is_alive(), "the evicting writer did not finish within 10s"
+        writer.join(WAIT_SECONDS)
+        assert not writer.is_alive(), (
+            f"the evicting writer did not finish within {WAIT_SECONDS}s"
+        )
         assert "exc" not in writer_error, (
             f"the eviction itself failed with {writer_error['exc']!r}, so this "
             f"probe never observed a completed write"
         )
     finally:
         release.set()  # idempotent; frees the writer if an assertion above failed
-        writer.join(10)
+        writer.join(WAIT_SECONDS)
         d.disk_backend.serialize = original
 
 
@@ -531,11 +564,18 @@ _WRITER = textwrap.dedent(
     import sys
     sys.path.insert(0, {repo!r})
     from effidict import EffiDict, {backend}, LRUReplacement
+    # Through the same helper the in-process specs use: issue 1.1 drops both of
+    # these arguments, and a child that hard-codes them would die on TypeError
+    # rather than exercise what it was launched for. The repo root is already on
+    # sys.path above, so tests.helpers is importable here.
+    from tests.helpers import build_policy
 
     backend = {backend}.open_or_create({path!r})
     store = EffiDict(
         disk_backend=backend,
-        replacement_strategy=LRUReplacement(disk_backend=backend, max_in_memory=4),
+        replacement_strategy=build_policy(
+            LRUReplacement, disk_backend=backend, max_in_memory=4
+        ),
     )
     for key, value in {items!r}.items():
         store[key] = value
