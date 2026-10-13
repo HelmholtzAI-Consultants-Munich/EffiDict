@@ -58,19 +58,29 @@ def test_storage_path_is_stable_across_instances(backend_cls, storage_dir):
 
     Without this nothing else in this file is reachable: a store you cannot
     address twice cannot be reopened, and 'persistent' means nothing.
+
+    The first handle is released before the second is opened. Holding both at
+    once would quietly demand that every backend permit concurrent handles on
+    one path -- HDF5 and any lock-taking backend may refuse the second while
+    being perfectly addressable, and this spec would fail them for something it
+    never meant to assert. Only the *path string* is compared, so releasing the
+    first store first costs nothing. Same correction as
+    ``test_open_does_not_truncate_existing_store``.
     """
     path = str(storage_dir / "store")
 
     first = backend_cls(path)
+    first_path = first.storage_path
+    release_store(first)
+
     second = backend_cls(path)
     try:
-        assert first.storage_path == second.storage_path, (
+        assert first_path == second.storage_path, (
             f"same argument produced two locations:\n"
-            f"  {first.storage_path}\n  {second.storage_path}"
+            f"  {first_path}\n  {second.storage_path}"
         )
     finally:
-        for backend in (first, second):
-            release_store(backend)
+        release_store(second)
 
 
 @pytest.mark.xfail(

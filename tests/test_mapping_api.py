@@ -282,6 +282,94 @@ def test_dict_extras_behave_like_dict(backend_cls, policy_cls, make_dict):
 # --------------------------------------------------------------------------
 
 
+#: ``(other, expected)`` pairs, where ``expected`` is what a plain ``dict``
+#: holding ``BASE`` answers. Comparing against ``dict``'s own answer rather than
+#: a hand-written True/False keeps the table honest.
+BASE = {"x": "1", "y": "2"}
+EQUALITY_CASES = [
+    ("equal mapping", dict(BASE)),
+    ("different value", {"x": "1", "y": "9"}),
+    ("missing key", {"x": "1"}),
+    ("extra key", {"x": "1", "y": "2", "z": "3"}),
+    ("empty mapping", {}),
+    ("not a mapping", 42),
+    ("none", None),
+    ("list of pairs", [("x", "1"), ("y", "2")]),
+]
+
+
+@pytest.mark.parametrize("label, other", EQUALITY_CASES, ids=[c[0] for c in EQUALITY_CASES])
+def test_equality_matches_dict(request, label, other, backend_cls, policy_cls, make_dict):
+    """``==`` must give the answer a ``dict`` would, against any operand.
+
+    Nothing pinned this. The two existing ``__eq__`` specs cover *purity* -- that
+    comparing does not mutate either operand -- and unhashability; neither looks
+    at what the comparison returns, so an ``__eq__`` answering False for
+    identical contents satisfied the whole "complete mapping surface" claim.
+
+    That it must equal a plain ``dict`` is not an invention: this suite's premise
+    is that an ``EffiDict`` is indistinguishable from a ``dict``, the
+    differential oracle asserts exactly that for every other operation, and
+    issue 6.1 registers the class as a ``MutableMapping``. A type check that
+    rejects every other mapping is the deviation, and it is the one defect this
+    case table exposes -- the other seven rows already agree with ``dict``.
+    """
+    expected = BASE == other
+    if expected:
+        # Marked per case, not on the parametrization. The type check only shows
+        # up where equality *should* hold: on the seven rows that compare
+        # unequal, returning False happens to be the right answer, so they pass
+        # today and are live guards. Blanket-xfailing them would have reported
+        # seven XPASSes and said nothing about the one real defect.
+        request.applymarker(
+            pytest.mark.xfail(
+                strict=True,
+                reason=(
+                    "__eq__ opens with `if not isinstance(other, EffiDict): "
+                    "return False`, so a store never equals a plain mapping "
+                    "holding the same items (issue 6.1)"
+                ),
+            )
+        )
+
+    d = make_dict(max_in_memory=10)
+    for key, value in BASE.items():
+        d[key] = value
+
+    assert (d == other) is expected, (
+        f"{label}: EffiDict == {other!r} gave {d == other!r}, dict gives "
+        f"{expected!r}"
+    )
+    assert (d != other) is (not expected), (
+        f"{label}: != disagrees with == (got {d != other!r})"
+    )
+    # Reflected: Python tries dict.__eq__ first, gets NotImplemented, then asks
+    # EffiDict. A store that only answers when it is on the left is still wrong.
+    assert (other == d) is expected, (
+        f"{label}: {other!r} == EffiDict gave {other == d!r}, dict gives "
+        f"{expected!r}"
+    )
+
+
+def test_equality_between_stores_is_by_contents(backend_cls, policy_cls, make_dict):
+    """Two stores holding the same items must compare equal.
+
+    Already true, and the half of ``__eq__`` that works; pinned so the fix for
+    the dict case above cannot regress it.
+    """
+    left = make_dict(max_in_memory=10)
+    right = make_dict(max_in_memory=10)
+    for key, value in BASE.items():
+        left[key] = value
+        right[key] = value
+
+    assert left == right, "two stores with identical contents compared unequal"
+    assert left == left, "a store did not equal itself"
+
+    right["y"] = "changed"
+    assert left != right, "stores with differing contents compared equal"
+
+
 def test_eq_does_not_mutate_either_operand(
     request, backend_cls, policy_cls, make_dict, backend_spy
 ):
