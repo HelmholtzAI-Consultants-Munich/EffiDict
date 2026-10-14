@@ -215,10 +215,22 @@ def test_bulk_write_does_not_issue_one_call_per_item(make_dict, backend_spy):
 
         per_item = spy.count("serialize")
         batched = spy.count("write_many")
+        total = per_item + batched
 
-    assert per_item <= len(items) // 100, (
-        f"a bulk load of {len(items)} items issued {per_item} single writes and "
-        f"{batched} batch calls"
+    # Both paths bounded, not just the per-item one. Counting serialize alone
+    # let an implementation satisfy a test named "does not issue one call per
+    # item" by issuing one *write_many* per item instead -- 3000 round trips
+    # under a different name. The property is work proportional to chunks, so
+    # the total is what has to be small.
+    #
+    # items // 100 is a real constraint, not just a round number: it requires a
+    # chunk of at least 100 items. That is well inside what any batching scheme
+    # would choose -- the defect being pinned is 3000 calls, and a typical
+    # implementation lands in single digits -- but if issue 4.1 wants smaller
+    # chunks for memory reasons, this bound is what it has to change.
+    assert total <= len(items) // 100, (
+        f"a bulk load of {len(items)} items issued {total} backend writes "
+        f"({per_item} single, {batched} batched)"
     )
 
 

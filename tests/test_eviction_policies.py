@@ -24,6 +24,7 @@ The semantics being pinned:
 
 from __future__ import annotations
 
+import copy
 import inspect
 from collections import abc
 
@@ -71,6 +72,29 @@ def _instance_state(obj):
             if hasattr(obj, slot):
                 state[slot] = getattr(obj, slot)
     return state
+
+
+def _state_snapshot(obj):
+    """A *detached* copy of ``_instance_state``, safe to compare against later.
+
+    ``_instance_state`` hands back the live containers -- ``vars()`` returns the
+    policy's own dict and list objects -- so ``before = _instance_state(p)``
+    followed by ``assert _instance_state(p) == before`` compares a thing with
+    itself and is true however much ``p`` mutated in between. Any "did this
+    operation leave the policy alone?" check needs this instead; the only
+    before/after comparison in this file that uses the same object was
+    vacuous until it did.
+
+    Falls back to ``repr`` for anything that cannot be deep-copied, which still
+    detects a change while never failing the spec for a reason unrelated to it.
+    """
+    snapshot = {}
+    for attribute, value in _instance_state(obj).items():
+        try:
+            snapshot[attribute] = copy.deepcopy(value)
+        except Exception:  # noqa: BLE001 - uncopyable: fall back to its repr
+            snapshot[attribute] = repr(value)
+    return snapshot
 
 
 def _residual_state(policy):
@@ -534,4 +558,94 @@ def test_clear_drops_everything(name):
     assert not differing, (
         f"{name} after clear() differs from a fresh instance "
         f"(attribute: cleared vs fresh): {differing}"
+    )
+
+
+# --------------------------------------------------------------------------
+# enumerating victims without disturbing the policy
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="the EvictionPolicy implementations do not exist yet (issue 1.1)",
+)
+@pytest.mark.parametrize("name", DETERMINISTIC)
+def test_victims_enumerates_in_eviction_order(name):
+    """``victims()`` must list every tracked key, most-evictable first.
+
+    ``Cache.evict_candidates`` promises several keys in victim order *without*
+    mutating, and ``victim()`` cannot supply that: it names one key and only
+    advances when that key is removed, so asking twice returns the same answer.
+    Removing before the caller has written a dirty value out is what I5 forbids,
+    so the enumeration has to exist on the policy -- otherwise a conforming
+    ``Cache`` would have to keep a second copy of the ordering.
+
+    Checked against ``victim()`` itself rather than a hardcoded order, so the two
+    cannot disagree: repeatedly taking ``victim()`` and removing it produces the
+    sequence ``victims()`` must have returned in one pass.
+    """
+    policy = _policy_class(name)()
+    for key in ("a", "b", "c", "d"):
+        policy.on_insert(key)
+    policy.on_access("b")
+
+    listed = list(policy.victims())
+
+    drained = []
+    while True:
+        try:
+            victim = policy.victim()
+        except KeyError:
+            break
+        drained.append(victim)
+        policy.on_remove(victim)
+
+    assert listed == drained, (
+        f"{name}.victims() gave {listed}, draining victim() gives {drained}"
+    )
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="the EvictionPolicy implementations do not exist yet (issue 1.1)",
+)
+@pytest.mark.parametrize("name", POLICY_NAMES)
+def test_victims_records_nothing(name):
+    """Walking ``victims()`` must leave the policy exactly as it was.
+
+    It is an inspection, not an access: a version that routed through
+    ``on_access`` would reorder the very thing the caller is reading, and a
+    ``Store`` deciding what to shed would change its answer by asking.
+    """
+    policy = _policy_class(name)()
+    for key in ("a", "b", "c"):
+        policy.on_insert(key)
+    policy.on_access("a")
+    before = _state_snapshot(policy)
+
+    # Partially first. A policy that promoted every key it listed would walk an
+    # LRU ordering right back to where it started, so comparing only after a
+    # full pass cannot see it -- the promotions cancel. Stopping after one key
+    # breaks the symmetry, and stopping early is what a Store does anyway once
+    # it is back inside budget.
+    sentinel = object()
+    partial = next(iter(policy.victims()), sentinel)
+    assert partial is not sentinel, (
+        f"{name}.victims() was empty while the policy tracked three keys"
+    )
+    assert partial in ("a", "b", "c"), f"{name}.victims() yielded {partial!r}"
+    assert _state_snapshot(policy) == before, (
+        f"{name}.victims() changed the policy after a single step:\n"
+        f"  before: {before}\n  after:  {_state_snapshot(policy)}"
+    )
+
+    listed = list(policy.victims())
+    assert sorted(listed) == ["a", "b", "c"], (
+        f"{name}.victims() did not list every tracked key: {listed}"
+    )
+
+    assert _state_snapshot(policy) == before, (
+        f"{name}.victims() changed the policy:\n"
+        f"  before: {before}\n  after:  {_state_snapshot(policy)}"
     )

@@ -324,6 +324,11 @@ class RecordingPolicy(EvictionPolicy):
             raise KeyError("empty")
         return self.order[0]
 
+    def victims(self):
+        # A snapshot, so walking it records nothing and is unaffected by any
+        # discard the caller makes while iterating.
+        return iter(list(self.order))
+
     def clear(self):
         self.calls.append(("clear", None))
         self.order.clear()

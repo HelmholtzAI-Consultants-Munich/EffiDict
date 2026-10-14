@@ -75,5 +75,9 @@ class Cache:
         budgets are satisfied. Yielding a key does not remove it: the cache is
         unchanged until the caller calls ``discard``, which is what lets the
         caller write a dirty value out first.
+
+        Built on ``EvictionPolicy.victims()`` rather than repeated ``victim()``
+        calls -- ``victim()`` only advances when a key is removed, so it cannot
+        enumerate without mutating.
         """
         raise NotImplementedError("see issue #1.2")

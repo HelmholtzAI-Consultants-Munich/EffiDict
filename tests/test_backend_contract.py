@@ -513,9 +513,19 @@ def test_iter_keys_streams_the_same_keys_as_keys(backend):
     and said in its own docstring that ``return iter(self.keys())`` would
     satisfy it, which is precisely the implementation that materialises
     everything. So ``keys()`` is spied on: a streaming implementation must not
-    call it, because calling it *is* the materialisation. The size at which the
-    memory cost shows up directly is far too large for a test; this is the
-    structural statement of the same property.
+    call it, because calling it *is* the materialisation, and the iterator must
+    neither enumerate at creation nor be an iterator over a container somebody
+    already built.
+
+    What that does not reach, stated plainly rather than implied away: a
+    generator that materialises *internally* -- ``names = os.listdir(path)``
+    then ``yield from names`` -- calls no backend method, is not a
+    ``list_iterator``, and does no work until first consumed, so it is accepted
+    here. Verified, not assumed. Closing that needs the backend's own
+    enumeration primitive to be lazy (``os.scandir`` over ``os.listdir``, a
+    cursor over ``fetchall``), which is per-backend and belongs to issue 4.2's
+    implementation rather than to a portable contract test. The size at which
+    the memory cost shows up directly is far too large for a test.
     """
     for key, value in BATCH_ITEMS.items():
         backend.serialize(key, value)
@@ -533,6 +543,27 @@ def test_iter_keys_streams_the_same_keys_as_keys(backend):
         assert iter(stream) is stream, (
             f"iter_keys returned {type(stream).__name__}, not an iterator"
         )
+
+        # Creating the iterator must not do the work. A generator function has
+        # not run a line of its body yet at this point; `return iter(self.keys())`
+        # has already enumerated everything. Checked before anything is consumed,
+        # which is the only moment the two are distinguishable.
+        assert not calls, (
+            f"iter_keys enumerated the keyspace when the iterator was created "
+            f"({len(calls)} keys() call(s)), so nothing about it is lazy"
+        )
+
+        # And it must not be an iterator over an already-built container.
+        # `iter(os.listdir(path))` calls no backend method and is a perfectly
+        # good iterator, so neither check above sees it -- but it holds every
+        # key in memory, which is the cost this method exists to avoid.
+        eager = {"list_iterator", "tuple_iterator", "set_iterator",
+                 "dict_keyiterator", "range_iterator", "str_iterator"}
+        assert type(stream).__name__ not in eager, (
+            f"iter_keys returned a {type(stream).__name__}, so the keyspace was "
+            f"materialised before iteration began"
+        )
+
         streamed = list(stream)
         assert not calls, (
             f"iter_keys built its answer from keys() ({len(calls)} call(s)), so "
