@@ -231,13 +231,14 @@ def test_mutablemapping_surface_is_complete(backend_cls, policy_cls, make_dict):
 @pytest.mark.xfail(
     strict=True,
     reason=(
-        "__reversed__, __or__ and fromkeys are absent from EffiDict, so three "
-        "entries in MAPPING_METHODS were only ever hasattr-checked. Absent does "
-        "not mean inert: with no __reversed__, reversed() falls back to the "
-        "sequence protocol and subscripts the store with integers, so the "
-        "failure surfaces from inside the backend -- TypeError out of "
-        "os.path.join on Pickle/HDF5, KeyError on SQLite/JSON -- rather than as "
-        "a clean TypeError about reversal (issue 6.1)"
+        "__reversed__, __or__ and fromkeys raise NotImplementedError; the three "
+        "entries in MAPPING_METHODS were only ever hasattr-checked (issue 6.1). "
+        "They are declared stubs now rather than missing attributes, which is "
+        "itself the fix for a sharper problem: with no __reversed__ at all, "
+        "reversed() fell back to the sequence protocol and subscripted the store "
+        "with integers, so the caller got a TypeError from inside os.path.join "
+        "on Pickle/HDF5 or a KeyError on SQLite/JSON instead of anything about "
+        "reversal"
     ),
 )
 def test_dict_extras_behave_like_dict(backend_cls, policy_cls, make_dict):
@@ -249,6 +250,11 @@ def test_dict_extras_behave_like_dict(backend_cls, policy_cls, make_dict):
     mapping surface" spec. None of the three come from ``MutableMapping``; they
     are ``dict`` features, which is exactly why inheriting the ABC does not
     supply them and why they need exercising rather than listing.
+
+    All three are declared stubs on the facade, so this now fails with an
+    issue-linked ``NotImplementedError``. Before they were declared, the
+    failures came from wherever Python's fallbacks happened to land -- which is
+    the state this spec was written against and no longer describes.
 
     Each is compared against ``dict``'s own answer. ``fromkeys`` is asserted on
     *contents* only: where the new store's storage lives is a real open question

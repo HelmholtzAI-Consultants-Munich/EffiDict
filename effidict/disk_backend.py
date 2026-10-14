@@ -83,6 +83,18 @@ class DiskBackend(ABC):
         """Delete multiple keys from this backend."""
         raise NotImplementedError("see issue #4.1")
 
+    def supports(self, value) -> bool:
+        """Return whether this backend can store ``value`` faithfully.
+
+        An instance method rather than a classmethod: whether a value fits can
+        depend on how the store was opened. Declared here so every backend
+        exposes the same predicate -- ``test_backend_declares_its_value_domain``
+        already treats it as part of the contract, and without a stub the
+        failure is a bare ``AttributeError`` instead of a reference to the issue
+        that implements it.
+        """
+        raise NotImplementedError("see issue #7.2")
+
     def close(self) -> None:
         """Release handles and flush buffers, leaving the storage in place.
 

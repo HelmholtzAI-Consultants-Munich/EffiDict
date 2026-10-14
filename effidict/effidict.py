@@ -92,6 +92,45 @@ class EffiDict:
         """Clone this dictionary to ``new_path``."""
         raise NotImplementedError("see issue #3.2")
 
+    def destroy(self):
+        """Delete the backing storage. Explicit, and idempotent.
+
+        Separate from ``close``, which must release handles and leave the data
+        in place. Today ``close`` destroys, which is why collecting a store --
+        or a joblib worker finishing a task -- takes the data with it.
+
+        Idempotent: a second call is a no-op, not ``FileNotFoundError``. That is
+        what lets teardown paths call it without first checking.
+        """
+        raise NotImplementedError("see issue #3.1")
+
+    def __reversed__(self):
+        """Iterate keys newest-first, mirroring ``reversed(dict)``.
+
+        Declared because its absence is not inert: with no ``__reversed__``,
+        ``reversed()`` falls back to the sequence protocol and subscripts the
+        store with integers, so the caller gets a ``TypeError`` from inside
+        ``os.path.join`` or a ``KeyError`` from the backend rather than anything
+        about reversal.
+        """
+        raise NotImplementedError("see issue #6.1")
+
+    def __or__(self, other):
+        """Return a new mapping with ``other`` merged over this one."""
+        raise NotImplementedError("see issue #6.1")
+
+    @classmethod
+    def fromkeys(cls, keys, value=None):
+        """Build a store whose keys are ``keys``, each mapped to ``value``.
+
+        A classmethod, as on ``dict``, which leaves one question open: a store
+        needs somewhere to live and ``dict.fromkeys`` takes no path. Issue 6.1
+        settles that and may well make this an instance method borrowing the
+        receiver's backend -- which is why the spec asserts the *contents* of
+        the result and not this signature.
+        """
+        raise NotImplementedError("see issue #6.1")
+
     @property
     def _store(self):
         """Future Store facade used by white-box tier-invariant specs."""

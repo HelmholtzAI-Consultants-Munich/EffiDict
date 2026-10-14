@@ -502,3 +502,78 @@ def test_cache_peek_does_not_promote():
         f"peek reordered the eviction queue: {before} -> "
         f"{list(cache.evict_candidates())}"
     )
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="Cache is a contract stub (issue 1.2)",
+)
+def test_cache_get_reads_and_records_the_access():
+    """``get`` must return the value *and* tell the policy.
+
+    The complement of ``test_cache_peek_does_not_promote``, and without it the
+    pair said only half of what it needs to: nothing exercised ``get`` at all,
+    so an implementation where ``get`` is literally ``peek`` passed every Cache
+    spec in this file. That store would hold a cache whose recency and frequency
+    data never moved -- LRU degenerating to FIFO, LFU to insertion order --
+    which is invisible to any test that only checks the value came back.
+
+    So the recording is asserted directly through ``RecordingPolicy``, the same
+    way its absence is asserted for ``peek``.
+    """
+    policy = RecordingPolicy()
+    cache = Cache(policy=policy, max_items=4)
+    cache.put("a", "va")
+    cache.put("b", "vb")
+
+    policy.calls.clear()
+    assert cache.get("a") == "va"
+
+    accesses = [call for call in policy.calls if call[0] == "on_access"]
+    assert accesses == [("on_access", "a")], (
+        f"get did not record the access as exactly one on_access('a'): "
+        f"{policy.calls}"
+    )
+
+    # A miss must raise rather than return a sentinel -- Store.get distinguishes
+    # "not cached" from "cached as None" on this, and a cache that returned None
+    # for both would make a stored None indistinguishable from an absent key.
+    with pytest.raises(KeyError):
+        cache.get("absent")
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="Store is a contract stub (issue 1.2)",
+)
+def test_store_pop_distinguishes_an_omitted_default_from_none(backend_cls, storage_dir):
+    """``pop`` must tell ``pop(key)`` from ``pop(key, None)``.
+
+    This is the entire reason ``Store.pop`` carries a ``MISSING`` sentinel
+    instead of ``default=None``, and nothing tested it: no spec invoked
+    ``Store.pop`` at all, and the structural guard cannot help because
+    ``default=MISSING`` and ``default=None`` produce the identical signature
+    spec ``['key', 'default=']``. Phase 1 could therefore restore
+    ``default=None`` -- reintroducing exactly the missing-key defect
+    ``test_pop_without_default_raises_keyerror`` pins at the facade -- with every
+    Store spec still green.
+    """
+    backend = backend_cls(str(storage_dir / "store"))
+    try:
+        store = Store(backend=backend, cache=Cache(policy=RecordingPolicy(), max_items=4))
+        store.set("present", "value")
+        store.set("holds-none", None)
+
+        assert store.pop("present") == "value"
+        assert not store.contains("present"), "pop returned the value but kept the key"
+
+        # Omitted: raise. Given explicitly: return it, even when it is None.
+        with pytest.raises(KeyError):
+            store.pop("absent")
+        assert store.pop("absent", None) is None
+        assert store.pop("absent", "fallback") == "fallback"
+
+        # And a stored None is a hit, not a miss.
+        assert store.pop("holds-none", "fallback") is None
+    finally:
+        backend.destroy()
