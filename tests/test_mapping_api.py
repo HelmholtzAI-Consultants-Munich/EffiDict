@@ -414,12 +414,14 @@ def test_eq_does_not_mutate_either_operand(
         with backend_spy(right.disk_backend) as right_spy:
             assert left == right
 
-            assert left_spy.count("serialize") == 0, (
-                f"comparing issued {left_spy.count('serialize')} writes to the "
+            left_writes = left_spy.count("serialize") + left_spy.count("write_many")
+            assert left_writes == 0, (
+                f"comparing issued {left_writes} writes to the "
                 f"left operand"
             )
-            assert right_spy.count("serialize") == 0, (
-                f"comparing issued {right_spy.count('serialize')} writes to the "
+            right_writes = right_spy.count("serialize") + right_spy.count("write_many")
+            assert right_writes == 0, (
+                f"comparing issued {right_writes} writes to the "
                 f"right operand"
             )
 

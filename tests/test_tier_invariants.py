@@ -287,9 +287,12 @@ def test_clean_eviction_performs_no_io(
         for key in keys:
             assert d[key] == f"v-{key}"
 
-        assert spy.count("serialize") == 0, (
-            f"a read-only pass issued {spy.count('serialize')} writes"
-        )
+        # Both write paths. Counting only serialize leaves the batch route
+        # uncounted, so after issue 4.1 an eviction that flushed through
+        # write_many would read as zero writes -- the guard would go quiet
+        # exactly when the code it guards gained a second way to write.
+        writes = spy.count("serialize") + spy.count("write_many")
+        assert writes == 0, f"a read-only pass issued {writes} writes"
 
 
 def test_reading_a_cached_key_never_writes(backend_cls, policy_cls, make_dict, backend_spy):
@@ -301,7 +304,8 @@ def test_reading_a_cached_key_never_writes(backend_cls, policy_cls, make_dict, b
         for _ in range(5):
             assert d["hot"] == "payload"
 
-        assert spy.count("serialize") == 0
+        writes = spy.count("serialize") + spy.count("write_many")
+        assert writes == 0, f"reading a cached key issued {writes} writes"
 
 
 # --------------------------------------------------------------------------
@@ -324,8 +328,14 @@ def test_membership_of_a_cached_key_never_touches_the_backend(
     with backend_spy(d.disk_backend) as spy:
         assert "hot" in d
 
-        assert spy.count("keys") == 0
-        assert spy.count("iter_keys") == 0
+        # The claim is that the backend is not consulted, so no call of any
+        # kind is the assertion. Naming keys() and iter_keys() alone let an
+        # implementation answer membership through has(), count() or
+        # deserialize() and still satisfy a test called "never touches the
+        # backend" -- and has() is precisely what issue 2.2 adds.
+        assert spy.names() == [], (
+            f"a cached membership check reached the backend: {spy.names()}"
+        )
 
 
 @pytest.mark.xfail(
@@ -525,10 +535,39 @@ def test_abstract_bases_cannot_be_instantiated(base):
 
     ``@abstractmethod`` without ``ABCMeta`` is inert -- it was decorative before
     issue 0.1, so the base classes could be constructed and subclasses were never
-    checked for completeness.
+    checked for completeness. Activating it is the one behaviour change in Phase
+    0, and this is the guard that pins it.
+
+    ``pytest.raises(TypeError): base()`` alone does not pin it. ``DiskBackend``
+    takes ``storage_path``, so a plain non-abstract class with the same
+    ``__init__`` raises ``TypeError: __init__() missing 1 required positional
+    argument`` and satisfies that assertion exactly -- strip ``ABCMeta`` and the
+    guard still passes. Verified against such a class rather than reasoned
+    about. So the abstractness is asserted directly, and then where it actually
+    bites: an incomplete subclass must be refused too, which is the half that
+    protects callers.
     """
-    with pytest.raises(TypeError):
+    assert getattr(base, "__abstractmethods__", frozenset()), (
+        f"{base.__name__} declares no abstract methods, so @abstractmethod is "
+        f"inert and incomplete subclasses are never checked"
+    )
+
+    with pytest.raises(TypeError) as raised:
         base()
+    assert "abstract" in str(raised.value).lower(), (
+        f"{base.__name__}() raised {raised.value!r}, which is not an "
+        f"abstractness error -- a missing argument would read the same"
+    )
+
+    # The property callers depend on: a subclass that forgets a method is
+    # refused at construction rather than failing later at the call site.
+    incomplete = type(f"Incomplete{base.__name__}", (base,), {})
+    with pytest.raises(TypeError) as raised:
+        incomplete()
+    assert "abstract" in str(raised.value).lower(), (
+        f"an incomplete subclass of {base.__name__} was constructible: "
+        f"{raised.value!r}"
+    )
 
 
 def test_concrete_backends_remain_instantiable(backend_cls, storage_dir):

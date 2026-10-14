@@ -266,13 +266,25 @@ def test_unpickled_instance_does_not_own_storage(backend_cls, policy_cls, make_d
     path = d.disk_backend.storage_path
 
     child = pickle.loads(pickle.dumps(d))
-    assert child["k"] == "v"
+    # Held separately so the store below can still be collected while its
+    # backend -- a second live handle on the same storage -- stays reachable
+    # for release at the end. Without this the handle survives to process exit.
+    child_backend = child.disk_backend
+    try:
+        assert child["k"] == "v"
 
-    del child
-    gc.collect()
+        del child
+        gc.collect()
 
-    assert os.path.exists(path), "collecting an unpickled store deleted the storage"
-    assert d["k"] == "v"
+        assert os.path.exists(path), (
+            "collecting an unpickled store deleted the storage"
+        )
+        assert d["k"] == "v"
+    finally:
+        # Destroys rather than closes, because Backend.close() is still a stub
+        # (issue 3.1). Harmless here: every assertion has already run, and the
+        # fixture teardown of ``d`` tolerates the storage being gone.
+        release_store(child_backend)
 
 
 # --------------------------------------------------------------------------

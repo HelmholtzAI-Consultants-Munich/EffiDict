@@ -391,6 +391,7 @@ def test_all_backends_are_picklable(request, backend_cls, storage_dir):
         )
 
     backend = backend_cls(str(storage_dir / "store"))
+    revived = None
     try:
         backend.serialize("k", "v")
 
@@ -398,7 +399,13 @@ def test_all_backends_are_picklable(request, backend_cls, storage_dir):
 
         assert revived.deserialize("k") == "v"
     finally:
-        release_store(backend)
+        # The revived object is a second live handle on the same storage -- a
+        # sqlite3.Connection or an h5py.File of its own. Leaving it open leaks a
+        # descriptor for the rest of the session and, on Windows, blocks cleanup
+        # of the storage this test just wrote.
+        for handle in (revived, backend):
+            if handle is not None:
+                release_store(handle)
 
 
 def test_picklable_backend_table_matches_reality(backend_cls, storage_dir):
