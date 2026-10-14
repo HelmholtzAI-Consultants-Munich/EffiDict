@@ -1,7 +1,18 @@
+from __future__ import annotations
+
+from typing import Optional
+
+
 class EffiDict:
-    def __init__(self, disk_backend=None, replacement_strategy=None):
+    def __init__(self, disk_backend=None, replacement_strategy=None, *, max_bytes: Optional[int] = None):
+        """Create an EffiDict facade.
+
+        ``max_bytes`` is accepted as the future approximate cache byte budget,
+        but it is not enforced yet; see issue #1.4.
+        """
         self.disk_backend = disk_backend
         self.replacement_strategy = replacement_strategy
+        self.max_bytes = max_bytes
         self.memory = replacement_strategy.memory
 
     def __enter__(self):
@@ -47,6 +58,83 @@ class EffiDict:
                 return default
 
         return value
+
+    def get(self, key, default=None):
+        """Return ``key`` if present, otherwise ``default``."""
+        raise NotImplementedError("see issue #6.1")
+
+    def setdefault(self, key, default=None):
+        """Return ``key`` if present, otherwise set and return ``default``."""
+        raise NotImplementedError("see issue #6.1")
+
+    def popitem(self):
+        """Remove and return the **most recently inserted** key/value pair.
+
+        LIFO, not arbitrary: ``dict.popitem`` has been last-in-first-out since
+        3.7 and the differential oracle compares against ``dict``, so returning
+        an arbitrary pair would fail conformance. Raises ``KeyError`` when empty.
+        """
+        raise NotImplementedError("see issue #6.1")
+
+    def update(self, other=(), **kwargs):
+        """Update this dictionary from another mapping or iterable."""
+        raise NotImplementedError("see issue #6.1")
+
+    def iter_keys(self):
+        """Iterate over keys without materializing a list."""
+        raise NotImplementedError("see issue #4.2")
+
+    def flush(self):
+        """Flush dirty cached entries to storage."""
+        raise NotImplementedError("see issue #1.4")
+
+    def clone(self, new_path):
+        """Clone this dictionary to ``new_path``."""
+        raise NotImplementedError("see issue #3.2")
+
+    def destroy(self):
+        """Delete the backing storage. Explicit, and idempotent.
+
+        Separate from ``close``, which must release handles and leave the data
+        in place. Today ``close`` destroys, which is why collecting a store --
+        or a joblib worker finishing a task -- takes the data with it.
+
+        Idempotent: a second call is a no-op, not ``FileNotFoundError``. That is
+        what lets teardown paths call it without first checking.
+        """
+        raise NotImplementedError("see issue #3.1")
+
+    def __reversed__(self):
+        """Iterate keys newest-first, mirroring ``reversed(dict)``.
+
+        Declared because its absence is not inert: with no ``__reversed__``,
+        ``reversed()`` falls back to the sequence protocol and subscripts the
+        store with integers, so the caller gets a ``TypeError`` from inside
+        ``os.path.join`` or a ``KeyError`` from the backend rather than anything
+        about reversal.
+        """
+        raise NotImplementedError("see issue #6.1")
+
+    def __or__(self, other):
+        """Return a new mapping with ``other`` merged over this one."""
+        raise NotImplementedError("see issue #6.1")
+
+    @classmethod
+    def fromkeys(cls, keys, value=None):
+        """Build a store whose keys are ``keys``, each mapped to ``value``.
+
+        A classmethod, as on ``dict``, which leaves one question open: a store
+        needs somewhere to live and ``dict.fromkeys`` takes no path. Issue 6.1
+        settles that and may well make this an instance method borrowing the
+        receiver's backend -- which is why the spec asserts the *contents* of
+        the result and not this signature.
+        """
+        raise NotImplementedError("see issue #6.1")
+
+    @property
+    def _store(self):
+        """Future Store facade used by white-box tier-invariant specs."""
+        raise NotImplementedError("see issue #1.2")
 
     def clear(self):
         all_keys = self.keys()
