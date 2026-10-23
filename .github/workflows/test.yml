@@ -64,3 +64,36 @@ jobs:
       env:
         CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
+  test-without-h5py:
+    name: test without optional h5py
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v3
+
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: "3.10"
+
+    # Install the full dev set and then remove only h5py. Installing a smaller
+    # set instead would also drop pandas/hypothesis/joblib, which the rest of
+    # the suite needs, and the job would stop testing anything but h5py.
+    - name: Install pip dependencies without h5py
+      run: |
+        python -m pip install --upgrade pip
+        pip install -e ".[dev]"
+        pip uninstall -y h5py
+
+    # Without this the job silently degrades into a duplicate of `build` if
+    # anything ever pulls h5py back in as a transitive dependency.
+    - name: Assert h5py is really absent
+      run: |
+        python -c "import importlib.util, sys; sys.exit('h5py is installed; this job no longer tests the h5py-free path') if importlib.util.find_spec('h5py') else None"
+
+    - name: Test with pytest
+      run: pytest
+      env:
+        PLATFORM: ubuntu-latest
