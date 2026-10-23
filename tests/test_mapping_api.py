@@ -23,7 +23,13 @@ from pathlib import Path
 
 import pytest
 
-from .helpers import PROMOTING_POLICIES, cached_keys
+from .helpers import (
+    EAGER_ITERATOR_TYPES,
+    PROMOTING_POLICIES,
+    cached_keys,
+    in_cache,
+    on_disk,
+)
 
 REPO_ROOT = str(Path(__file__).resolve().parents[1])
 
@@ -456,3 +462,63 @@ def test_unhashable_by_design(backend_cls, policy_cls, make_dict):
         hash(d)
     with pytest.raises(TypeError):
         {d: "not allowed"}
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="EffiDict.iter_keys() is a contract stub (issue 4.2)",
+)
+def test_facade_iter_keys_streams_the_whole_keyspace(
+    backend_cls, policy_cls, make_dict, backend_spy
+):
+    """``d.iter_keys()`` must stream every key, across both tiers.
+
+    The facade method had no test of its own. ``DiskBackend.iter_keys`` is
+    specified in ``test_backend_contract``, ``keys()`` and ``iter(d)`` here --
+    all three could be fixed while this public method stayed a stub, because
+    nothing called it.
+
+    It is also the only one of the four that has to merge tiers: the backend
+    sees what spilled, the cache holds the rest, and the caller must get the
+    union exactly once each. The cache is kept smaller than the keyspace on
+    purpose so both tiers are non-empty.
+    """
+    d = make_dict(max_in_memory=5)
+    expected = [f"k{index:02d}" for index in range(20)]
+    for key in expected:
+        d[key] = f"v-{key}"
+
+    # One key put in *both* tiers on purpose. Without this the de-duplication
+    # assertion below is dead: nothing is flushed today, so the cached keys are
+    # not on disk and the two tiers happen not to overlap -- an implementation
+    # that simply concatenated them would pass. Dual residency is the intended
+    # steady state once I1 holds (disk authoritative, not exclusive), so the
+    # union has to be a union rather than a concatenation.
+    dual = expected[-1]
+    assert in_cache(d, dual), "precondition: the last write is still cached"
+    d.disk_backend.serialize(dual, f"v-{dual}")
+    assert on_disk(d, dual), "precondition: the probe key is now in both tiers"
+
+    with backend_spy(d.disk_backend) as spy:
+        stream = d.iter_keys()
+
+        assert iter(stream) is stream, (
+            f"iter_keys returned {type(stream).__name__}, not an iterator"
+        )
+        assert type(stream).__name__ not in EAGER_ITERATOR_TYPES, (
+            f"iter_keys returned a {type(stream).__name__}, so the keyspace was "
+            f"materialised before iteration began"
+        )
+        assert spy.names() == [], (
+            f"creating the iterator already went to the backend: {spy.names()}"
+        )
+
+        streamed = list(stream)
+
+    assert sorted(streamed) == sorted(expected), (
+        f"iter_keys yielded {len(streamed)} keys, expected {len(expected)}"
+    )
+    assert len(streamed) == len(set(streamed)), (
+        f"a key present in both tiers was yielded twice: "
+        f"{sorted(k for k in set(streamed) if streamed.count(k) > 1)}"
+    )

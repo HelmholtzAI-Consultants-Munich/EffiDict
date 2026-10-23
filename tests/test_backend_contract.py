@@ -28,6 +28,7 @@ from effidict import (
 )
 
 from .helpers import (
+    EAGER_ITERATOR_TYPES,
     UNSUPPORTED,
     VALUE_KINDS,
     assert_equal_value,
@@ -105,8 +106,17 @@ def test_backend_declares_its_value_domain(backend_cls, backend):
 
     Today the only way to discover that SQLite cannot store an ndarray is to try
     it and read the traceback. A ``supports()`` predicate makes the domain part of
-    the contract -- and is cross-checked here against what ``serialize`` actually
+    the contract -- and is cross-checked here against what the backend actually
     does, because a declaration nobody verifies drifts.
+
+    "Can store" means *faithfully*, so the cross-check round-trips and compares
+    type-strictly rather than asking whether ``serialize`` raised. The
+    difference is not academic: HDF5 accepts a Python ``int``, ``float``,
+    ``bool`` and a DataFrame and hands back something else, so measuring only
+    "did it raise" marks four kinds storable and a correct ``supports()``
+    returning False for them would *fail* this test. Same definition of faithful
+    as ``test_value_support_tables_match_reality``, deliberately -- two
+    definitions would drift apart.
 
     Called on the *instance*, not the class. Every other backend operation is an
     instance method, so ``def supports(self, value)`` is the natural
@@ -126,8 +136,9 @@ def test_backend_declares_its_value_domain(backend_cls, backend):
         declared = backend.supports(value)
         try:
             backend.serialize(f"probe-{kind}", value)
+            assert_equal_value(backend.deserialize(f"probe-{kind}"), value)
             actual = True
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001 - raised or came back changed
             actual = False
         if declared != actual:
             disagreements.append(f"{kind}: declared {declared}, actual {actual}")
@@ -557,9 +568,7 @@ def test_iter_keys_streams_the_same_keys_as_keys(backend):
         # `iter(os.listdir(path))` calls no backend method and is a perfectly
         # good iterator, so neither check above sees it -- but it holds every
         # key in memory, which is the cost this method exists to avoid.
-        eager = {"list_iterator", "tuple_iterator", "set_iterator",
-                 "dict_keyiterator", "range_iterator", "str_iterator"}
-        assert type(stream).__name__ not in eager, (
+        assert type(stream).__name__ not in EAGER_ITERATOR_TYPES, (
             f"iter_keys returned a {type(stream).__name__}, so the keyspace was "
             f"materialised before iteration began"
         )
@@ -580,3 +589,47 @@ def test_iter_keys_streams_the_same_keys_as_keys(backend):
         f"{sorted(backend.keys())}"
     )
     assert list(stream) == [], "the iterator restarted, so it was a sequence"
+
+
+#: String values that are legal Python ``str`` but awkward to store.
+#: ``test_dict_conformance`` excludes both from its value strategy and says why;
+#: that exclusion is what left the behaviour unpinned here.
+DEGENERATE_STRINGS = {"nul": "a\x00b", "lone_surrogate": "a\ud800b"}
+
+#: Backends that refuse them. Derived by round-tripping each value through each
+#: backend, not read off the source: Pickle, JSON and SQLite store both
+#: faithfully; HDF5 raises ``ValueError`` for the NUL and ``UnicodeEncodeError``
+#: for the surrogate, because it encodes strings as UTF-8 C strings.
+REJECTS_DEGENERATE_STRINGS = {Hdf5Backend}
+
+
+@pytest.mark.parametrize("label", sorted(DEGENERATE_STRINGS))
+def test_degenerate_string_values_round_trip(request, label, backend_cls, backend):
+    """A ``str`` containing NUL or a lone surrogate must round-trip.
+
+    Both are valid Python strings and valid ``dict`` values, so refusing them is
+    a narrower value domain than ``dict`` offers rather than a fix. The
+    differential oracle cannot carry this: its value strategy excludes both
+    precisely because HDF5 rejects them, which documents the defect without
+    pinning it -- so a later value-domain change could drop either case and
+    nothing would notice.
+
+    Scoped by a measured table rather than by backend family, and strict, so if
+    HDF5 gains a codec that handles them the marker flips instead of going
+    quietly stale.
+    """
+    if backend_cls in REJECTS_DEGENERATE_STRINGS:
+        request.applymarker(
+            pytest.mark.xfail(
+                strict=True,
+                reason=(
+                    "HDF5 stores strings as UTF-8 C strings, so a NUL raises "
+                    "ValueError and a lone surrogate raises UnicodeEncodeError "
+                    "(issue 7.2)"
+                ),
+            )
+        )
+
+    value = DEGENERATE_STRINGS[label]
+    backend.serialize("degenerate", value)
+    assert_equal_value(backend.deserialize("degenerate"), value)

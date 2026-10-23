@@ -112,6 +112,26 @@ def is_lossy(backend_cls, kind):
     return kind in LOSSY[backend_cls]
 
 
+#: Iterator types that prove the sequence behind them was already built. An
+#: iterator over a container is a perfectly good iterator and calls no backend
+#: method, so neither "is it an iterator" nor a call spy can see it -- but it
+#: holds every key in memory, which is what the streaming contract exists to
+#: avoid. Shared by the backend-level and facade-level streaming specs so one
+#: definition covers both.
+EAGER_ITERATOR_TYPES = frozenset(
+    {
+        "list_iterator",
+        "tuple_iterator",
+        "set_iterator",
+        "dict_keyiterator",
+        "dict_itemiterator",
+        "dict_valueiterator",
+        "range_iterator",
+        "str_iterator",
+    }
+)
+
+
 def build_policy(policy_cls, disk_backend=None, max_in_memory=2, **extra):
     """Construct ``policy_cls`` with whatever arguments it actually declares.
 

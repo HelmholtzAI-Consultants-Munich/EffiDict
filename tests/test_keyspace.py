@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import unicodedata
 
 import pytest
 
@@ -373,3 +374,91 @@ def test_traversal_escape_table_matches_reality(backend_cls, probe_backend):
         f"{'escapes' if backend_cls in TRAVERSAL_ESCAPES else 'contained'}, "
         f"reality says {verdict}"
     )
+
+
+# --------------------------------------------------------------------------
+# keys the *filesystem* cannot tell apart
+# --------------------------------------------------------------------------
+
+#: Pairs of distinct ``dict`` keys that some filesystems fold together. macOS
+#: APFS does both; Windows NTFS folds case; Linux ext4 does neither.
+FOLDING_KEY_PAIRS = {
+    "case": ("Alpha", "alpha"),
+    "normalization": (
+        unicodedata.normalize("NFC", "é") + "k",
+        unicodedata.normalize("NFD", "é") + "k",
+    ),
+}
+
+#: Backends that derive a *path* from the key, so a folding filesystem decides
+#: whether two keys are one. SQLite and HDF5 keep keys inside a single file and
+#: are unaffected -- measured, both keep the pair distinct on a folding
+#: filesystem.
+PATH_PER_KEY_BACKENDS = {PickleBackend, JSONBackend}
+
+
+def _filesystem_folds(directory, first, second):
+    """Whether this filesystem keeps two names apart, asked rather than assumed.
+
+    Run against ``directory`` so it measures the filesystem the backends
+    actually write to, which is not necessarily the one the repository is on.
+    """
+    probe = os.path.join(directory, "fs-folding-probe")
+    os.makedirs(probe, exist_ok=True)
+    try:
+        for name, body in ((first, "a"), (second, "b")):
+            with open(os.path.join(probe, name), "w", encoding="utf-8") as handle:
+                handle.write(body)
+        return len(os.listdir(probe)) < 2
+    finally:
+        shutil.rmtree(probe, ignore_errors=True)
+
+
+@pytest.mark.parametrize("label", sorted(FOLDING_KEY_PAIRS))
+def test_keys_differing_only_by_case_or_normalization_stay_distinct(
+    request, label, backend_cls, probe_backend, storage_dir
+):
+    """Two keys a ``dict`` keeps apart must not become one on disk.
+
+    ``'A'`` and ``'a'``, or the NFC and NFD spellings of the same character, are
+    distinct ``dict`` keys. On a case-insensitive or normalizing filesystem the
+    file-per-key backends write both to one path: measured here as one file
+    where there should be two, with the second write silently overwriting the
+    first. That is data loss, not a formatting quirk.
+
+    The differential oracle cannot carry this -- its key alphabet excludes
+    uppercase and non-ASCII for exactly this reason, which documented the defect
+    and pinned nothing, so issue 7.1 could land with the collision intact.
+
+    Scoped by probing the filesystem at runtime rather than by platform name, so
+    the expectation is right on a case-sensitive runner (where these backends
+    pass) and on a folding one (where they must not). Strict, so a backend that
+    starts escaping its keys flips the marker.
+    """
+    first, second = FOLDING_KEY_PAIRS[label]
+
+    if backend_cls in PATH_PER_KEY_BACKENDS and _filesystem_folds(
+        str(storage_dir), first, second
+    ):
+        request.applymarker(
+            pytest.mark.xfail(
+                strict=True,
+                reason=(
+                    f"{backend_cls.__name__} uses the key as a filename and this "
+                    f"filesystem folds {label}, so two distinct keys become one "
+                    f"file and the second write destroys the first (issue 7.1)"
+                ),
+            )
+        )
+
+    probe_backend.serialize(first, "first-value")
+    probe_backend.serialize(second, "second-value")
+
+    stored = probe_backend.keys()
+    assert sorted(stored) == sorted([first, second]), (
+        f"two distinct keys became {len(stored)}: {stored!r}"
+    )
+    assert probe_backend.deserialize(first) == "first-value", (
+        f"writing {second!r} overwrote {first!r}"
+    )
+    assert probe_backend.deserialize(second) == "second-value"

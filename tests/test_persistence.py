@@ -358,3 +358,46 @@ def test_backend_close_is_idempotent_and_keeps_the_storage(backend_cls, storage_
         assert reopened.deserialize("kept") == "value"
     finally:
         release_store(reopened)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "open_or_create() is a contract stub (issue 2.1). It also closes the "
+        "first handle before reopening, so it stays red until close() lands too "
+        "(issue 3.1) -- deliberately, because holding both handles open would "
+        "demand that every backend permit concurrent opens on one path"
+    ),
+)
+def test_open_or_create_creates_then_reopens_without_truncating(
+    backend_cls, storage_dir
+):
+    """``open_or_create`` must create a missing store and open an existing one.
+
+    Its only callers were the three Phase 5b multiprocess specs, which stay
+    expected failures for concurrency and cache-coherence reasons that have
+    nothing to do with this method. So issue 2.1 could implement ``create`` and
+    ``open``, leave this one raising, and no marker anywhere would flip.
+
+    Both halves in one test because the method *is* the choice between them:
+    creating when absent is useless if reopening truncates, and truncation is
+    the live defect -- ``Hdf5Backend`` opens ``mode="w"``.
+    """
+    path = str(storage_dir / "fresh")
+
+    created = backend_cls.open_or_create(path)
+    created.serialize("kept", "value")
+    created.close()
+
+    reopened = backend_cls.open_or_create(path)
+    try:
+        assert "kept" in reopened.keys(), (
+            "open_or_create truncated an existing store instead of opening it"
+        )
+        assert reopened.deserialize("kept") == "value"
+
+        # And it is a working handle, not just a readable one.
+        reopened.serialize("added", "second")
+        assert reopened.deserialize("added") == "second"
+    finally:
+        release_store(reopened)
