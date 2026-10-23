@@ -12,10 +12,8 @@ import ast
 
 try:
     import h5py
-    import numpy as np
 except Exception:
     h5py = None
-    np = None
 
 class DiskBackend(ABC):
     """Base contract for the persistent tier.
@@ -216,8 +214,8 @@ class PickleBackend(DiskBackend):
 
 class Hdf5Backend(DiskBackend):
     def __init__(self, storage_path):
-        if h5py is None or np is None:
-            raise ImportError("h5py and numpy are required for Hdf5Backend but are not installed.")
+        if h5py is None:
+            raise ImportError("h5py is required for Hdf5Backend but is not installed.")
         super().__init__(storage_path)
         self.file = h5py.File(self.storage_path, "w")
 

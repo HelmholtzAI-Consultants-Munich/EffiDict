@@ -65,11 +65,17 @@ DEFAULT_BACKEND = PickleBackend
 DEFAULT_POLICY = LRUReplacement
 
 
-def _backend_param(backend_cls):
-    marks = []
+def backend_marks(backend_cls):
+    """Marks every param for ``backend_cls`` needs, wherever it is built."""
     if backend_cls is Hdf5Backend:
-        marks.append(pytest.mark.skipif(h5py is None, reason="h5py is not installed"))
-    return pytest.param(backend_cls, id=backend_cls.__name__, marks=marks)
+        return [pytest.mark.skipif(h5py is None, reason="h5py is not installed")]
+    return []
+
+
+def _backend_param(backend_cls):
+    return pytest.param(
+        backend_cls, id=backend_cls.__name__, marks=backend_marks(backend_cls)
+    )
 
 
 @pytest.fixture(params=[_backend_param(cls) for cls in BACKENDS])

@@ -53,7 +53,7 @@ from hypothesis.stateful import (
 
 from effidict import LRUReplacement, PickleBackend
 
-from .conftest import BACKENDS, POLICIES, release_store
+from .conftest import BACKENDS, POLICIES, backend_marks, release_store
 from .helpers import assert_equal_value, supported_kinds
 
 try:
@@ -363,7 +363,12 @@ MAX_IN_MEMORY = [1, 2, 10, 1000]
 #: plus every policy against Pickle. Cheaper than the full product while still
 #: touching each backend and each policy at least once.
 CROSS_SECTION = [
-    pytest.param(backend, LRUReplacement, id=f"{backend.__name__}-LRUReplacement")
+    pytest.param(
+        backend,
+        LRUReplacement,
+        id=f"{backend.__name__}-LRUReplacement",
+        marks=backend_marks(backend),
+    )
     for backend in BACKENDS
 ] + [
     pytest.param(PickleBackend, policy, id=f"PickleBackend-{policy.__name__}")
