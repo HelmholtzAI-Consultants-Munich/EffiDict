@@ -20,13 +20,14 @@ here.
 
 from __future__ import annotations
 
-import os
 import pickle
 import time
 
 import pytest
 
 from effidict import Hdf5Backend, SqliteBackend
+
+from .helpers import store_bytes
 
 pytestmark = pytest.mark.slow
 
@@ -239,16 +240,6 @@ def test_bulk_write_does_not_issue_one_call_per_item(make_dict, backend_spy):
 # --------------------------------------------------------------------------
 
 
-def _store_bytes(path):
-    if os.path.isdir(path):
-        return sum(
-            os.path.getsize(os.path.join(dirpath, filename))
-            for dirpath, _, filenames in os.walk(path)
-            for filename in filenames
-        )
-    return os.path.getsize(path)
-
-
 @pytest.mark.xfail(
     strict=True,
     reason=(
@@ -273,7 +264,7 @@ def test_stored_payload_is_not_far_larger_than_the_data(tmp_path):
     backend = SqliteBackend(str(tmp_path / "store"))
     try:
         backend.serialize("payload", value)
-        stored = _store_bytes(backend.storage_path)
+        stored = store_bytes(backend.storage_path)
     finally:
         try:
             backend.destroy()
@@ -321,7 +312,7 @@ def test_stored_size_grows_linearly_with_the_data(request, backend_cls, tmp_path
         try:
             for i in range(count):
                 backend.serialize(f"k{i:05d}", "x" * 200)
-            sizes[count] = _store_bytes(backend.storage_path)
+            sizes[count] = store_bytes(backend.storage_path)
         finally:
             try:
                 backend.destroy()

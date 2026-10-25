@@ -9,8 +9,8 @@ they cannot drift.
 from __future__ import annotations
 
 import inspect
-
 import math
+import os
 
 try:
     import numpy as np
@@ -145,8 +145,7 @@ def build_policy(policy_cls, disk_backend=None, max_in_memory=2, **extra):
     never flip green when the defect it pins is actually fixed.
 
     Only declared parameters are passed, so this spans the change without a flag
-    day. The ``make_policy`` fixture wraps this for specs that take the policy
-    from the matrix; module-level builders call it directly.
+    day.
     """
     accepted = inspect.signature(policy_cls.__init__).parameters
     candidates = {
@@ -259,3 +258,15 @@ def _equal(actual, expected):
 
 def _is_nan(value):
     return isinstance(value, float) and math.isnan(value)
+
+
+def store_bytes(path):
+    """Bytes a backend occupies on disk, whether it stores one file or a tree."""
+    if not os.path.isdir(path):
+        return os.path.getsize(path)
+
+    total = 0
+    for dirpath, _, filenames in os.walk(path):
+        for filename in filenames:
+            total += os.path.getsize(os.path.join(dirpath, filename))
+    return total

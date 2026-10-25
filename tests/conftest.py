@@ -95,25 +95,6 @@ def policy_cls(request):
 
 
 @pytest.fixture
-def make_policy(policy_cls):
-    """Build the active matrix policy, whatever its constructor currently wants.
-
-    Thin wrapper over ``helpers.build_policy``, which explains why the
-    indirection exists: issue 1.1 removes both of today's constructor arguments.
-    """
-
-    def factory(max_in_memory=4, disk_backend=None, **extra):
-        return build_policy(
-            policy_cls,
-            disk_backend=disk_backend,
-            max_in_memory=max_in_memory,
-            **extra,
-        )
-
-    return factory
-
-
-@pytest.fixture
 def storage_dir(tmp_path):
     """Directory that must be empty once the test has released its stores."""
     path = tmp_path / "effidict-storage"

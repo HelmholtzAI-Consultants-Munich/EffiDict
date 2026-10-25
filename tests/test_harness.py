@@ -29,13 +29,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 def _install_harness(pytester):
     """Point a pytester sandbox at this repo's conftest."""
     pytester.makeconftest(
-        "\n".join(
-            [
-                "import sys",
-                f"sys.path.insert(0, {str(PROJECT_ROOT)!r})",
-                'pytest_plugins = ["tests.conftest"]',
-            ]
-        )
+        f"""
+        import sys
+        sys.path.insert(0, {str(PROJECT_ROOT)!r})
+        pytest_plugins = ["tests.conftest"]
+        """
     )
 
 

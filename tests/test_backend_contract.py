@@ -14,7 +14,6 @@ into an ndarray, and SQLite/JSON return a tuple as a list.
 
 from __future__ import annotations
 
-import os
 from unittest import mock
 
 import pytest
@@ -34,6 +33,7 @@ from .helpers import (
     assert_equal_value,
     is_lossy,
     is_unsupported,
+    store_bytes,
 )
 
 #: Where each backend decodes a stored payload. Patched to raise, to check an
@@ -279,16 +279,6 @@ def test_decode_failure_is_not_reported_as_missing_key(request, backend_cls, bac
 # --------------------------------------------------------------------------
 
 
-def _store_size(path):
-    if os.path.isdir(path):
-        return sum(
-            os.path.getsize(os.path.join(dirpath, filename))
-            for dirpath, _, filenames in os.walk(path)
-            for filename in filenames
-        )
-    return os.path.getsize(path)
-
-
 @pytest.mark.xfail(
     strict=True,
     reason="compact() is a contract stub (issue 7.2)",
@@ -305,7 +295,7 @@ def test_compact_reclaims_deleted_space(backend, backend_cls):
     keys = [f"k{i:04d}" for i in range(400)]
     for key in keys:
         backend.serialize(key, payload)
-    full = _store_size(backend.storage_path)
+    full = store_bytes(backend.storage_path)
 
     for key in keys:
         backend.del_item(key)
@@ -313,7 +303,7 @@ def test_compact_reclaims_deleted_space(backend, backend_cls):
 
     backend.compact()
 
-    reclaimed = _store_size(backend.storage_path)
+    reclaimed = store_bytes(backend.storage_path)
     assert reclaimed < full / 2, (
         f"{backend_cls.__name__} still holds {reclaimed} bytes after deleting "
         f"every key and compacting (was {full})"
