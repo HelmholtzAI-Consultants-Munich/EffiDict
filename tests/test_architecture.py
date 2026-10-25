@@ -180,7 +180,15 @@ def test_unimplemented_methods_name_their_issue(owner):
     Only checks methods that still raise ``NotImplementedError``, so this stays
     valid as Phase 1 implements them one at a time: an implemented method is
     simply not examined, and a stub that forgets its reference is.
+
+    Goes through a subclass with ``__abstractmethods__`` cleared rather than
+    ``object.__new__(owner)``. The owners are ABCs, so ``object.__new__`` on one
+    raises ``TypeError`` -- which the ``except Exception`` below would swallow
+    for every name, leaving this asserting nothing at all while still passing.
     """
+    probe = type(f"Probe{owner.__name__}", (owner,), {})
+    probe.__abstractmethods__ = frozenset()
+
     unreferenced = []
     for name in list(STORE_SURFACE) + list(CACHE_SURFACE) + STORE_PROPERTIES:
         attribute = inspect.getattr_static(owner, name, None)
@@ -190,7 +198,7 @@ def test_unimplemented_methods_name_their_issue(owner):
         if not callable(function):
             continue
         try:
-            function(object.__new__(owner), *[None] * len(_signature_spec(function)))
+            function(object.__new__(probe), *[None] * len(_signature_spec(function)))
         except NotImplementedError as exc:
             if "issue #" not in str(exc):
                 unreferenced.append(f"{name}: {str(exc)!r}")

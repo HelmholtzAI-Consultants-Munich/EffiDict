@@ -9,7 +9,11 @@ generating a case where set-union order happens to differ, which is not reliable
 enough for a strict marker.
 
 Values and keys are plain strings, so nothing here can fail for a backend-fidelity
-or keyspace reason.
+or keyspace reason. That is also why most specs here take neither matrix fixture:
+the mapping surface is plain Python semantics, and running it over all 28
+backend/policy combinations asserts the same thing 28 times. The exceptions take
+the fixtures they actually read -- iteration order depends on which keys sit in
+which tier, and the purity spec branches on whether the policy promotes.
 """
 
 from __future__ import annotations
@@ -48,7 +52,7 @@ ORDERED_KEYS = [f"k{i:02d}" for i in range(12)]
         "self._iter_keys, so every iterator is the same object (issue 6.2)"
     ),
 )
-def test_iter_returns_independent_iterators(backend_cls, policy_cls, make_dict):
+def test_iter_returns_independent_iterators(make_dict):
     """Each call to ``iter()`` must hand back a fresh, independent cursor."""
     d = make_dict(max_in_memory=10)
     for key in "abcd":
@@ -69,7 +73,7 @@ def test_iter_returns_independent_iterators(backend_cls, policy_cls, make_dict):
         "cursor and the outer loop stops early (issue 6.2)"
     ),
 )
-def test_nested_iteration(backend_cls, policy_cls, make_dict):
+def test_nested_iteration(make_dict):
     """Nested loops must produce the full cross product.
 
     Silently truncating is worse than raising: four keys yield four pairs instead
@@ -205,7 +209,7 @@ MAPPING_METHODS = [
         "popitem/update raise NotImplementedError (issue 6.1)"
     ),
 )
-def test_mutablemapping_surface_is_complete(backend_cls, policy_cls, make_dict):
+def test_mutablemapping_surface_is_complete(make_dict):
     """The full mapping surface must be present and working.
 
     Registering as a ``MutableMapping`` is what makes conformance structural
@@ -247,7 +251,7 @@ def test_mutablemapping_surface_is_complete(backend_cls, policy_cls, make_dict):
         "reversal"
     ),
 )
-def test_dict_extras_behave_like_dict(backend_cls, policy_cls, make_dict):
+def test_dict_extras_behave_like_dict(make_dict):
     """The three non-``Mapping`` entries in the surface list must actually work.
 
     ``MAPPING_METHODS`` claims ``__reversed__``, ``__or__`` and ``fromkeys``, but
@@ -311,7 +315,7 @@ EQUALITY_CASES = [
 
 
 @pytest.mark.parametrize("label, other", EQUALITY_CASES, ids=[c[0] for c in EQUALITY_CASES])
-def test_equality_matches_dict(request, label, other, backend_cls, policy_cls, make_dict):
+def test_equality_matches_dict(request, label, other, make_dict):
     """``==`` must give the answer a ``dict`` would, against any operand.
 
     Nothing pinned this. The two existing ``__eq__`` specs cover *purity* -- that
@@ -363,7 +367,7 @@ def test_equality_matches_dict(request, label, other, backend_cls, policy_cls, m
     )
 
 
-def test_equality_between_stores_is_by_contents(backend_cls, policy_cls, make_dict):
+def test_equality_between_stores_is_by_contents(make_dict):
     """Two stores holding the same items must compare equal.
 
     Already true, and the half of ``__eq__`` that works; pinned so the fix for
@@ -445,7 +449,7 @@ def test_eq_does_not_mutate_either_operand(
     )
 
 
-def test_unhashable_by_design(backend_cls, policy_cls, make_dict):
+def test_unhashable_by_design(make_dict):
     """A mutable mapping must not be hashable.
 
     Already true, and pinned so it stays true: ``EffiDict`` defines ``__eq__``,
@@ -468,9 +472,7 @@ def test_unhashable_by_design(backend_cls, policy_cls, make_dict):
     strict=True,
     reason="EffiDict.iter_keys() is a contract stub (issue 4.2)",
 )
-def test_facade_iter_keys_streams_the_whole_keyspace(
-    backend_cls, policy_cls, make_dict, backend_spy
-):
+def test_facade_iter_keys_streams_the_whole_keyspace(make_dict, backend_spy):
     """``d.iter_keys()`` must stream every key, across both tiers.
 
     The facade method had no test of its own. ``DiskBackend.iter_keys`` is

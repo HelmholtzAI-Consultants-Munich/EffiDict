@@ -33,11 +33,11 @@ import pytest
 
 from effidict import EffiDict
 
-from .conftest import release_store
+from .conftest import DEFAULT_POLICY, release_store
 from .helpers import build_policy, on_disk
 
 
-def _build_unregistered(backend_cls, policy_cls, storage_dir, name="store", **kwargs):
+def _build_unregistered(backend_cls, storage_dir, name="store", **kwargs):
     """Build a store that the ``make_dict`` registry does not hold a reference to.
 
     ``make_dict`` keeps every store it creates alive for teardown, which would
@@ -47,7 +47,7 @@ def _build_unregistered(backend_cls, policy_cls, storage_dir, name="store", **kw
     backend = backend_cls(str(storage_dir / name))
     effidict = EffiDict(
         disk_backend=backend,
-        replacement_strategy=build_policy(policy_cls, disk_backend=backend),
+        replacement_strategy=build_policy(DEFAULT_POLICY, disk_backend=backend),
         **kwargs,
     )
     return effidict, backend.storage_path
@@ -76,7 +76,7 @@ def _remove(path):
         "__del__ destroys the original's storage (issue 3.2)"
     ),
 )
-def test_copy_raises_with_actionable_message(backend_cls, policy_cls, make_dict):
+def test_copy_raises_with_actionable_message(backend_cls, make_dict):
     """Shallow-copying a disk-backed store must be refused, and say what to use.
 
     Silently sharing the storage is the worse outcome: the copy looks independent
@@ -100,7 +100,7 @@ def test_copy_raises_with_actionable_message(backend_cls, policy_cls, make_dict)
         "pickling error (SQLite/HDF5) instead of naming clone() (issues 3.2, 2.3)"
     ),
 )
-def test_deepcopy_raises_with_actionable_message(backend_cls, policy_cls, make_dict):
+def test_deepcopy_raises_with_actionable_message(backend_cls, make_dict):
     """Deep-copying must be refused too, with the same pointer to clone().
 
     SQLite and HDF5 already raise ``TypeError`` here, but for the wrong reason --
@@ -125,9 +125,7 @@ def test_deepcopy_raises_with_actionable_message(backend_cls, policy_cls, make_d
         "collecting it destroys the original's data (issue 3.2)"
     ),
 )
-def test_copying_does_not_destroy_the_originals_storage(
-    backend_cls, policy_cls, make_dict
-):
+def test_copying_does_not_destroy_the_originals_storage(backend_cls, make_dict):
     """The oligo-designer-toolsuite bug, stated as a behaviour.
 
     Written so it passes once copying is *refused* as well as once it is made
@@ -159,7 +157,7 @@ def test_copying_does_not_destroy_the_originals_storage(
     strict=True,
     reason="clone() is a contract stub (issue 3.2)",
 )
-def test_clone_produces_independent_store(backend_cls, policy_cls, make_dict, storage_dir):
+def test_clone_produces_independent_store(backend_cls, make_dict, storage_dir):
     """``clone(new_path)`` must produce a store that shares nothing.
 
     Independence has to hold in both directions *and* survive the caches. An
@@ -229,13 +227,13 @@ def test_clone_produces_independent_store(backend_cls, policy_cls, make_dict, st
         "deletes its data (issue 3.1)"
     ),
 )
-def test_del_never_destroys_storage(backend_cls, policy_cls, storage_dir):
+def test_del_never_destroys_storage(backend_cls, storage_dir):
     """Collecting a store must release handles, never delete data.
 
     Uses a store the ``make_dict`` registry does not reference, so ``del`` plus
     ``gc.collect()`` genuinely collects it.
     """
-    d, path = _build_unregistered(backend_cls, policy_cls, storage_dir)
+    d, path = _build_unregistered(backend_cls, storage_dir)
     d["k"] = "v"
     assert os.path.exists(path), "precondition: storage was created"
 
@@ -255,7 +253,7 @@ def test_del_never_destroys_storage(backend_cls, policy_cls, storage_dir):
         "store owns the storage it did not create (issues 2.3, 3.1)"
     ),
 )
-def test_unpickled_instance_does_not_own_storage(backend_cls, policy_cls, make_dict):
+def test_unpickled_instance_does_not_own_storage(backend_cls, make_dict):
     """A store that arrived over a process boundary must not delete the data.
 
     This is the joblib failure: the worker's copy is collected when the task ends
@@ -281,7 +279,7 @@ def test_unpickled_instance_does_not_own_storage(backend_cls, policy_cls, make_d
         )
         assert d["k"] == "v"
     finally:
-        # Destroys rather than closes, because Backend.close() is still a stub
+        # Destroys rather than closes, because DiskBackend.close() is still a stub
         # (issue 3.1). Harmless here: every assertion has already run, and the
         # fixture teardown of ``d`` tolerates the storage being gone.
         release_store(child_backend)
@@ -299,13 +297,13 @@ def test_unpickled_instance_does_not_own_storage(backend_cls, policy_cls, make_d
         "FileNotFoundError (issue 3.1)"
     ),
 )
-def test_destroy_is_explicit_and_idempotent(backend_cls, policy_cls, storage_dir):
+def test_destroy_is_explicit_and_idempotent(backend_cls, storage_dir):
     """Deleting the data is an explicit call, and a second call is a no-op.
 
     Today a second release raises ``FileNotFoundError`` on all 28 combinations,
     which makes defensive cleanup in a ``finally`` block impossible to write.
     """
-    d, path = _build_unregistered(backend_cls, policy_cls, storage_dir)
+    d, path = _build_unregistered(backend_cls, storage_dir)
     d["k"] = "v"
 
     try:
@@ -321,11 +319,9 @@ def test_destroy_is_explicit_and_idempotent(backend_cls, policy_cls, storage_dir
     strict=True,
     reason="__exit__ calls close(), which destroys the storage (issue 3.1)",
 )
-def test_context_manager_closes_but_does_not_destroy(
-    backend_cls, policy_cls, storage_dir
-):
+def test_context_manager_closes_but_does_not_destroy(backend_cls, storage_dir):
     """Leaving a ``with`` block releases handles and keeps the data."""
-    d, path = _build_unregistered(backend_cls, policy_cls, storage_dir)
+    d, path = _build_unregistered(backend_cls, storage_dir)
 
     with d:
         d["k"] = "v"
@@ -340,7 +336,7 @@ def test_context_manager_closes_but_does_not_destroy(
     strict=True,
     reason="temporary() is a contract stub (issues 2.1, 3.1)",
 )
-def test_temporary_store_is_destroyed_on_close(backend_cls, policy_cls):
+def test_temporary_store_is_destroyed_on_close(backend_cls):
     """A scratch store is the one case that *should* clean itself up on close.
 
     Destroy-on-close becomes opt-in rather than the default, so ``temporary()``
@@ -356,7 +352,7 @@ def test_temporary_store_is_destroyed_on_close(backend_cls, policy_cls):
     try:
         d = EffiDict(
             disk_backend=backend,
-            replacement_strategy=build_policy(policy_cls, disk_backend=backend),
+            replacement_strategy=build_policy(DEFAULT_POLICY, disk_backend=backend),
         )
         d["k"] = "v"
 
@@ -374,9 +370,7 @@ def test_temporary_store_is_destroyed_on_close(backend_cls, policy_cls):
         "flushes (issues 1.4, 3.1)"
     ),
 )
-def test_dirty_entries_are_flushed_on_close(
-    backend_cls, policy_cls, make_dict, backend_spy
-):
+def test_dirty_entries_are_flushed_on_close(backend_cls, make_dict, backend_spy):
     """close() must write out whatever the cache still holds.
 
     Asserted with the call spy rather than by reopening, so this stays a statement

@@ -19,7 +19,7 @@ import threading
 
 import pytest
 
-from effidict import DiskBackend, EvictionPolicy
+from effidict import Cache, DiskBackend, EvictionPolicy, ReplacementStrategy, Store
 
 from .helpers import (
     PROMOTING_POLICIES,
@@ -529,9 +529,13 @@ def test_cache_respects_byte_budget(backend_cls, policy_cls, make_dict):
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("base", [DiskBackend, EvictionPolicy], ids=lambda c: c.__name__)
+@pytest.mark.parametrize(
+    "base",
+    [DiskBackend, EvictionPolicy, Store, Cache, ReplacementStrategy],
+    ids=lambda c: c.__name__,
+)
 def test_abstract_bases_cannot_be_instantiated(base):
-    """The contract bases are real ABCs.
+    """Every base class in the package is a real ABC.
 
     ``@abstractmethod`` without ``ABCMeta`` is inert -- it was decorative before
     issue 0.1, so the base classes could be constructed and subclasses were never
@@ -546,6 +550,16 @@ def test_abstract_bases_cannot_be_instantiated(base):
     about. So the abstractness is asserted directly, and then where it actually
     bites: an incomplete subclass must be refused too, which is the half that
     protects callers.
+
+    ``Store`` and ``Cache`` were exactly that trap before they became ABCs:
+    both raised ``TypeError`` from ``base()`` for missing positional arguments
+    rather than for abstractness, so the naive form of this spec passed against
+    them and reported nothing. The first assertion is what caught it.
+
+    ``ReplacementStrategy`` is the legacy base and is listed for the same
+    reason: it shipped carrying three ``@abstractmethod`` decorators while not
+    being an ABC at all, so they bound nothing. It is scheduled for removal in
+    Phase 1, and this row goes with it when it goes.
     """
     assert getattr(base, "__abstractmethods__", frozenset()), (
         f"{base.__name__} declares no abstract methods, so @abstractmethod is "
