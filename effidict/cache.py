@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from typing import Iterator
 
 
-class Cache:
+class Cache(ABC):
     def __init__(self, policy, max_items=None, max_bytes=None, size_estimator=None):
         """Create a cache constrained by independent item and byte budgets.
 
@@ -24,50 +25,62 @@ class Cache:
         """
         raise NotImplementedError("see issue #1.2")
 
+    @abstractmethod
     def has(self, key) -> bool:
         """Return whether ``key`` is present in the cache."""
         raise NotImplementedError("see issue #1.2")
 
+    @abstractmethod
     def get(self, key):
         """Return ``key`` and record access, or raise ``KeyError`` if absent."""
         raise NotImplementedError("see issue #1.2")
 
+    @abstractmethod
     def peek(self, key):
         """Return ``key`` without recording access, or raise ``KeyError``."""
         raise NotImplementedError("see issue #1.2")
 
+    @abstractmethod
     def put(self, key, value, dirty: bool = True) -> None:
         """Store ``value`` under ``key`` and record dirty state."""
         raise NotImplementedError("see issue #1.2")
 
+    @abstractmethod
     def discard(self, key) -> None:
         """Remove ``key`` if present without raising when absent."""
         raise NotImplementedError("see issue #1.2")
 
+    @abstractmethod
     def clear(self) -> None:
         """Remove all cached entries and policy state."""
         raise NotImplementedError("see issue #1.2")
 
+    @abstractmethod
     def __len__(self) -> int:
         """Return the number of cached items."""
         raise NotImplementedError("see issue #1.2")
 
+    @abstractmethod
     def nbytes(self) -> int:
         """Return the approximate cached byte size."""
         raise NotImplementedError("see issue #1.4")
 
+    @abstractmethod
     def is_dirty(self, key) -> bool:
         """Return whether ``key`` has unwritten cache changes."""
         raise NotImplementedError("see issue #1.3")
 
+    @abstractmethod
     def mark_clean(self, key) -> None:
         """Mark ``key`` as having no unwritten cache changes."""
         raise NotImplementedError("see issue #1.3")
 
+    @abstractmethod
     def dirty_items(self) -> Iterator:
         """Iterate over cached items with unwritten changes."""
         raise NotImplementedError("see issue #1.3")
 
+    @abstractmethod
     def evict_candidates(self) -> Iterator:
         """Iterate over keys that must be shed to get back inside budget.
 

@@ -1,8 +1,8 @@
 from collections import OrderedDict, defaultdict
 import random
-from abc import abstractmethod
+from abc import ABC, abstractmethod
 
-class ReplacementStrategy:
+class ReplacementStrategy(ABC):
     def __init__(self, disk_backend, max_in_memory):
         self.memory = self.get_memory()
         self.disk_backend = disk_backend

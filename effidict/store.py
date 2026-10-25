@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from typing import Iterator
 
 
@@ -20,7 +21,7 @@ class _Missing:
 MISSING = _Missing()
 
 
-class Store:
+class Store(ABC):
     """The single owner of where a key lives.
 
     Holds the lock. Enforces the tier invariants:
@@ -48,32 +49,39 @@ class Store:
         raise NotImplementedError("see issue #1.2")
 
     @property
+    @abstractmethod
     def backend(self):
         """Return the backing persistent store."""
         raise NotImplementedError("see issue #1.2")
 
     @property
+    @abstractmethod
     def cache(self):
         """Return the in-memory cache."""
         raise NotImplementedError("see issue #1.2")
 
     @property
+    @abstractmethod
     def owns_storage(self) -> bool:
         """Return whether this store owns the backend storage lifecycle."""
         raise NotImplementedError("see issue #3.1")
 
+    @abstractmethod
     def get(self, key):
         """Return ``key`` from the store."""
         raise NotImplementedError("see issue #1.2")
 
+    @abstractmethod
     def set(self, key, value) -> None:
         """Store ``value`` under ``key``."""
         raise NotImplementedError("see issue #1.2")
 
+    @abstractmethod
     def delete(self, key) -> None:
         """Remove ``key`` from all tiers."""
         raise NotImplementedError("see issue #1.2")
 
+    @abstractmethod
     def pop(self, key, default=MISSING):
         """Remove ``key`` and return its value.
 
@@ -83,26 +91,32 @@ class Store:
         """
         raise NotImplementedError("see issue #1.2")
 
+    @abstractmethod
     def clear(self) -> None:
         """Remove all entries from all tiers."""
         raise NotImplementedError("see issue #1.2")
 
+    @abstractmethod
     def update(self, items) -> None:
         """Store multiple items."""
         raise NotImplementedError("see issue #4.1")
 
+    @abstractmethod
     def contains(self, key) -> bool:
         """Return whether ``key`` is present in any tier."""
         raise NotImplementedError("see issue #1.2")
 
+    @abstractmethod
     def count(self) -> int:
         """Return the number of distinct keys in the store."""
         raise NotImplementedError("see issue #1.2")
 
+    @abstractmethod
     def iter_keys(self) -> Iterator:
         """Iterate over all distinct keys in the store."""
         raise NotImplementedError("see issue #4.2")
 
+    @abstractmethod
     def in_cache(self, key) -> bool:
         """White-box hook for tier-invariant specs to assert preconditions.
 
@@ -114,18 +128,22 @@ class Store:
         """
         raise NotImplementedError("see issue #1.2")
 
+    @abstractmethod
     def flush(self) -> None:
         """Write dirty cached items to the backend."""
         raise NotImplementedError("see issue #1.4")
 
+    @abstractmethod
     def close(self) -> None:
         """Close store resources without destroying storage."""
         raise NotImplementedError("see issue #1.2")
 
+    @abstractmethod
     def destroy(self) -> None:
         """Destroy owned storage resources."""
         raise NotImplementedError("see issue #3.1")
 
+    @abstractmethod
     def clone(self, new_path):
         """Clone the store to ``new_path``."""
         raise NotImplementedError("see issue #3.2")
