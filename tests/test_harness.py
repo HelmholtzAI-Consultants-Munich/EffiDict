@@ -231,6 +231,33 @@ def test_assert_equal_value_rejects_numpy_scalar_widening():
         assert_equal_value(np.int64(7), 7)
 
 
+@pytest.mark.parametrize(
+    "stored, returned",
+    [
+        ("float64", "float32"),   # narrowed on the way back
+        ("float32", "float64"),   # widened on the way back
+        ("int64", "int32"),
+        ("int64", "float64"),     # integers returned as floats
+    ],
+)
+def test_assert_equal_value_rejects_array_dtype_changes(stored, returned):
+    """An array that changes dtype in storage is not a faithful round-trip.
+
+    ``np.array_equal`` compares element values and ignores dtype, so a backend
+    deserialising float64 as float32 read as faithful: both the fidelity spec
+    and the support-table spec passed while the data silently lost precision.
+    The scalar path already rejected this widening; arrays did not, and the two
+    now agree.
+    """
+    np = pytest.importorskip("numpy")
+
+    values = [1, 2, 3]
+    with pytest.raises(AssertionError):
+        assert_equal_value(
+            np.array(values, dtype=stored), np.array(values, dtype=returned)
+        )
+
+
 # --------------------------------------------------------------------------
 # value support tables
 # --------------------------------------------------------------------------

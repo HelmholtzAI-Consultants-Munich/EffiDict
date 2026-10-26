@@ -237,6 +237,14 @@ def _equal(actual, expected):
         if isinstance(actual, np.ndarray) or isinstance(expected, np.ndarray):
             if not (isinstance(actual, np.ndarray) and isinstance(expected, np.ndarray)):
                 return False
+            # dtype before values. ``np.array_equal`` compares element values
+            # only, so an array stored as float64 and returned as float32 --
+            # or as int32, or widened to float64 -- compares equal and the
+            # round-trip reads as faithful. That is the same silent widening
+            # the scalar path already rejects below via ``type(actual) is not
+            # type(expected)``; arrays were the gap.
+            if actual.dtype != expected.dtype:
+                return False
             # equal_nan calls isnan(), which raises TypeError on string and
             # object dtypes, so only ask for it where NaN can exist.
             if np.issubdtype(actual.dtype, np.inexact) and np.issubdtype(
