@@ -1,0 +1,131 @@
+from __future__ import annotations
+
+from typing import Iterator
+
+
+class _Missing:
+    """Sentinel for "no default was given".
+
+    ``pop(key, default=None)`` cannot tell ``pop(key)`` from ``pop(key, None)``,
+    so a ``Store`` written against that signature would have to guess -- and
+    guessing "return None" is precisely the defect
+    ``test_pop_without_default_raises_keyerror`` pins at the facade (issue 1.2).
+    The contract has to be able to express the distinction that ``dict`` makes.
+    """
+
+    def __repr__(self):  # pragma: no cover - debugging aid
+        return "<no default>"
+
+
+MISSING = _Missing()
+
+
+class Store:
+    """The single owner of where a key lives.
+
+    Holds the lock. Enforces the tier invariants:
+
+    I1  Disk holds the authoritative copy of every flushed key.
+    I2  Cached entries are tagged ``clean`` (matches disk) or ``dirty``
+        (newer than disk).
+    I3  ``key in store`` is ``cache.has(key) or backend.has(key)`` --
+        never a full scan of the keyspace.
+    I4  Delete removes from cache *and* backend under one lock; no partial
+        state is observable.
+    I5  Evicting a **clean** entry is a pure memory drop with zero I/O.
+        Evicting a **dirty** entry writes *then* drops, so a key is never
+        absent from both tiers.
+    I6  A read never marks an entry dirty and never writes the key being
+        read.
+    I7  After ``flush()`` or ``close()``, every dirty entry is on disk.
+    I8  The cache honours a **byte** budget, not just an item count.
+
+    Note that keys legitimately reside in both tiers at once; I1 makes disk
+    authoritative rather than exclusive. I5 depends on that overlap.
+    """
+
+    def __init__(self, backend, cache, lock=None, owns_storage: bool = True):
+        raise NotImplementedError("see issue #1.2")
+
+    @property
+    def backend(self):
+        """Return the backing persistent store."""
+        raise NotImplementedError("see issue #1.2")
+
+    @property
+    def cache(self):
+        """Return the in-memory cache."""
+        raise NotImplementedError("see issue #1.2")
+
+    @property
+    def owns_storage(self) -> bool:
+        """Return whether this store owns the backend storage lifecycle."""
+        raise NotImplementedError("see issue #3.1")
+
+    def get(self, key):
+        """Return ``key`` from the store."""
+        raise NotImplementedError("see issue #1.2")
+
+    def set(self, key, value) -> None:
+        """Store ``value`` under ``key``."""
+        raise NotImplementedError("see issue #1.2")
+
+    def delete(self, key) -> None:
+        """Remove ``key`` from all tiers."""
+        raise NotImplementedError("see issue #1.2")
+
+    def pop(self, key, default=MISSING):
+        """Remove ``key`` and return its value.
+
+        Returns ``default`` if the key is absent and a default was given; raises
+        ``KeyError`` if it is absent and none was. ``dict`` semantics, including
+        ``pop(key, None)`` returning ``None`` rather than raising.
+        """
+        raise NotImplementedError("see issue #1.2")
+
+    def clear(self) -> None:
+        """Remove all entries from all tiers."""
+        raise NotImplementedError("see issue #1.2")
+
+    def update(self, items) -> None:
+        """Store multiple items."""
+        raise NotImplementedError("see issue #4.1")
+
+    def contains(self, key) -> bool:
+        """Return whether ``key`` is present in any tier."""
+        raise NotImplementedError("see issue #1.2")
+
+    def count(self) -> int:
+        """Return the number of distinct keys in the store."""
+        raise NotImplementedError("see issue #1.2")
+
+    def iter_keys(self) -> Iterator:
+        """Iterate over all distinct keys in the store."""
+        raise NotImplementedError("see issue #4.2")
+
+    def in_cache(self, key) -> bool:
+        """White-box hook for tier-invariant specs to assert preconditions.
+
+        Must **not** acquire the store lock. The I5 specs use this to observe
+        tier residency while an eviction is deliberately held open; if this
+        blocked behind that eviction it could only ever report state from after
+        the write completed, at which point a drop-then-write implementation
+        looks identical to a compliant one.
+        """
+        raise NotImplementedError("see issue #1.2")
+
+    def flush(self) -> None:
+        """Write dirty cached items to the backend."""
+        raise NotImplementedError("see issue #1.4")
+
+    def close(self) -> None:
+        """Close store resources without destroying storage."""
+        raise NotImplementedError("see issue #1.2")
+
+    def destroy(self) -> None:
+        """Destroy owned storage resources."""
+        raise NotImplementedError("see issue #3.1")
+
+    def clone(self, new_path):
+        """Clone the store to ``new_path``."""
+        raise NotImplementedError("see issue #3.2")

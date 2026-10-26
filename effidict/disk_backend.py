@@ -1,5 +1,8 @@
+from __future__ import annotations
+
 import time
-from abc import abstractmethod
+from abc import ABC, abstractmethod
+from typing import Dict, Iterator
 import sqlite3  
 import json
 import os
@@ -9,12 +12,43 @@ import ast
 
 try:
     import h5py
-    import numpy as np
 except Exception:
     h5py = None
-    np = None
 
-class DiskBackend:
+class DiskBackend(ABC):
+    """Base contract for the persistent tier.
+
+    Note the ``ABC`` base. Before issue 0.1 this class carried
+    ``@abstractmethod`` decorators without ``ABCMeta``, which makes them inert:
+    the base could be instantiated and an incomplete subclass was never
+    checked. Activating it is deliberate and is pinned by
+    ``test_abstract_bases_cannot_be_instantiated``, but it is a real
+    behaviour change -- an out-of-tree subclass that omits ``serialize``,
+    ``deserialize``, ``del_item``, ``keys`` or ``destroy`` used to construct and
+    will now raise ``TypeError`` at instantiation. The four shipped backends are
+    unaffected, which ``test_concrete_backends_remain_instantiable`` pins.
+
+    Phase 0 carries three further user-visible changes, listed here so the set
+    is in one place:
+
+    * ``ReplacementStrategy`` became an ABC for the same reason, so an
+      out-of-tree policy missing ``get``, ``put`` or ``get_memory`` now raises
+      ``TypeError`` at construction.
+    * ``Hdf5Backend`` no longer requires ``numpy``. It never used it, and h5py
+      depends on numpy anyway, so the gate could not fire; the ``ImportError``
+      text changed with it.
+    * ``EffiDict`` grew ``get``, ``setdefault``, ``popitem``, ``update``,
+      ``clone``, ``flush``, ``iter_keys``, ``destroy``, ``fromkeys``,
+      ``__reversed__`` and ``__or__`` as stubs that raise
+      ``NotImplementedError``. They are declared ahead of issue 6.1 so the specs
+      fail on the documented reason rather than ``AttributeError``, but the
+      declaration is itself observable: ``hasattr(d, "get")`` flipped from False
+      to True, so a duck-typing caller now takes the branch and gets
+      ``NotImplementedError``. ``reversed(d)`` likewise used to return a
+      ``reversed`` object that failed later on iteration, and now raises
+      immediately.
+    """
+
     def __init__(self, storage_path):
         self.storage_path = storage_path + f"{int(time.time())}_{id(self)}"
         
@@ -41,6 +75,85 @@ class DiskBackend:
     def load_from_dict(self, dictionary):
         for key, value in dictionary.items():
             self.serialize(key, value)
+
+    def has(self, key) -> bool:
+        """Return whether ``key`` exists in this backend."""
+        raise NotImplementedError("see issue #2.2")
+
+    def count(self) -> int:
+        """Return the number of keys in this backend."""
+        raise NotImplementedError("see issue #2.2")
+
+    def iter_keys(self) -> Iterator:
+        """Iterate over keys in this backend."""
+        raise NotImplementedError("see issue #4.2")
+
+    def read_many(self, keys) -> Dict:
+        """Read multiple keys from this backend."""
+        raise NotImplementedError("see issue #4.1")
+
+    def write_many(self, items) -> None:
+        """Write multiple items to this backend."""
+        raise NotImplementedError("see issue #4.1")
+
+    def delete_many(self, keys) -> None:
+        """Delete multiple keys from this backend."""
+        raise NotImplementedError("see issue #4.1")
+
+    def supports(self, value) -> bool:
+        """Return whether this backend can store ``value`` faithfully.
+
+        An instance method rather than a classmethod: whether a value fits can
+        depend on how the store was opened. Declared here so every backend
+        exposes the same predicate -- ``test_backend_declares_its_value_domain``
+        already treats it as part of the contract, and without a stub the
+        failure is a bare ``AttributeError`` instead of a reference to the issue
+        that implements it.
+        """
+        raise NotImplementedError("see issue #7.2")
+
+    def close(self) -> None:
+        """Release handles and flush buffers, leaving the storage in place.
+
+        Distinct from ``destroy``, which deletes it. Without this, a
+        non-destructive ``Store.close()`` cannot be built on the backend
+        contract at all: SQLite holds a live ``sqlite3.Connection`` and HDF5 an
+        open ``h5py.File``, and today the only method that closes either is
+        ``destroy`` -- which also removes the data. That is why ``close()`` on
+        the facade currently destroys the store (issue 3.1).
+
+        Must be idempotent, and must leave the store reopenable via ``open``.
+        """
+        raise NotImplementedError("see issue #3.1")
+
+    def compact(self) -> None:
+        """Reclaim unused storage space."""
+        raise NotImplementedError("see issue #7.2")
+
+    @classmethod
+    def create(cls, path, **kwargs):
+        """Create a new backend at ``path``."""
+        raise NotImplementedError("see issue #2.1")
+
+    @classmethod
+    def open(cls, path, mode: str = "r+", **kwargs):
+        """Open a backend at ``path``.
+
+        ``mode`` follows the ``create``/``open``/``open_or_create``
+        distinction. The existing ``__init__`` behavior of deriving a unique
+        path from the clock and ``id(self)`` is a bug fixed in issue #2.1.
+        """
+        raise NotImplementedError("see issue #2.1")
+
+    @classmethod
+    def open_or_create(cls, path, **kwargs):
+        """Open an existing backend or create one at ``path``."""
+        raise NotImplementedError("see issue #2.1")
+
+    @classmethod
+    def temporary(cls, prefix: str = "effidict-"):
+        """Create a scratch backend at a unique path."""
+        raise NotImplementedError("see issue #2.1")
 
 
 class SqliteBackend(DiskBackend):
@@ -120,8 +233,8 @@ class PickleBackend(DiskBackend):
 
 class Hdf5Backend(DiskBackend):
     def __init__(self, storage_path):
-        if h5py is None or np is None:
-            raise ImportError("h5py and numpy are required for Hdf5Backend but are not installed.")
+        if h5py is None:
+            raise ImportError("h5py is required for Hdf5Backend but is not installed.")
         super().__init__(storage_path)
         self.file = h5py.File(self.storage_path, "w")
 

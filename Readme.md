@@ -26,7 +26,7 @@ pip install effidict
 Optional dependencies for the HDF5 backend:
 
 ```bash
-pip install h5py numpy
+pip install effidict[hdf5]
 ```
 
 For development (tests):
@@ -89,7 +89,7 @@ store = EffiDict(disk_backend=backend, replacement_strategy=strategy)
 Notes:
 - SQLite and JSON backends store values as JSON; values must be JSON-serializable.
 - Pickle backend can store any picklable Python object.
-- HDF5 backend requires `h5py` and `numpy` and is best suited for numeric arrays; basic Python types are also supported.
+- HDF5 backend requires `h5py` and is best suited for numeric arrays; basic Python types are also supported.
 - The `storage_path` you provide is used as a prefix; a unique suffix is appended automatically per instance.
 
 ## Cleanup and lifecycle
