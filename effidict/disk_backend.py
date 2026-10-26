@@ -23,11 +23,30 @@ class DiskBackend(ABC):
     the base could be instantiated and an incomplete subclass was never
     checked. Activating it is deliberate and is pinned by
     ``test_abstract_bases_cannot_be_instantiated``, but it is a real
-    behaviour change and the only one in Phase 0 -- an out-of-tree subclass that
-    omits ``serialize``, ``deserialize``, ``del_item``, ``keys`` or ``destroy``
-    used to construct and will now raise ``TypeError`` at instantiation. The
-    four shipped backends are unaffected, which
-    ``test_concrete_backends_remain_instantiable`` pins.
+    behaviour change -- an out-of-tree subclass that omits ``serialize``,
+    ``deserialize``, ``del_item``, ``keys`` or ``destroy`` used to construct and
+    will now raise ``TypeError`` at instantiation. The four shipped backends are
+    unaffected, which ``test_concrete_backends_remain_instantiable`` pins.
+
+    Phase 0 carries three further user-visible changes, listed here so the set
+    is in one place:
+
+    * ``ReplacementStrategy`` became an ABC for the same reason, so an
+      out-of-tree policy missing ``get``, ``put`` or ``get_memory`` now raises
+      ``TypeError`` at construction.
+    * ``Hdf5Backend`` no longer requires ``numpy``. It never used it, and h5py
+      depends on numpy anyway, so the gate could not fire; the ``ImportError``
+      text changed with it.
+    * ``EffiDict`` grew ``get``, ``setdefault``, ``popitem``, ``update``,
+      ``clone``, ``flush``, ``iter_keys``, ``destroy``, ``fromkeys``,
+      ``__reversed__`` and ``__or__`` as stubs that raise
+      ``NotImplementedError``. They are declared ahead of issue 6.1 so the specs
+      fail on the documented reason rather than ``AttributeError``, but the
+      declaration is itself observable: ``hasattr(d, "get")`` flipped from False
+      to True, so a duck-typing caller now takes the branch and gets
+      ``NotImplementedError``. ``reversed(d)`` likewise used to return a
+      ``reversed`` object that failed later on iteration, and now raises
+      immediately.
     """
 
     def __init__(self, storage_path):

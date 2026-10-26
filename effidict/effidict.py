@@ -4,8 +4,14 @@ from typing import Optional
 
 
 class EffiDict:
-    def __init__(self, disk_backend=None, replacement_strategy=None, *, max_bytes: Optional[int] = None):
+    def __init__(self, disk_backend, replacement_strategy, *, max_bytes: Optional[int] = None):
         """Create an EffiDict facade.
+
+        Both tiers are required. They used to default to ``None``, but the last
+        line of this constructor reads ``replacement_strategy.memory``, so
+        either default raised ``AttributeError`` from inside the object -- a
+        declared default that could never be used. Omitting one is now a
+        ``TypeError`` naming the argument.
 
         ``max_bytes`` is accepted as the future approximate cache byte budget,
         but it is not enforced yet; see issue #1.4.
@@ -76,8 +82,15 @@ class EffiDict:
         """
         raise NotImplementedError("see issue #6.1")
 
-    def update(self, other=(), **kwargs):
-        """Update this dictionary from another mapping or iterable."""
+    def update(self, other=(), /, **kwargs):
+        """Update this dictionary from another mapping or iterable.
+
+        ``other`` is positional-only, as it is on ``dict.update``. Without the
+        ``/`` the name is bindable, so ``update(other=5)`` would assign 5 to the
+        mapping parameter instead of storing a key called ``other`` -- and
+        ``update({"other": a}, other=b)`` would raise ``TypeError`` for a
+        duplicate argument rather than letting the keyword win.
+        """
         raise NotImplementedError("see issue #6.1")
 
     def iter_keys(self):
