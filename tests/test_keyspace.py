@@ -311,6 +311,67 @@ def test_key_traversal_is_neutralised(request, backend_cls, probe_backend):
     assert not outside, f"a '..' key wrote outside the store: {outside}"
 
 
+#: Keys that escape *past* the tree ``_entries_outside`` walks. Its root is
+#: ``dirname(dirname(storage_path))``, which is ``storage_dir``, so the spec above
+#: can only see an escape that happens to land inside it -- ``'../escaped'`` does.
+#: These two do not: an absolute key replaces the storage prefix outright, because
+#: ``os.path.join`` discards everything before an absolute segment, and three
+#: ``..`` segments climb out of ``storage_dir`` altogether. Both were reproduced
+#: against PickleBackend and JSONBackend before this spec was written.
+ESCAPE_KEYS = {
+    "absolute": "{sentinel}/escaped",
+    "deep traversal": "../../../{sentinel_name}/escaped",
+}
+
+
+@pytest.mark.parametrize("label", sorted(ESCAPE_KEYS))
+def test_keys_cannot_write_outside_the_storage_tree(
+    request, label, backend_cls, probe_backend, tmp_path
+):
+    """No key may place a file outside the store, however it is spelled.
+
+    Containment has to hold for the whole key domain, not for one relative key.
+    Checked against a sentinel directory rather than by walking a tree: an
+    absolute key can land anywhere the process can write, so there is no tree to
+    walk. The sentinel sits beside ``storage_dir`` under ``tmp_path``, which also
+    puts it outside the autouse leak detector -- nothing else in the suite would
+    notice a file arriving there.
+    """
+    sentinel = tmp_path / "outside-the-store"
+    sentinel.mkdir(exist_ok=True)
+    key = ESCAPE_KEYS[label].format(sentinel=sentinel, sentinel_name=sentinel.name)
+
+    if backend_cls in TRAVERSAL_ESCAPES:
+        request.applymarker(
+            pytest.mark.xfail(
+                strict=True,
+                reason=(
+                    f"{backend_cls.__name__} joins the key onto its storage path "
+                    f"unsanitised, so a {label} key writes outside the store "
+                    f"(issue 7.1)"
+                ),
+            )
+        )
+
+    try:
+        # Refusing the key is a legitimate way to satisfy containment, so a raise
+        # is not a failure -- but the sentinel is inspected either way, in case
+        # the write got partway before failing.
+        try:
+            probe_backend.serialize(key, "v")
+        except Exception:  # noqa: BLE001 - refusal is an acceptable outcome
+            pass
+
+        escaped = sorted(entry.name for entry in sentinel.iterdir())
+        assert not escaped, (
+            f"{label} key wrote outside the storage tree: {escaped}"
+        )
+    finally:
+        # Removed here, not by the leak detector: the sentinel is outside
+        # storage_dir by design, so nothing else cleans it up.
+        shutil.rmtree(sentinel, ignore_errors=True)
+
+
 def test_traversal_key_round_trips(request, backend_cls, probe_backend):
     """``'../escaped'`` is a legal dict key and must round-trip as one key.
 

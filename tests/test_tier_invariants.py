@@ -19,7 +19,7 @@ import threading
 
 import pytest
 
-from effidict import Cache, DiskBackend, EvictionPolicy, ReplacementStrategy, Store
+from effidict import DiskBackend, EvictionPolicy, ReplacementStrategy
 
 from .helpers import (
     PROMOTING_POLICIES,
@@ -171,7 +171,11 @@ def test_clear_removes_from_both_tiers(backend_cls, policy_cls, make_dict):
     strict=True,
     reason=(
         "I5: eviction drops the cache copy before the disk write completes, so "
-        "the key is briefly in neither tier (issues 1.3, 5.1)"
+        "the key is briefly in neither tier (issues 1.3, 5.1). On SQLite the "
+        "evicting write additionally fails with the thread-affinity error -- the "
+        "connection is opened on the main thread and the eviction runs on a "
+        "worker -- which the writer-error assertion below catches, so the seven "
+        "SQLite cases stay red until that lands too (issue 2.3)"
     ),
 )
 def test_no_key_is_ever_absent_from_both_tiers(backend_cls, policy_cls, make_dict):
@@ -517,9 +521,17 @@ def test_cache_respects_byte_budget(backend_cls, policy_cls, make_dict):
         tail = f"{i:08d}"
         d[f"k{i}"] = "x" * (size - len(tail)) + tail
 
+    # Budget plus one entry, not a multiple of it. ``Cache.put`` may take the
+    # cache over budget and ``evict_candidates`` then names what to shed, so
+    # exceeding by the entry that triggered the overflow is legitimate -- more is
+    # not. The values are strings and ``cached_bytes`` sums ``len``, so the
+    # measurement is exact and carries no error for a tolerance to absorb. At
+    # ``budget * 2`` this strict xfail would flip green on a cache holding double
+    # its budget, which is the defect it exists to pin.
     held = cached_bytes(d)
-    assert held <= budget * 2, (
-        f"cache holds ~{held // 1024} KiB against a {budget // 1024} KiB budget; "
+    assert held <= budget + size, (
+        f"cache holds ~{held // 1024} KiB against a {budget // 1024} KiB budget "
+        f"(+{size // 1024} KiB for the entry that overflowed it); "
         f"{len(cached_keys(d))} items resident"
     )
 
@@ -531,11 +543,11 @@ def test_cache_respects_byte_budget(backend_cls, policy_cls, make_dict):
 
 @pytest.mark.parametrize(
     "base",
-    [DiskBackend, EvictionPolicy, Store, Cache, ReplacementStrategy],
+    [DiskBackend, EvictionPolicy, ReplacementStrategy],
     ids=lambda c: c.__name__,
 )
 def test_abstract_bases_cannot_be_instantiated(base):
-    """Every base class in the package is a real ABC.
+    """The polymorphic base classes are real ABCs.
 
     ``@abstractmethod`` without ``ABCMeta`` is inert -- it was decorative before
     issue 0.1, so the base classes could be constructed and subclasses were never
@@ -551,15 +563,19 @@ def test_abstract_bases_cannot_be_instantiated(base):
     bites: an incomplete subclass must be refused too, which is the half that
     protects callers.
 
-    ``Store`` and ``Cache`` were exactly that trap before they became ABCs:
-    both raised ``TypeError`` from ``base()`` for missing positional arguments
-    rather than for abstractness, so the naive form of this spec passed against
-    them and reported nothing. The first assertion is what caught it.
+    ``Store`` and ``Cache`` are deliberately absent. An ABC earns its place where
+    several implementations have to be kept honest -- four backends, seven
+    policies -- and those two have exactly one implementation each by design:
+    PLAN.md calls ``Store`` "THE single owner of key location", and both vary by
+    what you inject (policy, budgets, size estimator, and the ``Lock`` protocol
+    of PLAN.md §3.6) rather than by subclassing. Making them abstract would also
+    contradict the specs in ``test_architecture.py``, which construct
+    ``Cache(...)`` and ``Store(...)`` directly.
 
-    ``ReplacementStrategy`` is the legacy base and is listed for the same
+    ``ReplacementStrategy`` is the legacy base and is listed for a sharper
     reason: it shipped carrying three ``@abstractmethod`` decorators while not
-    being an ABC at all, so they bound nothing. It is scheduled for removal in
-    Phase 1, and this row goes with it when it goes.
+    being an ABC at all, so they bound nothing across seven live subclasses. It
+    is scheduled for removal in Phase 1, and this row goes with it when it goes.
     """
     assert getattr(base, "__abstractmethods__", frozenset()), (
         f"{base.__name__} declares no abstract methods, so @abstractmethod is "

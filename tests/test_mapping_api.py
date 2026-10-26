@@ -18,6 +18,7 @@ which tier, and the purity spec branches on whether the policy promotes.
 
 from __future__ import annotations
 
+import inspect
 import os
 import subprocess
 import sys
@@ -26,6 +27,8 @@ from collections.abc import MutableMapping
 from pathlib import Path
 
 import pytest
+
+from effidict import EffiDict
 
 from .helpers import (
     EAGER_ITERATOR_TYPES,
@@ -236,6 +239,27 @@ def test_mutablemapping_surface_is_complete(make_dict):
     assert d["c"] == "vc"
     key, value = d.popitem()
     assert key not in d and value is not None
+
+
+def test_update_mapping_parameter_is_positional_only():
+    """``update`` must accept ``other`` as a key, the way ``dict`` does.
+
+    The expectation is taken from ``dict`` itself rather than asserted as a
+    literal, since ``dict`` is the contract this suite compares against. A
+    positional-or-keyword parameter named ``other`` silently swallows that key,
+    and the oracle will not find it: ``update_from_keywords`` draws its key from
+    a 27-character alphabet, so generating exactly ``"other"`` is a ~1-in-14-
+    million event per draw. A signature check is the only guard that fires.
+    """
+    reference = {}
+    reference.update(other=5)
+    assert reference == {"other": 5}, "dict.update stores 'other' as a key"
+
+    parameter = inspect.signature(EffiDict.update).parameters["other"]
+    assert parameter.kind is inspect.Parameter.POSITIONAL_ONLY, (
+        f"EffiDict.update takes 'other' as {parameter.kind.description}, so "
+        f"update(other=...) binds the mapping parameter instead of storing the key"
+    )
 
 
 @pytest.mark.xfail(

@@ -78,10 +78,13 @@ def test_cache_respects_max_bytes(make_dict):
     for index in range(100):
         d[f"k{index}"] = _distinct(index)
 
+    # Budget plus one entry; see the same guard in test_tier_invariants.py for
+    # why a multiple of the budget is the wrong shape here.
     held = cached_bytes(d)
-    assert held <= budget * 1.5, (
+    assert held <= budget + MIB, (
         f"the cache holds {held / MIB:.0f} MiB against a {budget / MIB:.0f} MiB "
-        f"budget, in {len(cached_keys(d))} items"
+        f"budget (+1 MiB for the entry that overflowed it), "
+        f"in {len(cached_keys(d))} items"
     )
 
 

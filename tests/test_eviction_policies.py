@@ -30,6 +30,8 @@ from collections import abc
 
 import pytest
 
+from effidict import MFUReplacement
+
 POLICY_NAMES = ["Random", "FIFO", "LIFO", "LRU", "MRU", "LFU", "MFU"]
 
 DETERMINISTIC = [name for name in POLICY_NAMES if name != "Random"]
@@ -327,10 +329,12 @@ def test_lfu_evicts_the_least_frequently_used():
 def test_mfu_evicts_the_most_frequently_used():
     """MFU gives up the hottest key first.
 
-    Regression pin for the duplicated ``MFUReplacement`` class body, whose
-    surviving ``put`` resets ``secondary_memory[key]`` to 1 on every write. That
-    makes the frequency count meaningless, so the policy does not actually
-    evict by frequency at all.
+    States the contract issue 1.1 has to satisfy. It cannot reach the defect it
+    was written for: ``_policy_class("MFU")`` resolves
+    ``effidict.policies.MFUPolicy``, which does not exist, so this raises
+    ``NotImplementedError`` before any shipped code runs.
+    ``test_mfu_replacement_keeps_frequency_across_a_value_update`` below is the
+    pin that does reach it.
     """
     policy = _policy_class("MFU")()
     for key in ("hot", "warm", "cold"):
@@ -340,6 +344,53 @@ def test_mfu_evicts_the_most_frequently_used():
     policy.on_access("warm")
 
     assert policy.victim() == "hot"
+
+
+class _NullBackend:
+    """Absorbs the write an eviction performs. The shipped policies do their own
+    I/O, which issue 1.1 removes; until then a victim cannot be observed without
+    one."""
+
+    def serialize(self, key, value):
+        pass
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "MFUReplacement's surviving put() resets secondary_memory[key] to 1, so "
+        "a value update discards the key's recorded frequency and the policy "
+        "evicts by stale counts (issue 1.1)"
+    ),
+)
+def test_mfu_replacement_keeps_frequency_across_a_value_update():
+    """The *shipped* MFU policy must not forget a key's frequency on rewrite.
+
+    Aimed at ``MFUReplacement`` rather than the future ``MFUPolicy``, so it
+    actually executes the duplicated class body. Derived from the MFU rule
+    stated in this module's docstring, not from the implementation: ``a`` is used
+    four times and ``b`` twice, so ``a`` is the hottest key and MFU must give it
+    up. Rewriting ``a``'s *value* changes no usage count, so the victim is
+    unchanged by it.
+
+    The counts are what discriminate here. With the reset, ``a`` drops to 1
+    against ``b``'s 2, and the policy evicts ``b`` -- the coldest key, the exact
+    opposite of MFU.
+    """
+    policy = MFUReplacement(disk_backend=_NullBackend(), max_in_memory=2)
+    policy.put("a", "va")
+    policy.put("b", "vb")
+    for _ in range(3):
+        policy.get("a")
+    policy.get("b")
+
+    policy.put("a", "va-updated")
+    policy.put("c", "vc")
+
+    assert sorted(policy.memory) == ["b", "c"], (
+        f"MFU kept {sorted(policy.memory)}; 'a' was the hottest key (4 uses "
+        f"against 2) and should have been the victim"
+    )
 
 
 @pytest.mark.xfail(

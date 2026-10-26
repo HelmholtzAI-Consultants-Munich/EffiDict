@@ -127,6 +127,11 @@ EAGER_ITERATOR_TYPES = frozenset(
         "dict_itemiterator",
         "dict_valueiterator",
         "range_iterator",
+        # Both spellings: CPython returns str_ascii_iterator for an ASCII
+        # string and str_iterator only for a non-ASCII one, so listing just
+        # the latter leaves the common case unmatched -- and this set is
+        # used in a `not in` assertion, which passes silently when it misses.
+        "str_ascii_iterator",
         "str_iterator",
     }
 )

@@ -19,9 +19,14 @@ Two kinds of guard here, and the split is deliberate:
   constructed yet, so everything about what they *do* is ``xfail(strict=True)``
   against the issue that implements it.
 
-Unlike ``DiskBackend`` and ``EvictionPolicy``, neither type is an ABC: they are
-concrete classes awaiting bodies, so they are absent from
-``test_abstract_bases_cannot_be_instantiated`` on purpose.
+Unlike ``DiskBackend`` and ``EvictionPolicy``, neither type is an ABC, and that
+is deliberate rather than an oversight: an abstract base earns its place where
+several implementations have to be kept honest, and PLAN.md plans exactly one of
+each -- ``Store`` is "THE single owner of key location", and both vary by what is
+injected into them rather than by subclassing. They are therefore absent from
+``test_abstract_bases_cannot_be_instantiated``, which covers the three bases that
+do have implementations. Making them abstract would also contradict the specs
+below, which construct ``Cache(...)`` and ``Store(...)`` directly.
 """
 
 from __future__ import annotations
@@ -181,14 +186,7 @@ def test_unimplemented_methods_name_their_issue(owner):
     valid as Phase 1 implements them one at a time: an implemented method is
     simply not examined, and a stub that forgets its reference is.
 
-    Goes through a subclass with ``__abstractmethods__`` cleared rather than
-    ``object.__new__(owner)``. The owners are ABCs, so ``object.__new__`` on one
-    raises ``TypeError`` -- which the ``except Exception`` below would swallow
-    for every name, leaving this asserting nothing at all while still passing.
     """
-    probe = type(f"Probe{owner.__name__}", (owner,), {})
-    probe.__abstractmethods__ = frozenset()
-
     unreferenced = []
     for name in list(STORE_SURFACE) + list(CACHE_SURFACE) + STORE_PROPERTIES:
         attribute = inspect.getattr_static(owner, name, None)
@@ -198,7 +196,7 @@ def test_unimplemented_methods_name_their_issue(owner):
         if not callable(function):
             continue
         try:
-            function(object.__new__(probe), *[None] * len(_signature_spec(function)))
+            function(object.__new__(owner), *[None] * len(_signature_spec(function)))
         except NotImplementedError as exc:
             if "issue #" not in str(exc):
                 unreferenced.append(f"{name}: {str(exc)!r}")
@@ -234,6 +232,28 @@ def test_store_can_be_built_over_a_backend_and_a_cache(backend_cls, storage_dir)
         assert store.owns_storage is True
     finally:
         backend.destroy()
+
+
+def test_both_tiers_are_required_to_construct():
+    """Neither constructor argument may carry a default it cannot honour.
+
+    ``__init__`` ends with ``self.memory = replacement_strategy.memory``, so a
+    ``None`` default could only ever raise ``AttributeError`` from inside the
+    object. A caller who omits an argument should be told which one, by the
+    signature, before any attribute lookup happens.
+    """
+    parameters = inspect.signature(EffiDict.__init__).parameters
+    for name in ("disk_backend", "replacement_strategy"):
+        assert parameters[name].default is inspect.Parameter.empty, (
+            f"{name} declares a default that __init__ cannot work with"
+        )
+
+    with pytest.raises(TypeError) as raised:
+        EffiDict()
+    assert "replacement_strategy" in str(raised.value), (
+        f"constructing without arguments reported {raised.value!r}, which does "
+        f"not name the missing argument"
+    )
 
 
 @pytest.mark.xfail(

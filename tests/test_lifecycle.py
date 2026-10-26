@@ -11,10 +11,16 @@ issue 3.1 rather than by special-casing either symptom:
   parent's cache mid-run.
 
 No test here uses ``keeps_storage``: the autouse leak detector from issue 0.2
-checks ``storage_dir`` is empty at teardown, so it backs every test in this file.
-Tests that deliberately assert storage *survives* something clean up explicitly
-afterwards, which turns the detector into a second assertion that the explicit
-cleanup worked.
+checks ``storage_dir`` is empty at teardown, so it backs every test in this file
+that puts its store there. Tests that deliberately assert storage *survives*
+something clean up explicitly afterwards, which turns the detector into a second
+assertion that the explicit cleanup worked.
+
+One exception, stated rather than glossed:
+``test_temporary_store_is_destroyed_on_close`` goes through
+``backend_cls.temporary()``, which by definition places the store outside
+``storage_dir``. The detector still runs for it but has nothing to look at, so
+that spec stands on its own assertions alone.
 
 ``__del__`` is always exercised through real garbage collection -- ``del`` plus
 ``gc.collect()`` -- never by calling ``__del__`` directly, which would prove
