@@ -284,20 +284,16 @@ def test_clean_eviction_performs_no_io(
 
     d = make_dict(max_in_memory=5)
     keys = [f"k{i}" for i in range(30)]
-    for key in keys:
-        d[key] = f"v-{key}"
 
-    # Warm-up pass, deliberately outside the spy. Filling the store leaves the
-    # last `max_in_memory` entries in the cache and *never written* -- nothing
-    # flushes today -- so they are dirty. Evicting a dirty entry has to write it
-    # out (I5), which means the measured pass below would see those writes and
-    # count them against a compliant implementation: the assertion would demand
-    # 0 while correct behaviour produces exactly `max_in_memory`. Reading every
-    # key once first drives those entries to disk, so what the cache holds when
-    # the spy starts was loaded from disk and is clean -- which is the only
-    # state in which "clean eviction performs no I/O" is a meaningful claim.
+    # The disk is seeded directly and the store is never written through, so no
+    # entry is ever dirty and the cache starts empty. A warm-up read pass is not
+    # enough: it only cleans entries the policy happens to evict, and under
+    # random eviction a dirty entry can survive it and then be written during
+    # the measured pass -- a write I5 requires, which this assertion would count
+    # against a correct implementation. Seeding removes the dependency on which
+    # victim the policy picks.
     for key in keys:
-        assert d[key] == f"v-{key}"
+        d.disk_backend.serialize(key, f"v-{key}")
 
     with backend_spy(d.disk_backend) as spy:
         for key in keys:

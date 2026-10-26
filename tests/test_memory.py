@@ -129,9 +129,19 @@ store = EffiDict(
     max_bytes=budget,
 )
 baseline = resident_bytes()
+peak = baseline
 for index in range(items):
     store[f"k{index}"] = distinct(index)
-print(resident_bytes() - baseline)
+    # Sampled every write, not just at the end. Two endpoint readings miss a
+    # transient that is freed before the last one -- 129 MiB of growth can read
+    # as 10 MiB, under the budget, and the guard goes quiet exactly when the
+    # store is at its worst. ru_maxrss would catch the transient but carries the
+    # inherited-watermark problem this probe exists to avoid, so the peak is
+    # accumulated here instead.
+    current = resident_bytes()
+    if current > peak:
+        peak = current
+print(peak - baseline)
 """
 
 
@@ -145,9 +155,12 @@ def test_peak_rss_is_bounded_by_max_bytes(tmp_path):
 
     The observable consequence of the guard above: measured at around +105 MiB of
     resident memory for a store told to hold 8 MiB. Asserted as growth above a
-    baseline, in a subprocess so that baseline means something -- and measured
-    as *current* RSS rather than the high-water mark, which a subprocess does
-    not reliably reset on Linux.
+    baseline, in a subprocess so that baseline means something. The peak is
+    accumulated from *current* RSS sampled on every write, rather than read from
+    ``ru_maxrss``: the high-water mark is not reliably reset for a child on
+    Linux, so an inflated parent leaves growth reading as zero. Sampling per
+    write still cannot see a spike that rises and falls inside one assignment,
+    which is the known limit of this approach.
     """
     budget = 8 * MIB
     items = 100

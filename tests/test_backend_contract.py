@@ -47,6 +47,10 @@ DECODE_HOOK = {
 
 #: Backends whose ``deserialize`` wraps its whole body in ``except KeyError``, so
 #: a decode failure is indistinguishable from an absent key.
+#: Backends that actively rewrite a decode failure into ``KeyError(key)``. The
+#: others merely let the decoder's own ``KeyError`` through -- a different route
+#: to the same place, since the caller reads either as a miss. Kept apart only
+#: so the xfail below says which defect each backend has.
 MASKS_DECODE_FAILURE = {Hdf5Backend}
 
 
@@ -233,25 +237,39 @@ def test_missing_key_raises_keyerror_not_something_else(backend, backend_cls):
 
 
 def test_decode_failure_is_not_reported_as_missing_key(request, backend_cls, backend):
-    """A corrupt payload must not look like an absent key.
+    """A corrupt payload must raise something a caller can tell from a miss.
 
-    ``Hdf5Backend.deserialize`` wraps its entire body in ``except KeyError`` and
-    re-raises ``KeyError(key)``, so a decode failure is reported as "no such key"
-    -- the caller silently treats real data loss as a cache miss. Injected by
-    patching the decode step, which is deterministic and does not depend on
-    manufacturing a corrupt file.
+    A missing key raises ``KeyError``, so *any* ``KeyError`` out of
+    ``deserialize`` reads as "not there" to a caller writing ``except KeyError``
+    -- whatever its message says. Distinguishability is therefore a claim about
+    the exception *type*, not about its text or its identity.
+
+    An earlier version of this spec asserted ``excinfo.value is sentinel``: the
+    injected error had to arrive unchanged. That accepted exactly the three
+    backends that let the decoder's own ``KeyError`` through, which leaves the
+    caller unable to tell corruption from absence, and it *rejected* the fix
+    that actually works -- wrapping the failure in a distinct error with the
+    original as ``__cause__``. The assertion was pinning the wrong half of the
+    contract.
+
+    Injected by patching the decode step, which is deterministic and does not
+    depend on manufacturing a corrupt file.
     """
-    if backend_cls in MASKS_DECODE_FAILURE:
-        request.applymarker(
-            pytest.mark.xfail(
-                strict=True,
-                reason=(
-                    "Hdf5Backend.deserialize catches KeyError around its whole "
-                    "body, so a decode failure is reported as a missing key "
-                    "(issue 7.2)"
-                ),
-            )
+    request.applymarker(
+        pytest.mark.xfail(
+            strict=True,
+            reason=(
+                "Hdf5Backend.deserialize catches KeyError around its whole body "
+                "and re-raises KeyError(key); the other three let the decoder's "
+                "own KeyError propagate. Either way `except KeyError` reads a "
+                "decode failure as a missing key (issue 7.2)"
+                if backend_cls in MASKS_DECODE_FAILURE
+                else "the decoder's KeyError propagates unchanged, so a caller "
+                "writing `except KeyError` reads a decode failure as a missing "
+                "key (issue 7.2)"
+            ),
         )
+    )
 
     hook = DECODE_HOOK.get(backend_cls)
     if hook is None:
@@ -264,13 +282,24 @@ def test_decode_failure_is_not_reported_as_missing_key(request, backend_cls, bac
         with pytest.raises(Exception) as excinfo:  # noqa: PT011 - type is the point
             backend.deserialize("present")
 
-    # The injected failure must reach the caller unchanged. Asserting only that
-    # it is not KeyError('present') would accept a backend that swallowed it and
-    # raised some other KeyError, or wrapped it in a way that still reads as a
-    # miss -- the payload was not decoded either way.
-    assert excinfo.value is sentinel, (
-        f"a decode failure surfaced as {excinfo.value!r} instead of propagating; "
-        f"the caller cannot tell it apart from the key simply not being there"
+    raised = excinfo.value
+
+    # Type, not identity: KeyError is what a *missing* key raises, so a decode
+    # failure arriving as one is indistinguishable however it got there.
+    assert not isinstance(raised, KeyError), (
+        f"a decode failure surfaced as {raised!r}; a caller writing "
+        f"`except KeyError` cannot tell it apart from the key simply not "
+        f"being there"
+    )
+
+    # ...and the original must still be reachable, or the backend has traded one
+    # kind of information loss for another. Satisfied by `raise Decode... from
+    # exc`, and by a bare re-raise of a non-KeyError.
+    origins = (raised, raised.__cause__, raised.__context__)
+    assert sentinel in origins, (
+        f"{raised!r} is distinguishable from a miss but discarded the "
+        f"underlying failure {sentinel!r}, which is neither its cause nor its "
+        f"context"
     )
 
 

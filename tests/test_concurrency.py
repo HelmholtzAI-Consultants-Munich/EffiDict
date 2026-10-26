@@ -329,6 +329,15 @@ def test_reader_never_observes_a_key_mid_eviction(backend_cls, make_dict):
 
         # Distinguishes "not scheduled yet" from "blocked on the lock", which a
         # timer cannot. If this fails the machine is wedged, not the store.
+        #
+        # Known residual gap: the hook fires on entry to the lookup, so a reader
+        # descheduled between that and the read itself is still indistinguishable
+        # from one blocked on a lock -- both leave `observed` empty, and the
+        # post-release assertions below then pass against a drop-then-write
+        # store. The window is one call wide and the probe waits WAIT_SECONDS
+        # with the write held, so it is narrow rather than closed. Closing it
+        # needs a hook at the lock boundary itself, which arrives with the
+        # `Lock` protocol in issue 5.1; this spec should take it then.
         assert entered.wait(WAIT_SECONDS), "the reader never entered the lookup"
 
         # The write is still held, so whatever the reader returns here it formed
