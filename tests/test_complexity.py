@@ -164,8 +164,9 @@ def test_membership_time_is_flat(make_dict):
 def test_read_only_pass_performs_no_writes(make_dict, backend_spy):
     """Reading 500 keys through a 50-key cache must not write anything.
 
-    Every value is already on disk, so each eviction during the pass rewrites
-    bytes that are already there -- 500 writes for 500 reads today. The equivalent
+    After the warm-up below every value is on disk and the cache is clean, so
+    each eviction during the measured pass rewrites bytes that are already
+    there -- 500 writes for 500 reads today. The equivalent
     invariant is pinned per-policy in ``test_tier_invariants.py``; this is the
     at-scale cost guard.
     """
@@ -173,6 +174,18 @@ def test_read_only_pass_performs_no_writes(make_dict, backend_spy):
     keys = [f"k{i:04d}" for i in range(500)]
     for key in keys:
         d[key] = f"v-{key}"
+
+    # Warm-up pass, deliberately outside the spy. Filling the store leaves the
+    # last `max_in_memory` entries in the cache and *never written* -- nothing
+    # flushes today -- so they are dirty. Evicting a dirty entry has to write it
+    # out (I5), which means the measured pass below would see those writes and
+    # count them against a compliant implementation: the assertion would demand
+    # 0 while correct behaviour produces exactly `max_in_memory`. Reading every
+    # key once first drives those entries to disk, so what the cache holds when
+    # the spy starts was loaded from disk and is clean -- which is the only
+    # state in which "clean eviction performs no I/O" is a meaningful claim.
+    for key in keys:
+        assert d[key] == f"v-{key}"
 
     with backend_spy(d.disk_backend) as spy:
         for key in keys:

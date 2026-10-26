@@ -643,14 +643,12 @@ def test_victims_enumerates_in_eviction_order(name):
 
     listed = list(policy.victims())
 
-    drained = []
-    while True:
-        try:
-            victim = policy.victim()
-        except KeyError:
-            break
-        drained.append(victim)
-        policy.on_remove(victim)
+    # Through the bounded helper rather than an inline ``while True``. An
+    # ``on_remove`` that fails to deregister the key makes ``victim()`` return
+    # it forever: an unbounded loop appends until the machine runs out of
+    # memory, so a broken policy hangs the suite instead of failing it.
+    # ``_victim_sequence`` stops after 50 and says what went wrong.
+    drained = _victim_sequence(policy)
 
     assert listed == drained, (
         f"{name}.victims() gave {listed}, draining victim() gives {drained}"

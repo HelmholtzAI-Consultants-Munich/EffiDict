@@ -102,9 +102,19 @@ from tests.helpers import build_policy  # see the note in test_concurrency
 tmpdir, items, budget = sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
 MIB = 1024 * 1024
 
-def peak_bytes():
-    usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    return usage if sys.platform == "darwin" else usage * 1024
+def resident_bytes():
+    # Current RSS, not ru_maxrss. ru_maxrss is a high-water mark, and on Linux a
+    # large parent can leave the child's mark inflated across fork/exec -- the
+    # baseline then already exceeds anything this probe allocates, growth reads
+    # as 0 MiB however much is stored, and a strict xfail XPASSes, which fails
+    # the build. /proc gives the live figure; elsewhere fall back to the peak,
+    # which is accurate enough on a freshly exec'd process.
+    try:
+        with open("/proc/self/statm") as handle:
+            return int(handle.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
+    except (OSError, ValueError, IndexError):
+        usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return usage if sys.platform == "darwin" else usage * 1024
 
 def distinct(index, size=MIB):
     tail = str(index).zfill(16)
@@ -118,10 +128,10 @@ store = EffiDict(
     ),
     max_bytes=budget,
 )
-baseline = peak_bytes()
+baseline = resident_bytes()
 for index in range(items):
     store[f"k{index}"] = distinct(index)
-print(peak_bytes() - baseline)
+print(resident_bytes() - baseline)
 """
 
 
@@ -135,7 +145,9 @@ def test_peak_rss_is_bounded_by_max_bytes(tmp_path):
 
     The observable consequence of the guard above: measured at around +105 MiB of
     resident memory for a store told to hold 8 MiB. Asserted as growth above a
-    baseline, in a subprocess so that baseline means something.
+    baseline, in a subprocess so that baseline means something -- and measured
+    as *current* RSS rather than the high-water mark, which a subprocess does
+    not reliably reset on Linux.
     """
     budget = 8 * MIB
     items = 100

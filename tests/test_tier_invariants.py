@@ -287,6 +287,18 @@ def test_clean_eviction_performs_no_io(
     for key in keys:
         d[key] = f"v-{key}"
 
+    # Warm-up pass, deliberately outside the spy. Filling the store leaves the
+    # last `max_in_memory` entries in the cache and *never written* -- nothing
+    # flushes today -- so they are dirty. Evicting a dirty entry has to write it
+    # out (I5), which means the measured pass below would see those writes and
+    # count them against a compliant implementation: the assertion would demand
+    # 0 while correct behaviour produces exactly `max_in_memory`. Reading every
+    # key once first drives those entries to disk, so what the cache holds when
+    # the spy starts was loaded from disk and is clean -- which is the only
+    # state in which "clean eviction performs no I/O" is a meaningful claim.
+    for key in keys:
+        assert d[key] == f"v-{key}"
+
     with backend_spy(d.disk_backend) as spy:
         for key in keys:
             assert d[key] == f"v-{key}"

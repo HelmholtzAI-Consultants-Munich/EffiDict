@@ -300,8 +300,23 @@ def test_reader_never_observes_a_key_mid_eviction(backend_cls, make_dict):
         entered = threading.Event()
         finished = threading.Event()
 
+        # Fired from *inside* the lookup, not before it. Setting an event at the
+        # top of the thread body only proves the thread was scheduled: it can be
+        # descheduled between that line and the subscript, the writer finishes,
+        # and the probe then reports a mid-eviction read that never happened.
+        # Patched on the instance and restored in the finally below, like the
+        # blocking serialize above. Issue 1.2 moves this delegation to
+        # ``Store.get``; the hook moves with it.
+        original_lookup = d.replacement_strategy.get
+
+        def instrumented_lookup(wanted):
+            if wanted == key:
+                entered.set()
+            return original_lookup(wanted)
+
+        d.replacement_strategy.get = instrumented_lookup
+
         def read():
-            entered.set()
             try:
                 observed["value"] = d[key]
             except Exception as exc:  # noqa: BLE001
@@ -314,7 +329,7 @@ def test_reader_never_observes_a_key_mid_eviction(backend_cls, make_dict):
 
         # Distinguishes "not scheduled yet" from "blocked on the lock", which a
         # timer cannot. If this fails the machine is wedged, not the store.
-        assert entered.wait(WAIT_SECONDS), "the reader thread never reached the read path"
+        assert entered.wait(WAIT_SECONDS), "the reader never entered the lookup"
 
         # The write is still held, so whatever the reader returns here it formed
         # mid-eviction. If it has not returned, it is waiting on the Store lock.
@@ -366,6 +381,8 @@ def test_reader_never_observes_a_key_mid_eviction(backend_cls, make_dict):
         release.set()  # idempotent; frees the writer if an assertion above failed
         writer.join(WAIT_SECONDS)
         d.disk_backend.serialize = original
+        if "instrumented_lookup" in locals():
+            d.replacement_strategy.get = original_lookup
 
 
 # --------------------------------------------------------------------------
