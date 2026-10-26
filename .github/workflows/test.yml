@@ -61,6 +61,8 @@ jobs:
       uses: codecov/codecov-action@v4.0.1
       with:
         files: ./coverage.xml
+        # Loud rather than silent
+        fail_ci_if_error: true
       env:
         CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
