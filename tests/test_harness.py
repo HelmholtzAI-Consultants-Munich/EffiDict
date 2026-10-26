@@ -231,6 +231,26 @@ def test_assert_equal_value_rejects_numpy_scalar_widening():
         assert_equal_value(np.int64(7), 7)
 
 
+def test_assert_equal_value_rejects_nan_type_changes():
+    """A NaN that changes type in storage is not a faithful round-trip.
+
+    ``NaN != NaN`` forces a special case, and that special case used to accept
+    any two NaNs. ``np.float64`` subclasses ``float``, so HDF5 returning
+    ``np.float64('nan')`` for a stored ``float('nan')`` passed -- while the very
+    same round-trip of ``1.5`` was correctly rejected as a type change.
+    """
+    np = pytest.importorskip("numpy")
+
+    with pytest.raises(AssertionError):
+        assert_equal_value(float("nan"), np.float64("nan"))
+    with pytest.raises(AssertionError):
+        assert_equal_value(np.float64("nan"), float("nan"))
+
+    # Still equal where the types agree -- the special case has to keep working.
+    assert_equal_value(float("nan"), float("nan"))
+    assert_equal_value(np.float64("nan"), np.float64("nan"))
+
+
 @pytest.mark.parametrize(
     "stored, returned",
     [

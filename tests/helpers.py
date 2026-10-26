@@ -224,7 +224,14 @@ def assert_equal_value(actual, expected):
 
 def _equal(actual, expected):
     if _is_nan(actual) and _is_nan(expected):
-        return True
+        # Type first, exactly as the non-NaN path does further down. ``NaN !=
+        # NaN`` is why this shortcut exists at all, but returning True outright
+        # skipped the type check that every other scalar gets: ``np.float64`` is
+        # a *subclass* of ``float``, so ``_is_nan`` says yes to both and a
+        # backend returning ``np.float64('nan')`` for a stored ``float('nan')``
+        # read as faithful. The same round-trip with 1.5 was already rejected,
+        # so only NaN slipped through.
+        return type(actual) is type(expected)
 
     if pd is not None:
         frame_types = (pd.DataFrame, pd.Series)
