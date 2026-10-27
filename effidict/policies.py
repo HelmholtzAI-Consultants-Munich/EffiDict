@@ -63,9 +63,9 @@ class _BookkeepingPolicy(EvictionPolicy):
     """Shared bookkeeping for the seven shipped policies.
 
     Each subclass answers one question -- in what order would you give these
-    keys up? -- by overriding :meth:`_eviction_order`. Everything else is
-    identical across the seven, which is what the old ``*Replacement`` classes
-    duplicated.
+    keys up? -- by overriding :meth:`_eviction_order` and :meth:`_next_victim`.
+    Everything else is identical across the seven, which is what the old
+    ``*Replacement`` classes duplicated.
 
     Three containers, because between them the policies need insertion order,
     last-use order and use counts. Each one is a few empty objects for the
@@ -81,6 +81,18 @@ class _BookkeepingPolicy(EvictionPolicy):
     @abstractmethod
     def _eviction_order(self) -> List[str]:
         """The tracked keys, most-evictable first."""
+
+    @abstractmethod
+    def _next_victim(self) -> str:
+        """Only the most evictable key, with at least one key tracked.
+
+        Separate from :meth:`_eviction_order` because shedding one key is the
+        common case, and four of the seven answer it by reading one end of an
+        ordering they already maintain. Routing it through the full order would
+        make a single eviction cost the size of the cache, and a drain
+        quadratic. ``test_victims_enumerates_in_eviction_order`` holds the two
+        methods to the same answer, so they cannot drift apart.
+        """
 
     def on_insert(self, key: str) -> None:
         self._inserted[key] = None
@@ -104,11 +116,14 @@ class _BookkeepingPolicy(EvictionPolicy):
         self._uses.pop(key, None)
 
     def victim(self) -> str:
-        for key in self.victims():
-            return key
-        raise KeyError("no keys are being tracked")
+        if not self._inserted:
+            raise KeyError("no keys are being tracked")
+        return self._next_victim()
 
     def victims(self) -> Iterator:
+        # Over a snapshot rather than the live ordering: the caller enumerating
+        # victims is on its way to removing some of them, and iterating an
+        # ``OrderedDict`` that is being mutated raises ``RuntimeError``.
         return iter(self._eviction_order())
 
     def clear(self) -> None:
@@ -118,13 +133,35 @@ class _BookkeepingPolicy(EvictionPolicy):
 
 
 class RandomPolicy(_BookkeepingPolicy):
-    """Gives up an arbitrary tracked key."""
+    """Gives up an arbitrary tracked key.
+
+    Which key is arbitrary is drawn when the key arrives, not when a victim is
+    asked for. ``victim()`` is a peek: it must keep naming the same key until
+    that key is removed, and a draw taken per call would name a different one
+    every time it was asked.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._draw: dict = {}
+
+    def on_insert(self, key: str) -> None:
+        super().on_insert(key)
+        self._draw[key] = random.random()
+
+    def on_remove(self, key: str) -> None:
+        super().on_remove(key)
+        self._draw.pop(key, None)
+
+    def clear(self) -> None:
+        super().clear()
+        self._draw.clear()
 
     def _eviction_order(self) -> List[str]:
-        # The module-level generator, never an instance of ``random.Random``:
-        # drawing from one stored on the policy would mutate it, and listing
-        # victims has to leave the policy untouched.
-        return random.sample(list(self._inserted), len(self._inserted))
+        return sorted(self._inserted, key=lambda key: self._draw[key])
+
+    def _next_victim(self) -> str:
+        return min(self._inserted, key=lambda key: self._draw[key])
 
 
 class FIFOPolicy(_BookkeepingPolicy):
@@ -133,12 +170,18 @@ class FIFOPolicy(_BookkeepingPolicy):
     def _eviction_order(self) -> List[str]:
         return list(self._inserted)
 
+    def _next_victim(self) -> str:
+        return next(iter(self._inserted))
+
 
 class LIFOPolicy(_BookkeepingPolicy):
     """Gives up the key inserted most recently."""
 
     def _eviction_order(self) -> List[str]:
         return list(reversed(self._inserted))
+
+    def _next_victim(self) -> str:
+        return next(reversed(self._inserted))
 
 
 class LRUPolicy(_BookkeepingPolicy):
@@ -147,12 +190,18 @@ class LRUPolicy(_BookkeepingPolicy):
     def _eviction_order(self) -> List[str]:
         return list(self._used)
 
+    def _next_victim(self) -> str:
+        return next(iter(self._used))
+
 
 class MRUPolicy(_BookkeepingPolicy):
     """Gives up the key used most recently."""
 
     def _eviction_order(self) -> List[str]:
         return list(reversed(self._used))
+
+    def _next_victim(self) -> str:
+        return next(reversed(self._used))
 
 
 class LFUPolicy(_BookkeepingPolicy):
@@ -163,9 +212,19 @@ class LFUPolicy(_BookkeepingPolicy):
         # so equal counts come out oldest-first without a second sort key.
         return sorted(self._inserted, key=lambda key: self._uses[key])
 
+    def _next_victim(self) -> str:
+        # ``min`` returns the first of several equal keys, which is the same
+        # oldest-first tie-break the stable sort above gives.
+        return min(self._inserted, key=lambda key: self._uses[key])
+
 
 class MFUPolicy(_BookkeepingPolicy):
     """Gives up the most-used key; ties go to whichever arrived first."""
 
     def _eviction_order(self) -> List[str]:
         return sorted(self._inserted, key=lambda key: -self._uses[key])
+
+    def _next_victim(self) -> str:
+        # ``max`` also returns the first of several equal keys, so ties go to
+        # the oldest here too rather than to the newest.
+        return max(self._inserted, key=lambda key: self._uses[key])

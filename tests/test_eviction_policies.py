@@ -588,6 +588,53 @@ def test_clear_drops_everything(name):
 # --------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("name", POLICY_NAMES)
+def test_victim_peek_is_stable(name):
+    """``victim()`` must keep naming the same key until that key is removed.
+
+    It peeks, it does not draw. The ``EvictionPolicy`` contract from issue 0.1
+    says the only thing that advances it is ``on_remove``, and the cache depends
+    on exactly that: it peeks, writes the value out if it is dirty, and only
+    then removes. A policy that decides afresh on every call names a different
+    key each time it is asked, so the key the cache wrote out and the key it
+    goes on to drop need not be the same one.
+
+    Parametrized over every policy rather than the deterministic six. Random is
+    the one that can pass every other spec in this file while failing this, and
+    ``test_victims_enumerates_in_eviction_order`` cannot see it: that spec is
+    over ``DETERMINISTIC``, because Random has no expected sequence to compare
+    against.
+    """
+    policy = _policy_class(name)()
+    for key in ("a", "b", "c", "d"):
+        policy.on_insert(key)
+    policy.on_access("b")
+
+    before = _state_snapshot(policy)
+    peeked = policy.victim()
+    repeats = [policy.victim() for _ in range(5)]
+
+    assert repeats == [peeked] * 5, (
+        f"{name}.victim() first named {peeked!r}, then {repeats}"
+    )
+    # A peek that reshuffles need not mutate the policy to be wrong, and a peek
+    # that mutates need not change its answer, so both are worth asserting.
+    assert _state_snapshot(policy) == before, (
+        f"{name}.victim() changed the policy:\n"
+        f"  before: {before}\n  after:  {_state_snapshot(policy)}"
+    )
+
+    # Removing the peeked key is the one thing that may advance the answer.
+    policy.on_remove(peeked)
+    advanced = policy.victim()
+    assert advanced != peeked, (
+        f"{name}.victim() still names {peeked!r} after it was removed"
+    )
+    assert [policy.victim() for _ in range(3)] == [advanced] * 3, (
+        f"{name}.victim() is unstable again after advancing to {advanced!r}"
+    )
+
+
 @pytest.mark.parametrize("name", DETERMINISTIC)
 def test_victims_enumerates_in_eviction_order(name):
     """``victims()`` must list every tracked key, most-evictable first.
@@ -620,6 +667,35 @@ def test_victims_enumerates_in_eviction_order(name):
     assert listed == drained, (
         f"{name}.victims() gave {listed}, draining victim() gives {drained}"
     )
+
+
+def test_random_victims_agrees_with_victim():
+    """The same check for Random, which the spec above cannot be run against.
+
+    ``victims()`` and ``victim()`` have to describe one ordering, and that claim
+    is not probabilistic: whichever order a Random policy settles on, draining
+    it one victim at a time must walk that same order. Only the order itself is
+    unpredictable, which is why this is checked per instance instead of against
+    a hardcoded sequence.
+
+    Over several instances, since a single draw could agree by luck -- with five
+    keys there is a 1-in-120 chance of two independent orderings matching.
+    """
+    cls = _policy_class("Random")
+
+    for attempt in range(20):
+        policy = cls()
+        for key in ("a", "b", "c", "d", "e"):
+            policy.on_insert(key)
+        policy.on_access("c")
+
+        listed = list(policy.victims())
+        drained = _victim_sequence(policy)
+
+        assert listed == drained, (
+            f"attempt {attempt}: Random.victims() gave {listed}, "
+            f"draining victim() gives {drained}"
+        )
 
 
 @pytest.mark.parametrize("name", POLICY_NAMES)
