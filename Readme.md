@@ -7,7 +7,7 @@
 EffiDict is a fast, dictionary-like cache with pluggable on-disk backends and multiple replacement strategies. It gives you a familiar dict API, automatic spilling to disk, and control over how entries are evicted from memory.
 
 ## Features
-- Multiple replacement strategies: LRU, MRU, FIFO, LIFO, LFU, MFU, Random
+- Multiple eviction policies: LRU, MRU, FIFO, LIFO, LFU, MFU, Random
 - Pluggable persistence backends:
   - SQLite (single file, JSON-encoded values)
   - JSON folder (one JSON file per key)
@@ -40,12 +40,11 @@ pip install -e .[dev]
 Create an `EffiDict` using the SQLite backend and LRU replacement strategy:
 
 ```python
-from effidict import EffiDict, SqliteBackend, LRUReplacement
+from effidict import EffiDict, SqliteBackend, LRUPolicy
 
 # A unique suffix is appended to avoid collisions, so a simple prefix is fine
 backend = SqliteBackend("cache.sqlite_")
-strategy = LRUReplacement(disk_backend=backend, max_in_memory=2)
-store = EffiDict(disk_backend=backend, replacement_strategy=strategy)
+store = EffiDict(disk_backend=backend, policy=LRUPolicy(), max_in_memory=2)
 
 store["a"] = 1
 store["b"] = 2
@@ -57,11 +56,10 @@ assert store["a"] == 1  # transparently loads from disk if evicted
 Use as a context manager to ensure cleanup:
 
 ```python
-from effidict import EffiDict, JSONBackend, MRUReplacement
+from effidict import EffiDict, JSONBackend, MRUPolicy
 
 backend = JSONBackend("cache_dir_")
-strategy = MRUReplacement(disk_backend=backend, max_in_memory=100)
-with EffiDict(disk_backend=backend, replacement_strategy=strategy) as d:
+with EffiDict(disk_backend=backend, policy=MRUPolicy(), max_in_memory=100) as d:
 	d["k"] = "v"
 	print(d["k"])  # -> "v"
 # resources are cleaned up on exit
@@ -71,19 +69,19 @@ You can also call `store.close()` explicitly when done.
 
 ## Backends and strategies
 
-Construct the backend and strategy you need, then pass both to `EffiDict`:
+Construct the backend and pick an eviction policy, then pass both to `EffiDict` with
+the number of entries to keep in memory:
 
 ```python
 from effidict import (
 	EffiDict,
 	SqliteBackend, JSONBackend, PickleBackend, Hdf5Backend,
-	LRUReplacement, MRUReplacement, FIFOReplacement, LIFOReplacement,
-	LFUReplacement, MFUReplacement, RandomReplacement,
+	LRUPolicy, MRUPolicy, FIFOPolicy, LIFOPolicy,
+	LFUPolicy, MFUPolicy, RandomPolicy,
 )
 
 backend = SqliteBackend("cache.sqlite_")                  # or JSONBackend("cache_dir_"), PickleBackend("cache_dir_"), Hdf5Backend("cache.h5_")
-strategy = LRUReplacement(disk_backend=backend, max_in_memory=100)
-store = EffiDict(disk_backend=backend, replacement_strategy=strategy)
+store = EffiDict(disk_backend=backend, policy=LRUPolicy(), max_in_memory=100)
 ```
 
 Notes:

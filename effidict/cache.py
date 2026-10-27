@@ -21,36 +21,67 @@ class Cache:
         write it to, so a cache that dropped its own victims would make
         write-before-drop impossible to implement. It is also why the surface
         includes ``peek``, ``is_dirty``, ``dirty_items`` and ``discard`` at all.
+
+        ``max_bytes`` and ``size_estimator`` are recorded but not yet consulted:
+        the byte budget needs ``nbytes``, which is issue #1.4.
         """
-        raise NotImplementedError("see issue #1.2")
+        self.policy = policy
+        self.max_items = max_items
+        self.max_bytes = max_bytes
+        self.size_estimator = size_estimator
+        self._values = {}
+
+    def __iter__(self) -> Iterator:
+        """Iterate the cached keys, so ``set(cache)`` is the resident key set."""
+        return iter(self._values)
 
     def has(self, key) -> bool:
         """Return whether ``key`` is present in the cache."""
-        raise NotImplementedError("see issue #1.2")
+        return key in self._values
 
     def get(self, key):
         """Return ``key`` and record access, or raise ``KeyError`` if absent."""
-        raise NotImplementedError("see issue #1.2")
+        value = self._values[key]
+        self.policy.on_access(key)
+        return value
 
     def peek(self, key):
         """Return ``key`` without recording access, or raise ``KeyError``."""
-        raise NotImplementedError("see issue #1.2")
+        return self._values[key]
 
     def put(self, key, value, dirty: bool = True) -> None:
-        """Store ``value`` under ``key`` and record dirty state."""
-        raise NotImplementedError("see issue #1.2")
+        """Store ``value`` under ``key`` and record dirty state.
+
+        A rewrite is reported to the policy as an access, not an insertion.
+        ``on_insert`` restarts a key's bookkeeping -- frequency back to one --
+        so routing an update through it would discard the usage history of a key
+        that never left the cache. That is the defect
+        ``test_mfu_replacement_keeps_frequency_across_a_value_update`` pins
+        against the strategies this class replaces.
+
+        ``dirty`` is recorded by issue #1.3, which adds the clean/dirty tag.
+        Until then ``Store`` writes every victim out, not only the dirty ones.
+        """
+        if key in self._values:
+            self.policy.on_access(key)
+        else:
+            self.policy.on_insert(key)
+        self._values[key] = value
 
     def discard(self, key) -> None:
         """Remove ``key`` if present without raising when absent."""
-        raise NotImplementedError("see issue #1.2")
+        if key in self._values:
+            del self._values[key]
+            self.policy.on_remove(key)
 
     def clear(self) -> None:
         """Remove all cached entries and policy state."""
-        raise NotImplementedError("see issue #1.2")
+        self._values.clear()
+        self.policy.clear()
 
     def __len__(self) -> int:
         """Return the number of cached items."""
-        raise NotImplementedError("see issue #1.2")
+        return len(self._values)
 
     def nbytes(self) -> int:
         """Return the approximate cached byte size."""
@@ -79,5 +110,25 @@ class Cache:
         Built on ``EvictionPolicy.victims()`` rather than repeated ``victim()``
         calls -- ``victim()`` only advances when a key is removed, so it cannot
         enumerate without mutating.
+
+        Exactly the surplus, never more: the promise is "the keys that must be
+        shed to get back inside budget", so shedding further to a low-water mark
+        would be a different promise. Returned over a snapshot, so the caller
+        may discard what it is handed while walking it.
+
+        Only the item budget is consulted. The byte budget needs ``nbytes``,
+        which is issue #1.4.
         """
-        raise NotImplementedError("see issue #1.2")
+        if self.max_items is None:
+            return iter(())
+
+        surplus = len(self._values) - self.max_items
+        if surplus <= 0:
+            return iter(())
+
+        candidates = []
+        for key in self.policy.victims():
+            candidates.append(key)
+            if len(candidates) == surplus:
+                break
+        return iter(candidates)
