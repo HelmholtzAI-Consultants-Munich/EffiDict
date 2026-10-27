@@ -289,10 +289,6 @@ SCENARIOS = {
 }
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="the EvictionPolicy implementations do not exist yet (issue 1.1)",
-)
 @pytest.mark.parametrize("scenario", sorted(SCENARIOS))
 @pytest.mark.parametrize("name", DETERMINISTIC)
 def test_victim_order(name, scenario):
@@ -306,10 +302,6 @@ def test_victim_order(name, scenario):
     assert _victim_sequence(policy) == expected
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="the EvictionPolicy implementations do not exist yet (issue 1.1)",
-)
 def test_lfu_evicts_the_least_frequently_used():
     """LFU gives up the coldest key first, regardless of when it arrived."""
     policy = _policy_class("LFU")()
@@ -322,19 +314,14 @@ def test_lfu_evicts_the_least_frequently_used():
     assert policy.victim() == "cold"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="the EvictionPolicy implementations do not exist yet (issue 1.1)",
-)
 def test_mfu_evicts_the_most_frequently_used():
     """MFU gives up the hottest key first.
 
-    States the contract issue 1.1 has to satisfy. It cannot reach the defect it
-    was written for: ``_policy_class("MFU")`` resolves
-    ``effidict.policies.MFUPolicy``, which does not exist, so this raises
-    ``NotImplementedError`` before any shipped code runs.
-    ``test_mfu_replacement_keeps_frequency_across_a_value_update`` below is the
-    pin that does reach it.
+    States the contract issue 1.1 satisfies, against ``MFUPolicy``. It does not
+    reach the duplicated-class-body defect it was originally written for: that
+    lives on the legacy ``MFUReplacement``, which 1.1 leaves alone and 1.2
+    deletes. ``test_mfu_replacement_keeps_frequency_across_a_value_update``
+    below is the pin that does reach it.
     """
     policy = _policy_class("MFU")()
     for key in ("hot", "warm", "cold"):
@@ -393,10 +380,6 @@ def test_mfu_replacement_keeps_frequency_across_a_value_update():
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="the EvictionPolicy implementations do not exist yet (issue 1.1)",
-)
 @pytest.mark.parametrize("name", POLICY_NAMES)
 def test_policy_never_touches_the_backend(name):
     """A policy must have no way to reach storage.
@@ -472,10 +455,6 @@ def test_policy_never_touches_the_backend(name):
     assert not held, f"{cls.__name__} holds a backend-like object: {held}"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="the EvictionPolicy implementations do not exist yet (issue 1.1)",
-)
 @pytest.mark.parametrize("name", POLICY_NAMES)
 def test_forget_removes_all_policy_state(name):
     """``on_remove`` must drop every trace of a key.
@@ -511,10 +490,6 @@ def test_forget_removes_all_policy_state(name):
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="the EvictionPolicy implementations do not exist yet (issue 1.1)",
-)
 def test_random_policy_only_ever_names_tracked_keys():
     """Random cannot be pinned to a sequence, so pin what must still hold.
 
@@ -542,10 +517,6 @@ def test_random_policy_only_ever_names_tracked_keys():
     assert sorted(_victim_sequence(policy)) == sorted(keys)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="the EvictionPolicy implementations do not exist yet (issue 1.1)",
-)
 @pytest.mark.parametrize("name", POLICY_NAMES)
 def test_clear_drops_everything(name):
     """``clear()`` must leave the policy indistinguishable from a fresh one.
@@ -617,10 +588,6 @@ def test_clear_drops_everything(name):
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="the EvictionPolicy implementations do not exist yet (issue 1.1)",
-)
 @pytest.mark.parametrize("name", DETERMINISTIC)
 def test_victims_enumerates_in_eviction_order(name):
     """``victims()`` must list every tracked key, most-evictable first.
@@ -655,10 +622,6 @@ def test_victims_enumerates_in_eviction_order(name):
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="the EvictionPolicy implementations do not exist yet (issue 1.1)",
-)
 @pytest.mark.parametrize("name", POLICY_NAMES)
 def test_victims_records_nothing(name):
     """Walking ``victims()`` must leave the policy exactly as it was.
