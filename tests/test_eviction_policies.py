@@ -517,6 +517,47 @@ def test_random_policy_only_ever_names_tracked_keys():
     assert sorted(_victim_sequence(policy)) == sorted(keys)
 
 
+def test_random_stays_uniform_as_keys_are_replaced():
+    """Random must stay uniform once membership has turned over.
+
+    The test above fills a fresh policy and takes one victim, which every
+    plausible implementation passes. The failure this covers only appears after
+    keys have been replaced: a policy that gives each key a fixed random
+    priority and always evicts the lowest is selecting its survivors *on those
+    priorities*, so the keys still resident are the ones that drew high and an
+    incoming key with a fresh draw is almost always the lowest. It is then not
+    random replacement but a store of the luckiest keys ever inserted, and
+    nothing else in this file can see it.
+
+    Modelled on a full cache of ten: insert, then evict one of the eleven
+    candidates. Uniform replacement names the incoming key 1 time in 11, so
+    about 91 of 1000 insertions; the fixed-priority version measured ~950.
+
+    The bounds are wide rather than tight on purpose. The count is binomial with
+    standard deviation 9, so 30 and 160 sit more than six deviations from the
+    mean on either side -- an unbiased policy effectively never trips them,
+    while both ways of getting this wrong are far outside. A policy that never
+    evicts the incoming key lands near 0 and fails the lower bound.
+    """
+    policy = _policy_class("Random")()
+    for index in range(10):
+        policy.on_insert(f"resident-{index}")
+
+    evicted_immediately = 0
+    for index in range(1000):
+        incoming = f"key-{index}"
+        policy.on_insert(incoming)
+        victim = policy.victim()
+        policy.on_remove(victim)
+        if victim == incoming:
+            evicted_immediately += 1
+
+    assert 30 < evicted_immediately < 160, (
+        f"{evicted_immediately} of 1000 incoming keys were evicted immediately; "
+        f"uniform replacement over 11 candidates gives about 91"
+    )
+
+
 @pytest.mark.parametrize("name", POLICY_NAMES)
 def test_clear_drops_everything(name):
     """``clear()`` must leave the policy indistinguishable from a fresh one.

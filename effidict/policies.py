@@ -135,33 +135,51 @@ class _BookkeepingPolicy(EvictionPolicy):
 class RandomPolicy(_BookkeepingPolicy):
     """Gives up an arbitrary tracked key.
 
-    Which key is arbitrary is drawn when the key arrives, not when a victim is
-    asked for. ``victim()`` is a peek: it must keep naming the same key until
-    that key is removed, and a draw taken per call would name a different one
-    every time it was asked.
+    Keeps one shuffled ordering of the tracked keys instead of deciding per
+    call. A new key goes in at a uniformly chosen position and a removed key
+    leaves the rest where they are, which keeps the ordering a uniform
+    permutation of whatever is tracked right now: the head is equally likely to
+    be any of them, and it stays the same key until that key is removed.
+
+    A draw stored per key, smallest one evicted, satisfies both of those
+    properties read individually and is still not random replacement. Eviction
+    then selects on the draws themselves -- the keys that survive are the ones
+    that drew high -- so the survivors' draws are no longer uniform and an
+    incoming key with a fresh draw is almost always the smallest. Measured on a
+    cache of ten: that version evicted the incoming key again immediately on
+    ~950 of 1000 insertions, where uniform replacement evicts about 91.
+    ``test_random_stays_uniform_as_keys_are_replaced`` pins it.
+
+    Inserting into a list is linear in the number of tracked keys, where the
+    other six are constant. That is the cost of an ordering that can be read
+    without being rebuilt; LFU and MFU pay the same linearity per peek.
     """
 
     def __init__(self) -> None:
         super().__init__()
-        self._draw: dict = {}
+        self._shuffled: list = []
 
     def on_insert(self, key: str) -> None:
         super().on_insert(key)
-        self._draw[key] = random.random()
+        # Already tracked: it keeps the position it has, matching the base,
+        # where re-inserting a key leaves it where it is in insertion order.
+        if key not in self._shuffled:
+            self._shuffled.insert(random.randint(0, len(self._shuffled)), key)
 
     def on_remove(self, key: str) -> None:
         super().on_remove(key)
-        self._draw.pop(key, None)
+        if key in self._shuffled:
+            self._shuffled.remove(key)
 
     def clear(self) -> None:
         super().clear()
-        self._draw.clear()
+        self._shuffled.clear()
 
     def _eviction_order(self) -> List[str]:
-        return sorted(self._inserted, key=lambda key: self._draw[key])
+        return list(self._shuffled)
 
     def _next_victim(self) -> str:
-        return min(self._inserted, key=lambda key: self._draw[key])
+        return self._shuffled[0]
 
 
 class FIFOPolicy(_BookkeepingPolicy):
