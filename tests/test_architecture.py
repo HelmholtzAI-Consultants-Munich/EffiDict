@@ -621,6 +621,152 @@ def test_store_works_with_a_non_reentrant_lock(storage_dir):
         backend.destroy()
 
 
+#: Distinct from every value a test stores, so "the finalizer got KeyError"
+#: cannot be confused with "the finalizer read ``None``".
+_ABSENT = object()
+
+
+#: Read by :class:`_ReentrantFinalizer`, so the stored value itself holds
+#: nothing but a string and stays picklable -- the eviction case below writes it
+#: to disk. Keyed by tag, and each probe removes its own entry as it fires, so
+#: the copy that unpickling creates cannot set the recording off a second time.
+_FINALIZER_PROBES = {}
+
+
+class _ReentrantFinalizer:
+    """A stored value whose ``__del__`` queries the store that held it."""
+
+    def __init__(self, tag):
+        self.tag = tag
+
+    def __del__(self):
+        probe = _FINALIZER_PROBES.pop(self.tag, None)
+        if probe is not None:
+            probe()
+
+
+@pytest.mark.parametrize(
+    "operation, survives",
+    [
+        ("overwrite", True),
+        ("evict", True),
+        ("delete", False),
+        ("clear", False),
+    ],
+)
+def test_a_finalizer_never_runs_inside_a_tier_operation(
+    operation, survives, storage_dir
+):
+    """Displacing a value must not hand control to it mid-operation.
+
+    CPython runs ``__del__`` the instant the last reference goes, on the thread
+    that dropped it. Every mutating path drops one: an overwrite displaces the
+    old value, an eviction and a delete drop the cached one, ``clear`` drops
+    them all. Each of those drops sits inside the lock, so without care the
+    cache hands a tier operation it has half-applied to arbitrary user code.
+
+    Both halves are asserted, because the two plausible implementations each
+    fail only one. Keeping a plain lock and dropping the value in place
+    **hangs** -- the finalizer's query blocks on a lock its own thread holds --
+    which the bounded wait catches. Making the lock reentrant instead lets the
+    query through into the gap: measured on ``delete``, after the cache had
+    dropped the key and before the backend had, ``get`` returned the disk copy
+    of a key being deleted. So liveness alone is not the property; the
+    finalizer must also find the store whole, which is what ``survives``
+    pins per operation.
+
+    ``pop`` is absent deliberately: it returns the value, so the caller's
+    reference outlives the lock and nothing is dropped inside it.
+
+    One backend and the **default** lock. Default, because that is what a
+    reverted fix would change and what users actually get; injected locks are
+    ``test_store_works_with_a_non_reentrant_lock``'s subject. One backend,
+    for that test's reason -- SQLite's thread affinity (issue 2.3) would fail
+    here while saying nothing about finalizers.
+    """
+    backend = PickleBackend(str(storage_dir / "store"))
+    observed = []
+    tag = f"probe-{operation}"
+    try:
+        store = Store(
+            backend=backend,
+            cache=Cache(
+                policy=RecordingPolicy(),
+                max_items=1 if operation == "evict" else 4,
+            ),
+        )
+
+        def probe():
+            # Whatever the finalizer can see of the store it was dropped from.
+            try:
+                present = store.contains("k")
+            except BaseException as exc:  # noqa: BLE001 - reported below
+                observed.append(("contains-raised", exc))
+                return
+            try:
+                observed.append(("seen", present, store.get("k")))
+            except KeyError:
+                observed.append(("seen", present, _ABSENT))
+
+        _FINALIZER_PROBES[tag] = probe
+        # A disk copy as well as the cached one, so that "the store is whole"
+        # is a real question during a delete: a finalizer let into the gap
+        # reads this value, where one running afterwards gets ``KeyError``.
+        backend.serialize("k", "on-disk")
+        store.set("k", _ReentrantFinalizer(tag))
+
+        actions = {
+            "overwrite": lambda: store.set("k", "replacement"),
+            "evict": lambda: store.set("other", "v"),
+            "delete": lambda: store.delete("k"),
+            "clear": lambda: store.clear(),
+        }
+        finished = threading.Event()
+        failure = {}
+
+        def run():
+            try:
+                actions[operation]()
+            except Exception as exc:  # noqa: BLE001 - re-raised below
+                failure["exc"] = exc
+            finally:
+                finished.set()
+
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        assert finished.wait(5.0), (
+            f"{operation} did not return within 5s: the displaced value's "
+            f"__del__ ran while the lock was held and blocked on it"
+        )
+        if "exc" in failure:
+            raise AssertionError(
+                f"{operation} raised {failure['exc']!r} on a worker thread"
+            ) from failure["exc"]
+
+        assert len(observed) == 1, (
+            f"the finalizer ran {len(observed)} times during {operation}; the "
+            f"test proves nothing unless the value was actually dropped"
+        )
+        record = observed[0]
+        assert record[0] == "seen", (
+            f"the finalizer could not query the store during {operation}: "
+            f"{record}"
+        )
+        _, present, value = record
+        assert present is survives, (
+            f"during {operation} the finalizer saw contains('k') == {present}, "
+            f"expected {survives}: it was let into a half-applied operation"
+        )
+        if not survives:
+            assert value is _ABSENT, (
+                f"during {operation} the finalizer read {value!r} for a key "
+                f"being removed, so it ran between the two tiers"
+            )
+    finally:
+        _FINALIZER_PROBES.pop(tag, None)
+        backend.destroy()
+
+
 def test_store_pop_distinguishes_an_omitted_default_from_none(backend_cls, storage_dir):
     """``pop`` must tell ``pop(key)`` from ``pop(key, None)``.
 
