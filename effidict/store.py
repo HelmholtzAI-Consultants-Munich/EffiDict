@@ -54,13 +54,15 @@ class Store:
     def __init__(self, backend, cache, lock=None, owns_storage: bool = True):
         self._backend = backend
         self._cache = cache
-        # Reentrant: the tier operations are written in terms of each other --
-        # ``pop`` is ``get`` then ``delete``, ``delete`` asks ``contains`` --
-        # and I4 requires the whole sequence to hold one lock rather than
-        # releasing it between the two tiers. A plain ``Lock`` would deadlock on
-        # the first such call. An injected lock is used as given, which is what
-        # lets a caller share one across stores.
-        self._lock = threading.RLock() if lock is None else lock
+        # A plain ``Lock``, because nothing here re-acquires. The tier
+        # operations are written in terms of each other -- ``pop`` is ``get``
+        # then ``delete``, ``delete`` asks ``contains`` -- and I4 requires the
+        # whole sequence to hold one lock rather than releasing it between the
+        # two tiers, so each public method acquires once and calls the private
+        # held-lock form of the others. That is what lets an injected lock be
+        # any lock: a caller sharing a plain ``Lock`` across stores, or the
+        # ``Lock`` protocol of PLAN.md 3.6, which need not be reentrant.
+        self._lock = threading.Lock() if lock is None else lock
         self._owns_storage = owns_storage
 
     @property
@@ -92,10 +94,14 @@ class Store:
         Promotion belongs with the tag, not before it.
         """
         with self._lock:
-            try:
-                return self._cache.get(key)
-            except KeyError:
-                return self._backend.deserialize(key)
+            return self._get(key)
+
+    def _get(self, key):
+        """:meth:`get` with the lock already held."""
+        try:
+            return self._cache.get(key)
+        except KeyError:
+            return self._backend.deserialize(key)
 
     def set(self, key, value) -> None:
         """Store ``value`` under ``key``."""
@@ -120,13 +126,17 @@ class Store:
 
         I4: both tiers under one lock. ``del_item`` is tolerant of a key the
         backend never held, so a cache-only key needs no special case here --
-        the existence check above is what turns a missing key into ``KeyError``.
+        the check in :meth:`_delete` is what turns a missing key into ``KeyError``.
         """
         with self._lock:
-            if not self.contains(key):
-                raise KeyError(key)
-            self._cache.discard(key)
-            self._backend.del_item(key)
+            self._delete(key)
+
+    def _delete(self, key) -> None:
+        """:meth:`delete` with the lock already held."""
+        if not self._contains(key):
+            raise KeyError(key)
+        self._cache.discard(key)
+        self._backend.del_item(key)
 
     def pop(self, key, default=MISSING):
         """Remove ``key`` and return its value.
@@ -141,12 +151,12 @@ class Store:
         """
         with self._lock:
             try:
-                value = self.get(key)
+                value = self._get(key)
             except KeyError:
                 if default is MISSING:
                     raise
                 return default
-            self.delete(key)
+            self._delete(key)
             return value
 
     def clear(self) -> None:
@@ -168,12 +178,16 @@ class Store:
         shape of the answer is settled here.
         """
         with self._lock:
-            return self._cache.has(key) or self._backend.has(key)
+            return self._contains(key)
+
+    def _contains(self, key) -> bool:
+        """:meth:`contains` with the lock already held."""
+        return self._cache.has(key) or self._backend.has(key)
 
     def count(self) -> int:
         """Return the number of distinct keys in the store."""
         with self._lock:
-            return len(set(self.iter_keys()))
+            return len(self._key_set())
 
     def iter_keys(self) -> Iterator:
         """Iterate over all distinct keys in the store.
@@ -184,7 +198,11 @@ class Store:
         itself lives here because this is the one object that knows both tiers.
         """
         with self._lock:
-            return iter(set(self._cache) | set(self._backend.keys()))
+            return iter(self._key_set())
+
+    def _key_set(self):
+        """Every distinct key across both tiers, with the lock already held."""
+        return set(self._cache) | set(self._backend.keys())
 
     def in_cache(self, key) -> bool:
         """White-box hook for tier-invariant specs to assert preconditions.

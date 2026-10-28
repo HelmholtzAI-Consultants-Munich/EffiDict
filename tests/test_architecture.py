@@ -32,10 +32,11 @@ below, which construct ``Cache(...)`` and ``Store(...)`` directly.
 from __future__ import annotations
 
 import inspect
+import threading
 
 import pytest
 
-from effidict import Cache, EffiDict, EvictionPolicy, Store
+from effidict import Cache, EffiDict, EvictionPolicy, PickleBackend, Store
 
 #: The documented ``Store`` surface, as issue 0.1 wrote it. Each entry is the
 #: name plus the positional parameter names after ``self``, so a Phase 1
@@ -553,6 +554,71 @@ def test_cache_get_reads_and_records_the_access():
     # for both would make a stored None indistinguishable from an absent key.
     with pytest.raises(KeyError):
         cache.get("absent")
+
+
+def test_store_works_with_a_non_reentrant_lock(storage_dir):
+    """Every operation must acquire the lock exactly once.
+
+    ``lock=`` is part of the ``Store`` surface, and PLAN.md 3.6 lets a caller
+    inject a ``Lock`` protocol that need not be reentrant -- one shared across
+    stores, or an object that is not a ``threading`` lock at all. An
+    implementation whose public methods call each other re-acquires, which a
+    reentrant default hides: ``delete``, ``pop`` and ``count`` each hung
+    indefinitely under ``threading.Lock`` and nothing failed, because a deadlock
+    is not an exception.
+
+    Run on a worker with a bounded wait, since the failure mode is a hang, and
+    the worker's exception is re-raised rather than swallowed -- a call that
+    died still sets the "finished" event, so liveness alone would pass on a
+    broken call.
+
+    One backend, not the matrix: the claim is about ``Store`` acquiring its own
+    lock, which no backend participates in. Across the matrix SQLite would fail
+    here for an unrelated reason -- its connection cannot be used off the thread
+    that opened it (issue 2.3) -- and that noise would say nothing about locking.
+    """
+    backend = PickleBackend(str(storage_dir / "store"))
+    try:
+        store = Store(
+            backend=backend,
+            cache=Cache(policy=RecordingPolicy(), max_items=4),
+            lock=threading.Lock(),
+        )
+        store.set("a", "va")
+        store.set("b", "vb")
+
+        for label, call in (
+            ("contains", lambda: store.contains("a")),
+            ("get", lambda: store.get("a")),
+            ("count", lambda: store.count()),
+            ("iter_keys", lambda: list(store.iter_keys())),
+            ("pop", lambda: store.pop("a", None)),
+            ("delete", lambda: store.delete("b")),
+            ("clear", lambda: store.clear()),
+        ):
+            finished = threading.Event()
+            failure = {}
+
+            def run(call=call):
+                try:
+                    call()
+                except Exception as exc:  # noqa: BLE001 - re-raised below
+                    failure["exc"] = exc
+                finally:
+                    finished.set()
+
+            worker = threading.Thread(target=run, daemon=True)
+            worker.start()
+            assert finished.wait(5.0), (
+                f"Store.{label} did not return within 5s under a plain Lock, "
+                f"so it acquires the lock more than once"
+            )
+            if "exc" in failure:
+                raise AssertionError(
+                    f"Store.{label} raised {failure['exc']!r} on a worker thread"
+                ) from failure["exc"]
+    finally:
+        backend.destroy()
 
 
 def test_store_pop_distinguishes_an_omitted_default_from_none(backend_cls, storage_dir):

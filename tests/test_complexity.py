@@ -25,7 +25,7 @@ import time
 
 import pytest
 
-from effidict import Hdf5Backend, SqliteBackend
+from effidict import Cache, Hdf5Backend, LRUPolicy, SqliteBackend
 
 from .helpers import store_bytes
 
@@ -325,4 +325,55 @@ def test_stored_size_grows_linearly_with_the_data(request, backend_cls, tmp_path
     assert growth < 4 * 1.6, (
         f"4x the items took {growth:.1f}x the space "
         f"({sizes[250]} -> {sizes[1000]} bytes)"
+    )
+
+
+class _CountingPolicy(LRUPolicy):
+    """An LRU policy that reports how many keys each selection call walks."""
+
+    def __init__(self):
+        super().__init__()
+        self.visited = 0
+
+    def victims(self):
+        order = list(super().victims())
+        self.visited += len(order)
+        return iter(order)
+
+    def victim(self):
+        self.visited += 1
+        return super().victim()
+
+
+@pytest.mark.parametrize("size", [SMALL, LARGE])
+def test_shedding_one_entry_does_not_walk_the_cache(size):
+    """One write past the bound must not cost the size of the cache.
+
+    The steady state of a bounded cache is one eviction per write, so this is
+    nearly every call. ``victims()`` cannot serve it cheaply -- it has to build
+    the whole ordering before it yields anything -- while ``victim()`` reads the
+    ordering's endpoint, which is why the policy has both.
+
+    Counted rather than timed, like the write guards above: the number of keys
+    the policy was asked to walk is the thing that grows, and at 100 entries a
+    timer cannot tell a scan from a lookup. Asserted as a constant rather than a
+    ratio because the correct answer does not depend on the size at all -- one
+    victim, one key visited -- and a ratio would accept a scan that got twice as
+    expensive in both runs.
+    """
+    policy = _CountingPolicy()
+    cache = Cache(policy=policy, max_items=size)
+    for index in range(size):
+        cache.put(f"k{index}", "v")
+    cache.put("one-too-many", "v")
+
+    policy.visited = 0
+    candidates = list(cache.evict_candidates())
+
+    assert len(candidates) == 1, (
+        f"one entry over a {size}-entry budget named {len(candidates)} victims"
+    )
+    assert policy.visited == 1, (
+        f"selecting one victim from a {size}-entry cache walked "
+        f"{policy.visited} keys"
     )

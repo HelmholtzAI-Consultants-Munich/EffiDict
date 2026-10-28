@@ -126,6 +126,15 @@ class Cache:
         if surplus <= 0:
             return iter(())
 
+        if surplus == 1:
+            # One write past the bound sheds one key, which is the steady state
+            # and nearly every call. ``victims()`` has to build the whole
+            # ordering before it yields anything, so asking it for one key costs
+            # the size of the cache and a fill becomes quadratic; ``victim()``
+            # reads the ordering's endpoint instead. The two name the same key,
+            # which ``test_victims_enumerates_in_eviction_order`` pins.
+            return iter((self.policy.victim(),))
+
         candidates = []
         for key in self.policy.victims():
             candidates.append(key)
