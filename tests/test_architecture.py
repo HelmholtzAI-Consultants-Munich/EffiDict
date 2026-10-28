@@ -210,10 +210,6 @@ def test_unimplemented_methods_name_their_issue(owner):
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Store.__init__ and Cache.__init__ are contract stubs (issue 1.2)",
-)
 def test_store_can_be_built_over_a_backend_and_a_cache(backend_cls, storage_dir):
     """The composition root must actually compose.
 
@@ -235,34 +231,34 @@ def test_store_can_be_built_over_a_backend_and_a_cache(backend_cls, storage_dir)
 
 
 def test_both_tiers_are_required_to_construct():
-    """Neither constructor argument may carry a default it cannot honour.
+    """No constructor argument may carry a default it cannot honour.
 
-    ``__init__`` ends with ``self.memory = replacement_strategy.memory``, so a
-    ``None`` default could only ever raise ``AttributeError`` from inside the
-    object. A caller who omits an argument should be told which one, by the
-    signature, before any attribute lookup happens.
+    Three are required, for two different reasons. The backend and the policy
+    are the tiers themselves: before issue 1.2 they defaulted to ``None`` and
+    ``__init__`` ended with ``self.memory = replacement_strategy.memory``, so
+    either default could only raise ``AttributeError`` from inside the object.
+    ``max_in_memory`` is required because a default would be *usable* and wrong
+    -- an unbounded cache never spills, which is the one thing this library
+    exists to do, and the store would silently become a dict that also writes
+    files.
+
+    A caller who omits one should be told which, by the signature, before any
+    attribute lookup happens.
     """
     parameters = inspect.signature(EffiDict.__init__).parameters
-    for name in ("disk_backend", "replacement_strategy"):
+    for name in ("disk_backend", "policy", "max_in_memory"):
         assert parameters[name].default is inspect.Parameter.empty, (
             f"{name} declares a default that __init__ cannot work with"
         )
 
     with pytest.raises(TypeError) as raised:
         EffiDict()
-    assert "replacement_strategy" in str(raised.value), (
+    assert "policy" in str(raised.value), (
         f"constructing without arguments reported {raised.value!r}, which does "
         f"not name the missing argument"
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "EffiDict holds its own disk_backend and aliases the policy's dict as "
-        "self.memory, so nothing owns key placement (issue 1.2)"
-    ),
-)
 def test_effidict_delegates_placement_to_a_store(make_dict):
     """``EffiDict`` must be a facade over one ``Store``, not a second owner.
 
@@ -320,13 +316,10 @@ def test_cache_tags_entries_clean_or_dirty():
 #: "peek did not promote" is a statement about a call that must *not* happen,
 #: which is unobservable from the outside.
 #:
-#: Used by every Cache spec here in place of the matrix ``policy_cls``, and not
-#: only for observability: ``Cache`` takes an ``EvictionPolicy``, while the
-#: matrix still supplies the legacy ``*Replacement`` classes, which do not grow
-#: ``on_insert``/``victim`` until issue 1.1. Handing one to a correct ``Cache``
-#: raises ``AttributeError``, so these specs were unsatisfiable by the very
-#: implementation they are meant to describe -- found by running them against a
-#: reference ``Cache`` rather than by reading them.
+#: Used by every Cache spec here in place of the matrix ``policy_cls``. The
+#: matrix now supplies real ``*Policy`` classes, which a ``Cache`` accepts, but
+#: those keep their bookkeeping private: what these specs assert is which calls
+#: the cache made, and that is only visible from a policy that records them.
 class RecordingPolicy(EvictionPolicy):
     def __init__(self):
         self.calls = []
@@ -494,10 +487,6 @@ def test_cache_measures_values_with_the_size_estimator():
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Cache is a contract stub (issue 1.2)",
-)
 def test_cache_peek_does_not_promote():
     """I6. ``peek`` must read without telling the policy.
 
@@ -532,10 +521,6 @@ def test_cache_peek_does_not_promote():
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Cache is a contract stub (issue 1.2)",
-)
 def test_cache_get_reads_and_records_the_access():
     """``get`` must return the value *and* tell the policy.
 
@@ -570,10 +555,6 @@ def test_cache_get_reads_and_records_the_access():
         cache.get("absent")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Store is a contract stub (issue 1.2)",
-)
 def test_store_pop_distinguishes_an_omitted_default_from_none(backend_cls, storage_dir):
     """``pop`` must tell ``pop(key)`` from ``pop(key, None)``.
 

@@ -22,7 +22,7 @@ from effidict import (
     Hdf5Backend,
     JSONBackend,
     PickleBackend,
-    RandomReplacement,
+    RandomPolicy,
     SqliteBackend,
 )
 
@@ -64,17 +64,18 @@ def _policy_state(store):
     does not see at all. A bulk load could therefore match on keys and still
     behave differently on the very next write.
 
-    Reads the policy's own attributes, which issue 1.1 moves: the ``*Policy``
-    classes keep the ordering and the counts but the cache dict belongs to
-    ``Cache``. Update this reader then -- ``test_eviction_policies._instance_state``
-    already walks policy state generically and is the model to follow. Left
-    concrete here because the generic walk needs the post-1.1 shape to be useful.
+    The cache dict belongs to ``Cache`` since issue 1.2, and each ``*Policy``
+    keeps its ordering and counts in private containers whose names differ per
+    policy. So the policy half is walked generically, the way
+    ``test_eviction_policies._instance_state`` does it: this spec only compares
+    one store against another of the same policy, so the names never have to be
+    known here, and a counter added later is covered without anyone remembering
+    to extend this reader.
     """
-    policy = store.replacement_strategy
-    state = {"order": list(policy.memory.keys())}
-    frequencies = getattr(policy, "secondary_memory", None)
-    if frequencies is not None:
-        state["frequencies"] = dict(frequencies)
+    cache = store._store.cache
+    state = {"order": list(cache)}
+    for name, value in sorted(vars(cache.policy).items()):
+        state[name] = repr(value)
     return state
 
 
@@ -368,7 +369,7 @@ def test_batch_and_single_writes_are_equivalent(backend_cls, policy_cls, make_di
     # the bulk load did, and would pass on exactly the policies it should catch.
     bulk_state = _policy_state(in_bulk)
     individual_state = _policy_state(one_at_a_time)
-    if policy_cls is RandomReplacement:
+    if policy_cls is RandomPolicy:
         # Random picks its victims by coin flip, so two stores given identical
         # writes legitimately retain different keys -- and therefore a different
         # order. Only the population size is a meaningful comparison.
@@ -487,7 +488,6 @@ def test_delete_many_matches_individual_deletes(backend):
         assert_equal_value(backend.deserialize(key), BATCH_ITEMS[key])
 
 
-@pytest.mark.xfail(strict=True, reason="has is a contract stub (issue 2.2)")
 def test_has_agrees_with_keys(backend):
     """``has`` must answer what ``keys`` reports, without enumerating it.
 

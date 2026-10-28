@@ -96,8 +96,7 @@ def test_cache_respects_max_bytes(make_dict):
 _RSS_PROBE = """
 import os, resource, sys
 sys.path.insert(0, sys.argv[1])
-from effidict import EffiDict, PickleBackend, LRUReplacement
-from tests.helpers import build_policy  # see the note in test_concurrency
+from effidict import EffiDict, PickleBackend, LRUPolicy
 
 tmpdir, items, budget = sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
 MIB = 1024 * 1024
@@ -123,9 +122,8 @@ def distinct(index, size=MIB):
 backend = PickleBackend(os.path.join(tmpdir, "store"))
 store = EffiDict(
     disk_backend=backend,
-    replacement_strategy=build_policy(
-        LRUReplacement, disk_backend=backend, max_in_memory=items
-    ),
+    policy=LRUPolicy(),
+    max_in_memory=items,
     max_bytes=budget,
 )
 baseline = resident_bytes()
@@ -232,13 +230,6 @@ def test_keys_does_not_materialise_the_whole_keyspace(make_dict):
     assert not isinstance(iterator, list)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "items() reads every value through the policy, so a full scan promotes "
-        "each key in turn and evicts whatever was cached (issue 4.2)"
-    ),
-)
 def test_full_scan_does_not_evict_the_working_set(make_dict, backend_spy):
     """Walking the store must not cost the caller its cache.
 
@@ -262,7 +253,7 @@ def test_full_scan_does_not_evict_the_working_set(make_dict, backend_spy):
     before = cached_keys(d)
     assert before, "precondition: something is cached"
 
-    with backend_spy(d.disk_backend) as spy:
+    with backend_spy(d._store.backend) as spy:
         for _ in d.items():
             pass
         writes = spy.count("serialize") + spy.count("write_many")

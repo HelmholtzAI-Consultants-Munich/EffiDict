@@ -21,23 +21,21 @@ from pathlib import Path
 
 import pytest
 
-from effidict import EffiDict, LRUReplacement
+from effidict import EffiDict, LRUPolicy
 
 from .conftest import release_store
-from .helpers import build_policy
 
 REPO_ROOT = str(Path(__file__).resolve().parents[1])
 
 KEYS = {f"k{i}": f"v{i}" for i in range(5)}
 
 
-def _build(backend, policy_cls=LRUReplacement, max_in_memory=2):
+def _build(backend, policy_cls=LRUPolicy, max_in_memory=2):
     """Wrap an already-constructed backend in an EffiDict."""
     return EffiDict(
         disk_backend=backend,
-        replacement_strategy=build_policy(
-            policy_cls, disk_backend=backend, max_in_memory=max_in_memory
-        ),
+        policy=policy_cls(),
+        max_in_memory=max_in_memory,
     )
 
 
@@ -204,7 +202,7 @@ def test_unflushed_writes_are_not_lost_on_close(backend_cls, policy_cls, storage
     writer = _build(backend_cls.create(path), policy_cls, max_in_memory=100)
     for key, value in KEYS.items():
         writer[key] = value
-    assert writer.disk_backend.keys() == [], "precondition: nothing spilled yet"
+    assert writer._store.backend.keys() == [], "precondition: nothing spilled yet"
     writer.close()
 
     reader = _build(backend_cls.open(path), policy_cls)
@@ -223,15 +221,13 @@ _WRITER_SCRIPT = textwrap.dedent(
     """
     import sys
     sys.path.insert(0, {repo!r})
-    from effidict import EffiDict, {backend}, LRUReplacement
-    from tests.helpers import build_policy  # see the note in test_concurrency
+    from effidict import EffiDict, {backend}, LRUPolicy
 
     backend = {backend}.create({path!r})
     store = EffiDict(
         disk_backend=backend,
-        replacement_strategy=build_policy(
-            LRUReplacement, disk_backend=backend, max_in_memory=2
-        ),
+        policy=LRUPolicy(),
+        max_in_memory=2,
     )
     for key, value in {keys!r}.items():
         store[key] = value

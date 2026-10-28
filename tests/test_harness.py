@@ -80,7 +80,7 @@ def test_matrix_ids_are_readable_and_unique(pytester):
     lines = [line for line in result.outlines if "test_combo[" in line]
     assert len(lines) == 28
     assert len(set(lines)) == 28
-    assert any("[SqliteBackend-LRUReplacement]" in line for line in lines)
+    assert any("[SqliteBackend-LRUPolicy]" in line for line in lines)
 
 
 # --------------------------------------------------------------------------
@@ -107,10 +107,14 @@ def test_make_dict_honours_max_in_memory(make_dict):
 
 
 def test_make_dict_forwards_max_bytes(make_dict):
-    """A dropped max_bytes would let issue 0.4's budget spec test nothing."""
+    """A dropped max_bytes would let issue 0.4's budget spec test nothing.
+
+    Read from the cache, which is where issue 1.2 put the budget: the facade
+    holds no state of its own and forwards it on construction.
+    """
     d = make_dict(max_bytes=4096)
 
-    assert d.max_bytes == 4096
+    assert d._store.cache.max_bytes == 4096
 
 
 def test_make_dict_defaults_when_unparametrized(make_dict):
@@ -118,15 +122,15 @@ def test_make_dict_defaults_when_unparametrized(make_dict):
 
     d = make_dict()
 
-    assert isinstance(d.disk_backend, DEFAULT_BACKEND)
-    assert isinstance(d.replacement_strategy, DEFAULT_POLICY)
+    assert isinstance(d._store.backend, DEFAULT_BACKEND)
+    assert isinstance(d._store.cache.policy, DEFAULT_POLICY)
 
 
 def test_make_dict_gives_each_dict_its_own_storage(make_dict):
     first = make_dict()
     second = make_dict()
 
-    assert first.disk_backend.storage_path != second.disk_backend.storage_path
+    assert first._store.backend.storage_path != second._store.backend.storage_path
 
 
 # --------------------------------------------------------------------------
@@ -335,7 +339,7 @@ def test_backend_spy_records_and_delegates(make_dict, backend_spy):
     d["a"] = 1
     d["b"] = 2  # forces 'a' out to disk
 
-    with backend_spy(d.disk_backend) as spy:
+    with backend_spy(d._store.backend) as spy:
         assert d["a"] == 1
         assert spy.count("deserialize") == 1
         assert spy.count("del_item") == 0
@@ -348,19 +352,19 @@ def test_backend_spy_records_and_delegates(make_dict, backend_spy):
 
 def test_backend_spy_restores_the_backend(make_dict, backend_spy):
     d = make_dict()
-    original = type(d.disk_backend).serialize
+    original = type(d._store.backend).serialize
 
-    with backend_spy(d.disk_backend):
-        assert d.disk_backend.serialize.__name__ == "recorder"
+    with backend_spy(d._store.backend):
+        assert d._store.backend.serialize.__name__ == "recorder"
 
-    assert d.disk_backend.serialize.__func__ is original
-    assert "serialize" not in vars(d.disk_backend)
+    assert d._store.backend.serialize.__func__ is original
+    assert "serialize" not in vars(d._store.backend)
 
 
 def test_backend_spy_leaves_classmethods_alone(make_dict, backend_spy):
     d = make_dict()
 
-    with backend_spy(d.disk_backend) as spy:
+    with backend_spy(d._store.backend) as spy:
         assert "create" not in spy._patched
         assert "open" not in spy._patched
 
@@ -368,7 +372,7 @@ def test_backend_spy_leaves_classmethods_alone(make_dict, backend_spy):
 def test_backend_spy_counts_writes_during_eviction(make_dict, backend_spy):
     d = make_dict(max_in_memory=1)
 
-    with backend_spy(d.disk_backend) as spy:
+    with backend_spy(d._store.backend) as spy:
         d["a"] = 1
         d["b"] = 2
         assert spy.count("serialize") == 1

@@ -25,10 +25,6 @@ except ImportError:  # pragma: no cover - pandas is a dev dependency
 from effidict import (
     Hdf5Backend,
     JSONBackend,
-    LFUReplacement,
-    LRUReplacement,
-    MFUReplacement,
-    MRUReplacement,
     PickleBackend,
     SqliteBackend,
 )
@@ -37,12 +33,14 @@ from effidict import (
 #: can mutate the cache during a read, so only these violate I6 -- several
 #: specs need to scope their expectations to this set rather than assuming the
 #: defect is universal.
-PROMOTING_POLICIES = {
-    LRUReplacement,
-    MRUReplacement,
-    LFUReplacement,
-    MFUReplacement,
-}
+#:
+#: Empty since issue 1.2. Promotion used to be per-strategy: four of the seven
+#: wrote the loaded value back, three read straight through. ``Store.get`` now
+#: answers from one path for every policy and does not promote, because
+#: promoting without the clean/dirty tag means evicting, and evicting means
+#: writing a value the disk already holds. Issue 1.3 may reintroduce promotion
+#: once that tag exists, and this set is where it would be recorded.
+PROMOTING_POLICIES = set()
 
 
 def _ndarray():
@@ -137,38 +135,13 @@ EAGER_ITERATOR_TYPES = frozenset(
 )
 
 
-def build_policy(policy_cls, disk_backend=None, max_in_memory=2, **extra):
-    """Construct ``policy_cls`` with whatever arguments it actually declares.
-
-    Issue 1.1 replaces the ``*Replacement`` classes -- which require
-    ``disk_backend`` and ``max_in_memory`` -- with ``*Policy`` classes that own
-    bookkeeping only and take **no** constructor arguments;
-    ``test_eviction_policies.py`` pins that as ``ALLOWED_INIT_PARAMS =
-    frozenset()``. Hard-coding today's arguments would make every call site raise
-    ``TypeError`` the moment 1.1 lands, and on a strict xfail that reads as
-    "still failing" rather than "failing for a new reason" -- so the guard would
-    never flip green when the defect it pins is actually fixed.
-
-    Only declared parameters are passed, so this spans the change without a flag
-    day.
-    """
-    accepted = inspect.signature(policy_cls.__init__).parameters
-    candidates = {
-        "disk_backend": disk_backend,
-        "max_in_memory": max_in_memory,
-        **extra,
-    }
-    return policy_cls(**{k: v for k, v in candidates.items() if k in accepted})
-
-
 def in_cache(effidict, key):
     """Whether ``key`` currently sits in the in-memory tier.
 
-    Reads today's internals. Issue 1.2 replaces the body with
-    ``effidict._store.in_cache(key)``; keeping the call site behind this helper
-    means the tier-invariant specs do not all need rewriting when it lands.
+    ``Store.in_cache`` deliberately takes no lock, which is what lets the I5
+    specs observe tier residency while an eviction is held open.
     """
-    return key in effidict.replacement_strategy.memory
+    return effidict._store.in_cache(key)
 
 
 def cached_keys(effidict):
@@ -179,12 +152,12 @@ def cached_keys(effidict):
     Issue 1.2 replaces the body with ``set(effidict._store.cache)``.
 
     Behind a helper for the same reason as :func:`in_cache`, and the reason is
-    sharper than tidiness: a spec that reads ``replacement_strategy.memory``
-    directly raises ``AttributeError`` once 1.2 removes that alias, and a strict
+    sharper than tidiness: a spec that read ``replacement_strategy.memory``
+    directly raised ``AttributeError`` once 1.2 removed that alias, and a strict
     xfail cannot tell "still broken" from "broken differently". Those guards
-    would stay red on a correct implementation instead of flipping.
+    would have stayed red on a correct implementation instead of flipping.
     """
-    return set(effidict.replacement_strategy.memory)
+    return set(effidict._store.cache)
 
 
 def cached_bytes(effidict):
@@ -192,20 +165,26 @@ def cached_bytes(effidict):
 
     Issue 1.4 gives the cache a real byte budget and ``Cache.nbytes()`` becomes
     the contract; this becomes ``effidict._store.cache.nbytes()`` then. Until
-    the cache exists, summing ``len`` over the resident values is the only
-    measure available, which is why the budget specs assert with generous
-    headroom rather than an exact figure.
+    that lands, summing ``len`` over the resident values is the only measure
+    available, which is why the budget specs assert with generous headroom
+    rather than an exact figure.
+
+    Read through ``peek``, not ``get``: measuring the cache must not reorder it.
     """
-    return sum(len(value) for value in effidict.replacement_strategy.memory.values())
+    cache = effidict._store.cache
+    total = 0
+    for key in cache:
+        total += len(cache.peek(key))
+    return total
 
 
 def on_disk(effidict, key):
     """Whether ``key`` currently sits in the persistent tier.
 
-    Uses ``keys()`` rather than ``has()`` because ``has()`` is still a contract
-    stub (issue 2.2). Becomes ``effidict._store.backend.has(key)`` in 1.2.
+    ``has()`` rather than ``keys()``: issue 1.2 gave it a naive implementation,
+    and issue 2.2 makes it cheap without changing the answer.
     """
-    return key in effidict.disk_backend.keys()
+    return effidict._store.backend.has(key)
 
 
 def assert_equal_value(actual, expected):

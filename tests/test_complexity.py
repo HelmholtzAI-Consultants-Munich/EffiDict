@@ -103,7 +103,7 @@ def test_membership_cost_does_not_grow_with_the_store(backend_cls, policy_cls, m
         for i in range(size):
             d[f"k{i:05d}"] = "v"
 
-        total, restore = _count_enumerated(d.disk_backend)
+        total, restore = _count_enumerated(d._store.backend)
         try:
             assert ("absent" in d) is False
         finally:
@@ -154,13 +154,6 @@ def test_membership_time_is_flat(make_dict):
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "a promoted entry is never marked clean, so evicting it rewrites a value "
-        "the disk already holds (issue 1.3)"
-    ),
-)
 def test_read_only_pass_performs_no_writes(make_dict, backend_spy):
     """Reading 500 keys through a 50-key cache must not write anything.
 
@@ -181,9 +174,9 @@ def test_read_only_pass_performs_no_writes(make_dict, backend_spy):
     # against a correct implementation. Seeding removes the dependency on which
     # victim the policy picks.
     for key in keys:
-        d.disk_backend.serialize(key, f"v-{key}")
+        d._store.backend.serialize(key, f"v-{key}")
 
-    with backend_spy(d.disk_backend) as spy:
+    with backend_spy(d._store.backend) as spy:
         for key in keys:
             assert d[key] == f"v-{key}"
 
@@ -220,7 +213,7 @@ def test_bulk_write_does_not_issue_one_call_per_item(make_dict, backend_spy):
     items = {f"k{i:05d}": "v" for i in range(3000)}
     d = make_dict(max_in_memory=10)
 
-    with backend_spy(d.disk_backend) as spy:
+    with backend_spy(d._store.backend) as spy:
         d.load_from_dict(items)
 
         per_item = spy.count("serialize")

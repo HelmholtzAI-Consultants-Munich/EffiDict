@@ -1,9 +1,9 @@
 """Specs for the eviction policies as pure bookkeeping -- no disk, no values.
 
 Written against the ``EvictionPolicy`` contract declared in issue 0.1 and
-implemented in issue 1.1. Today's ``*Replacement`` classes cannot satisfy these:
-they take a backend in ``__init__`` and write to it during eviction, which is
-exactly the coupling 1.1 removes.
+implemented in issue 1.1. The ``*Replacement`` classes they replaced could not
+satisfy these: they took a backend in ``__init__`` and wrote to it during
+eviction, which is exactly the coupling 1.1 removed and 1.2 deleted.
 
 **These tests pin the concrete class names too.** Issue 0.1 declared the
 ``EvictionPolicy`` base but named no implementations, so this spec fixes them as
@@ -29,8 +29,6 @@ import inspect
 from collections import abc
 
 import pytest
-
-from effidict import MFUReplacement
 
 POLICY_NAMES = ["Random", "FIFO", "LIFO", "LRU", "MRU", "LFU", "MFU"]
 
@@ -317,11 +315,10 @@ def test_lfu_evicts_the_least_frequently_used():
 def test_mfu_evicts_the_most_frequently_used():
     """MFU gives up the hottest key first.
 
-    States the contract issue 1.1 satisfies, against ``MFUPolicy``. It does not
-    reach the duplicated-class-body defect it was originally written for: that
-    lives on the legacy ``MFUReplacement``, which 1.1 leaves alone and 1.2
-    deletes. ``test_mfu_replacement_keeps_frequency_across_a_value_update``
-    below is the pin that does reach it.
+    States the contract issue 1.1 satisfies, against ``MFUPolicy``. The
+    duplicated-class-body defect this was originally written for lived on the
+    legacy ``MFUReplacement``; 1.2 deleted that class, and the spec that pinned
+    the defect went with it.
     """
     policy = _policy_class("MFU")()
     for key in ("hot", "warm", "cold"):
@@ -333,59 +330,12 @@ def test_mfu_evicts_the_most_frequently_used():
     assert policy.victim() == "hot"
 
 
-class _NullBackend:
-    """Absorbs the write an eviction performs. The shipped policies do their own
-    I/O, which issue 1.1 removes; until then a victim cannot be observed without
-    one."""
-
-    def serialize(self, key, value):
-        pass
-
-
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "MFUReplacement's surviving put() resets secondary_memory[key] to 1, so "
-        "a value update discards the key's recorded frequency and the policy "
-        "evicts by stale counts (issue 1.1)"
-    ),
-)
-def test_mfu_replacement_keeps_frequency_across_a_value_update():
-    """The *shipped* MFU policy must not forget a key's frequency on rewrite.
-
-    Aimed at ``MFUReplacement`` rather than the future ``MFUPolicy``, so it
-    actually executes the duplicated class body. Derived from the MFU rule
-    stated in this module's docstring, not from the implementation: ``a`` is used
-    four times and ``b`` twice, so ``a`` is the hottest key and MFU must give it
-    up. Rewriting ``a``'s *value* changes no usage count, so the victim is
-    unchanged by it.
-
-    The counts are what discriminate here. With the reset, ``a`` drops to 1
-    against ``b``'s 2, and the policy evicts ``b`` -- the coldest key, the exact
-    opposite of MFU.
-    """
-    policy = MFUReplacement(disk_backend=_NullBackend(), max_in_memory=2)
-    policy.put("a", "va")
-    policy.put("b", "vb")
-    for _ in range(3):
-        policy.get("a")
-    policy.get("b")
-
-    policy.put("a", "va-updated")
-    policy.put("c", "vc")
-
-    assert sorted(policy.memory) == ["b", "c"], (
-        f"MFU kept {sorted(policy.memory)}; 'a' was the hottest key (4 uses "
-        f"against 2) and should have been the victim"
-    )
-
-
 @pytest.mark.parametrize("name", POLICY_NAMES)
 def test_policy_never_touches_the_backend(name):
     """A policy must have no way to reach storage.
 
-    Today every ``*Replacement`` takes a backend and serializes its own victims,
-    which is what makes them impossible to unit-test without a filesystem.
+    Every ``*Replacement`` took a backend and serialized its own victims, which
+    is what made them impossible to unit-test without a filesystem.
 
     Checked four ways, because no single one is sufficient. A denylist of
     parameter names is the weakest: it misses ``*args``/``**kwargs``, which can

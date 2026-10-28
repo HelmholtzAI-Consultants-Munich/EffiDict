@@ -35,13 +35,12 @@ import pytest
 from effidict import (
     EffiDict,
     JSONBackend,
-    LRUReplacement,
+    LRUPolicy,
     PickleBackend,
     SqliteBackend,
 )
 
 from .conftest import release_store
-from .helpers import build_policy
 
 pytestmark = pytest.mark.stress
 
@@ -73,9 +72,8 @@ WORKER_KEYS = {f"k{i}": f"v{i}" for i in range(6)}
 def _build(backend, max_in_memory=2):
     return EffiDict(
         disk_backend=backend,
-        replacement_strategy=build_policy(
-            LRUReplacement, disk_backend=backend, max_in_memory=max_in_memory
-        ),
+        policy=LRUPolicy(),
+        max_in_memory=max_in_memory,
     )
 
 
@@ -147,19 +145,14 @@ def test_backend_is_usable_from_another_thread(request, backend_cls, storage_dir
         release_store(backend)
 
 
-@pytest.mark.xfail(
-    strict=False,  # a race; the deterministic pins are named in the docstring
-    reason=(
-        "concurrent writers lose keys: SQLite raises ProgrammingError across "
-        "threads, and the others hit the eviction gap where a key is briefly in "
-        "neither tier (issues 2.3, 1.3, 5.1)"
-    ),
-)
-def test_concurrent_writers_see_every_key(backend_cls, make_dict):
+def test_concurrent_writers_see_every_key(request, backend_cls, make_dict):
     """Eight threads writing their own keys must each read their own back.
 
-    Not strict, because it is a genuine race: measured failing 5/5 at
-    ``max_in_memory=2``, but scheduling decides, and a bet that every run loses is
+    Issue 1.2 closed the eviction gap -- the store writes a victim out before
+    dropping it, under one lock -- so the three file-backed backends now pass
+    outright. SQLite still raises ``ProgrammingError`` across threads, so it
+    keeps the marker until issue 2.3. Not strict even there: scheduling decides
+    which thread reaches the connection first, and a bet that every run loses is
     the kind of marker that XPASSes in CI at the worst moment. The deterministic
     pins for the same defects are ``test_backend_is_usable_from_another_thread``
     above and ``test_reader_never_observes_a_key_mid_eviction`` below, plus 0.4's
@@ -168,6 +161,17 @@ def test_concurrent_writers_see_every_key(backend_cls, make_dict):
     The cache is kept small on purpose: with room for the whole working set the
     eviction gap never opens and the race cannot be observed at all.
     """
+    if backend_cls is SqliteBackend:
+        request.applymarker(
+            pytest.mark.xfail(
+                strict=False,  # a race; see the docstring
+                reason=(
+                    "concurrent writers lose keys: SQLite raises "
+                    "ProgrammingError across threads (issue 2.3)"
+                ),
+            )
+        )
+
     d = make_dict(max_in_memory=2)
     failures = []
 
@@ -228,16 +232,7 @@ def test_concurrent_writers_see_every_key(backend_cls, make_dict):
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "eviction drops the cache copy before the disk write completes, so a "
-        "concurrent reader sees the key as absent (issues 1.3, 5.1). On SQLite "
-        "the evicting write additionally fails with the thread-affinity error, "
-        "which this probe asserts rather than swallows (issue 2.3)"
-    ),
-)
-def test_reader_never_observes_a_key_mid_eviction(backend_cls, make_dict):
+def test_reader_never_observes_a_key_mid_eviction(request, backend_cls, make_dict):
     """A reader must never see a key vanish while it is being written out.
 
     Deterministic by construction: the probe blocks *inside* ``serialize`` on an
@@ -263,12 +258,28 @@ def test_reader_never_observes_a_key_mid_eviction(backend_cls, make_dict):
     implementation answer from post-write state and XPASS a strict marker, five
     times per stress run. The waits below are 10s liveness bounds, the same ones
     used elsewhere in this file, not timing discriminators.
+
+    Backend-scoped rather than blanket since issue 1.2, which made eviction
+    write *then* drop. On SQLite the evicting write still fails with the
+    thread-affinity error, which this probe asserts rather than swallows, so
+    that backend stays red until issue 2.3.
     """
+    if backend_cls is SqliteBackend:
+        request.applymarker(
+            pytest.mark.xfail(
+                strict=True,
+                reason=(
+                    "the evicting write raises the SQLite thread-affinity error, "
+                    "so the held-open write never completes (issue 2.3)"
+                ),
+            )
+        )
+
     d = make_dict(max_in_memory=2)
     d["k0"] = "v0"
     d["k1"] = "v1"
 
-    original = d.disk_backend.serialize
+    original = d._store.backend.serialize
     started = threading.Event()
     release = threading.Event()
     victim = {}
@@ -289,7 +300,7 @@ def test_reader_never_observes_a_key_mid_eviction(backend_cls, make_dict):
         except Exception as exc:  # noqa: BLE001
             writer_error["exc"] = exc
 
-    d.disk_backend.serialize = blocking_serialize
+    d._store.backend.serialize = blocking_serialize
     writer = threading.Thread(target=write, daemon=True)
     writer.start()
     try:
@@ -305,16 +316,16 @@ def test_reader_never_observes_a_key_mid_eviction(backend_cls, make_dict):
         # descheduled between that line and the subscript, the writer finishes,
         # and the probe then reports a mid-eviction read that never happened.
         # Patched on the instance and restored in the finally below, like the
-        # blocking serialize above. Issue 1.2 moves this delegation to
-        # ``Store.get``; the hook moves with it.
-        original_lookup = d.replacement_strategy.get
+        # blocking serialize above. Issue 1.2 moved this delegation to
+        # ``Store.get``, and the hook moved with it.
+        original_lookup = d._store.get
 
         def instrumented_lookup(wanted):
             if wanted == key:
                 entered.set()
             return original_lookup(wanted)
 
-        d.replacement_strategy.get = instrumented_lookup
+        d._store.get = instrumented_lookup
 
         def read():
             try:
@@ -389,9 +400,9 @@ def test_reader_never_observes_a_key_mid_eviction(backend_cls, make_dict):
     finally:
         release.set()  # idempotent; frees the writer if an assertion above failed
         writer.join(WAIT_SECONDS)
-        d.disk_backend.serialize = original
+        d._store.backend.serialize = original
         if "instrumented_lookup" in locals():
-            d.replacement_strategy.get = original_lookup
+            d._store.get = original_lookup
 
 
 # --------------------------------------------------------------------------
@@ -596,19 +607,13 @@ _WRITER = textwrap.dedent(
     """
     import sys
     sys.path.insert(0, {repo!r})
-    from effidict import EffiDict, {backend}, LRUReplacement
-    # Through the same helper the in-process specs use: issue 1.1 drops both of
-    # these arguments, and a child that hard-codes them would die on TypeError
-    # rather than exercise what it was launched for. The repo root is already on
-    # sys.path above, so tests.helpers is importable here.
-    from tests.helpers import build_policy
+    from effidict import EffiDict, {backend}, LRUPolicy
 
     backend = {backend}.open_or_create({path!r})
     store = EffiDict(
         disk_backend=backend,
-        replacement_strategy=build_policy(
-            LRUReplacement, disk_backend=backend, max_in_memory=4
-        ),
+        policy=LRUPolicy(),
+        max_in_memory=4,
     )
     for key, value in {items!r}.items():
         store[key] = value

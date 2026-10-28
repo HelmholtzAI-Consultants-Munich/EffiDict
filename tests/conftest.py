@@ -22,20 +22,18 @@ import pytest
 
 from effidict import (
     EffiDict,
-    FIFOReplacement,
+    FIFOPolicy,
     Hdf5Backend,
     JSONBackend,
-    LFUReplacement,
-    LIFOReplacement,
-    LRUReplacement,
-    MFUReplacement,
-    MRUReplacement,
+    LFUPolicy,
+    LIFOPolicy,
+    LRUPolicy,
+    MFUPolicy,
+    MRUPolicy,
     PickleBackend,
-    RandomReplacement,
+    RandomPolicy,
     SqliteBackend,
 )
-
-from .helpers import build_policy
 
 try:
     import h5py
@@ -49,20 +47,20 @@ pytest_plugins = ["pytester"]
 BACKENDS = [SqliteBackend, PickleBackend, JSONBackend, Hdf5Backend]
 
 POLICIES = [
-    RandomReplacement,
-    FIFOReplacement,
-    LIFOReplacement,
-    LRUReplacement,
-    MRUReplacement,
-    LFUReplacement,
-    MFUReplacement,
+    RandomPolicy,
+    FIFOPolicy,
+    LIFOPolicy,
+    LRUPolicy,
+    MRUPolicy,
+    LFUPolicy,
+    MFUPolicy,
 ]
 
 #: Used when a test asks for `make_dict` without joining the matrix. Pickle
 #: accepts every value kind and LRU is the most common policy, so an
 #: unparametrized test exercises the least surprising combination.
 DEFAULT_BACKEND = PickleBackend
-DEFAULT_POLICY = LRUReplacement
+DEFAULT_POLICY = LRUPolicy
 
 
 def backend_marks(backend_cls):
@@ -86,11 +84,7 @@ def backend_cls(request):
 
 @pytest.fixture(params=POLICIES, ids=[cls.__name__ for cls in POLICIES])
 def policy_cls(request):
-    """One replacement policy class per parametrization.
-
-    Named ``policy`` rather than ``strategy`` for the post-1.1 API; it currently
-    receives the ``*Replacement`` classes.
-    """
+    """One eviction policy class per parametrization."""
     return request.param
 
 
@@ -186,14 +180,11 @@ def make_dict(request, storage_dir, _open_stores):
 
         effidict = EffiDict(
             disk_backend=disk_backend,
-            # Through build_policy, like every other construction site: issue
-            # 1.1 drops both of these arguments, and this is the fixture nearly
-            # every spec in the suite goes through -- hard-coding them here would
-            # fail the whole suite at fixture construction rather than let each
-            # spec fail on the thing it actually pins.
-            replacement_strategy=build_policy(
-                policy, disk_backend=disk_backend, max_in_memory=max_in_memory
-            ),
+            # A policy takes no constructor arguments since issue 1.1, and the
+            # bound it used to carry is now the cache's item budget, which the
+            # facade routes through for us.
+            policy=policy(),
+            max_in_memory=max_in_memory,
             # Passed unconditionally: silently dropping it would let issue 0.4's
             # byte-budget spec pass a budget that never arrives.
             max_bytes=max_bytes,

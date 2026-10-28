@@ -119,15 +119,13 @@ _ORDER_SCRIPT = textwrap.dedent(
     """
     import sys
     sys.path.insert(0, {repo!r})
-    from effidict import EffiDict, {backend}, FIFOReplacement
-    from tests.helpers import build_policy  # see the note in test_concurrency
+    from effidict import EffiDict, {backend}, FIFOPolicy
 
     backend = {backend}({path!r})
     store = EffiDict(
         disk_backend=backend,
-        replacement_strategy=build_policy(
-            FIFOReplacement, disk_backend=backend, max_in_memory=4
-        ),
+        policy=FIFOPolicy(),
+        max_in_memory=4,
     )
     for key in {keys!r}:
         store[key] = key
@@ -450,8 +448,8 @@ def test_eq_does_not_mutate_either_operand(
     # Both operands are spied. __eq__ walks self.items() *and* reads other[key],
     # so the right-hand store is promoted too -- watching only the left would let
     # a mutation of the right slip past the assertion this test makes.
-    with backend_spy(left.disk_backend) as left_spy:
-        with backend_spy(right.disk_backend) as right_spy:
+    with backend_spy(left._store.backend) as left_spy:
+        with backend_spy(right._store.backend) as right_spy:
             assert left == right
 
             left_writes = left_spy.count("serialize") + left_spy.count("write_many")
@@ -522,10 +520,10 @@ def test_facade_iter_keys_streams_the_whole_keyspace(make_dict, backend_spy):
     # union has to be a union rather than a concatenation.
     dual = expected[-1]
     assert in_cache(d, dual), "precondition: the last write is still cached"
-    d.disk_backend.serialize(dual, f"v-{dual}")
+    d._store.backend.serialize(dual, f"v-{dual}")
     assert on_disk(d, dual), "precondition: the probe key is now in both tiers"
 
-    with backend_spy(d.disk_backend) as spy:
+    with backend_spy(d._store.backend) as spy:
         stream = d.iter_keys()
 
         assert iter(stream) is stream, (
