@@ -21,6 +21,54 @@ class _Missing:
 MISSING = _Missing()
 
 
+class _ReentrancyGuard:
+    """The store's lock, with same-thread re-entry turned into an error.
+
+    Nothing in :class:`Store` re-enters; the callers that can are finalizers,
+    and they arrive in the middle of whatever tier operation was running. A
+    plain lock hangs on them with no diagnosis, and a reentrant one lets them
+    read the half-applied state I4 exists to hide. Refusing is the third
+    option and the only safe one: the re-entrant call never runs, so it cannot
+    observe anything, and the operation underneath it is left alone.
+
+    ``_owner`` is read without holding anything, which is safe because only the
+    thread holding the lock ever writes an id to it. Another thread reads
+    either ``None`` or an id that is not its own, and in both cases goes on to
+    block on the real lock.
+    """
+
+    def __init__(self, lock):
+        self._lock = lock
+        self._owner = None
+
+    def __enter__(self):
+        current = threading.get_ident()
+        if self._owner == current:
+            raise RuntimeError(
+                "Store operation re-entered on the same thread. A stored "
+                "value's __del__ called back into the store -- directly, or "
+                "because the cyclic garbage collector ran that finalizer "
+                "inside an unrelated store operation. Re-entry cannot be "
+                "served: it would read a half-applied operation. Keep the "
+                "store out of the finalizer."
+            )
+        self._lock.acquire()
+        self._owner = current
+        return self
+
+    def __exit__(self, *exc_info):
+        # Bind ``release`` before clearing the owner. Between the two this
+        # thread holds a lock it no longer claims, and a finalizer arriving in
+        # that window would read ``_owner is None``, miss the re-entry and
+        # block on a lock its own thread holds. Binding first leaves nothing
+        # that can allocate in between, so the collector cannot run there.
+        # A lock whose ``release`` is itself written in Python reopens the
+        # window inside that call; the stdlib locks used here do not.
+        release = self._lock.release
+        self._owner = None
+        release()
+
+
 class Store:
     """The single owner of where a key lives.
 
@@ -61,11 +109,19 @@ class Store:
     local ``released`` list and let it die after the ``with`` block, which runs
     those finalizers against a store that is whole again.
 
-    This makes re-entry impossible rather than reentrant, which is why the
-    default lock is a plain :class:`threading.Lock`. It does not cover a value
-    whose *serialization* hooks re-enter -- ``__reduce__`` runs under the lock
-    by necessity, since I4 forbids releasing it around the write -- and such a
-    value deadlocks by design.
+    Deferral reaches only the references this class drops. A value in a
+    reference *cycle* outlives them: the collector frees it whenever it next
+    runs, which may be inside any later locked operation, and no refcount-side
+    strategy can reach that. Nor does deferral help a value whose
+    ``__reduce__`` re-enters, since pickling runs under the lock by necessity
+    -- I4 forbids releasing it around the write.
+
+    What is left over is therefore reported rather than allowed or waited on:
+    the lock is a :class:`_ReentrancyGuard`, which raises on same-thread
+    re-entry. Measured, with a collection forced inside the lock: a bare
+    ``Lock`` hangs there indefinitely, and the guard raises instead, leaving
+    the operation underneath untouched. CPython prints the error from the
+    finalizer and carries on.
     """
 
     def __init__(self, backend, cache, lock=None, owns_storage: bool = True):
@@ -81,11 +137,13 @@ class Store:
         # ``Lock`` protocol of PLAN.md 3.6, which need not be reentrant.
         #
         # Reentrant by default would not make the one caller that re-enters on
-        # its own -- a finalizer, run the instant a value's last reference
-        # goes -- correct; it would only let it observe a half-applied
-        # operation. The ``released`` lists in the mutating methods keep that
-        # from happening at all: see the class docstring.
-        self._lock = threading.Lock() if lock is None else lock
+        # its own -- a finalizer -- correct; it would only let it observe a
+        # half-applied operation. The ``released`` lists stop the finalizers
+        # this class triggers itself; the guard catches the rest, including the
+        # ones the cyclic collector runs. See the class docstring.
+        self._lock = _ReentrancyGuard(
+            threading.Lock() if lock is None else lock
+        )
         self._owns_storage = owns_storage
 
     @property

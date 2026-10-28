@@ -31,6 +31,7 @@ below, which construct ``Cache(...)`` and ``Store(...)`` directly.
 
 from __future__ import annotations
 
+import gc
 import inspect
 import threading
 
@@ -764,6 +765,119 @@ def test_a_finalizer_never_runs_inside_a_tier_operation(
             )
     finally:
         _FINALIZER_PROBES.pop(tag, None)
+        backend.destroy()
+
+
+class _CollectsOnWrite(PickleBackend):
+    """A backend whose write runs a cyclic collection.
+
+    Stands in for the one thing a test cannot schedule: the collector tripping
+    its threshold partway through a locked operation. Writing allocates, so the
+    real collector may do exactly this at any time -- but *when* is not
+    controllable, and waiting for it does not make a guard. Measured on this
+    tree: 400 store operations under ``gc.set_threshold(1, 1, 1)`` put zero
+    collections inside the critical section, because the surrounding code
+    allocated first every time. Forcing the collection moves the rarity out of
+    the test without changing what is being tested.
+    """
+
+    def serialize(self, key, value):
+        gc.collect()
+        return super().serialize(key, value)
+
+
+def test_a_cyclic_value_cannot_deadlock_the_store(storage_dir):
+    """Re-entry the deferral cannot reach must report itself, not hang.
+
+    The ``released`` lists in ``Store`` hold a displaced value past the unlock,
+    which covers every finalizer that *refcounting* would run. A value in a
+    reference cycle is not one of them: dropping the last reference does not
+    free it, and the collector does, whenever it next runs -- which may be deep
+    inside an unrelated locked operation. No refcount-side strategy reaches
+    that, so the lock refuses same-thread re-entry instead.
+
+    Refusing is what is asserted, not merely surviving. A bare ``Lock`` hangs
+    here, which the bounded wait catches; a reentrant one would let the
+    finalizer through to read a half-applied operation, and then ``contains``
+    returns a bool rather than raising. Only the guard gives ``RuntimeError``,
+    so the error *is* the evidence that the finalizer ran inside the lock.
+
+    Automatic collection is off for the duration, which removes scheduling
+    nondeterminism rather than the hazard: with it on, an incidental collection
+    between the ``delete`` below and the worker could reap the cycle early and
+    the test would pass without having tested anything.
+    """
+    backend = _CollectsOnWrite(str(storage_dir / "store"))
+    recorded = []
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        store = Store(
+            backend=backend,
+            cache=Cache(policy=RecordingPolicy(), max_items=1),
+        )
+
+        class Cyclic:
+            """Refers to itself, so only the collector can free it."""
+
+            def __init__(self):
+                self.self_ref = self
+
+            def __del__(self):
+                try:
+                    recorded.append(("returned", store.contains("a")))
+                except BaseException as exc:  # noqa: BLE001 - inspected below
+                    recorded.append(("raised", exc))
+
+        store.set("cyclic", Cyclic())
+        store.delete("cyclic")  # unreachable now; the cycle keeps it alive
+
+        finished = threading.Event()
+        failure = {}
+
+        def run():
+            try:
+                store.set("a", "va")
+                store.set("b", "vb")  # over budget -> serialize -> collect
+            except Exception as exc:  # noqa: BLE001 - re-raised below
+                failure["exc"] = exc
+            finally:
+                finished.set()
+
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        assert finished.wait(5.0), (
+            "a cyclic value's __del__ ran inside the lock and blocked on it: "
+            "the write never returned"
+        )
+        if "exc" in failure:
+            raise AssertionError(
+                f"the write raised {failure['exc']!r} on a worker thread"
+            ) from failure["exc"]
+
+        assert len(recorded) == 1, (
+            f"the cyclic finalizer ran {len(recorded)} times; the test proves "
+            f"nothing unless the collector reaped it during the write"
+        )
+        kind, detail = recorded[0]
+        assert kind == "raised", (
+            f"the finalizer re-entered the store and was served: contains() "
+            f"returned {detail!r} from inside a half-applied operation"
+        )
+        assert isinstance(detail, RuntimeError), (
+            f"re-entry raised {detail!r}, which says nothing a caller can act "
+            f"on; it should name the re-entry"
+        )
+        assert "re-entered" in str(detail), (
+            f"the re-entry error does not explain itself: {detail}"
+        )
+
+        # The refused call must leave the operation under it alone.
+        assert store.get("b") == "vb", "the write that was re-entered was lost"
+        assert not store.contains("cyclic"), "the deleted key came back"
+    finally:
+        if was_enabled:
+            gc.enable()
         backend.destroy()
 
 
