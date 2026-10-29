@@ -1,4 +1,5 @@
-"""Value catalogue and comparison helper shared by every Phase 0 spec.
+"""Scaffolding shared by every Phase 0 spec: the value catalogue, the
+comparison helper, and the conventions two or more spec files have to agree on.
 
 The per-backend tables below were derived by round-tripping each value through
 each backend, not by reading the source. Anything asserted here is observed
@@ -11,6 +12,8 @@ from __future__ import annotations
 import inspect
 import math
 import os
+
+import pytest
 
 try:
     import numpy as np
@@ -269,3 +272,42 @@ def store_bytes(path):
         for filename in filenames:
             total += os.path.getsize(os.path.join(dirpath, filename))
     return total
+
+
+# --------------------------------------------------------------------------
+# holding an eviction open
+# --------------------------------------------------------------------------
+
+#: How long a probe keeps a write blocked inside ``serialize``, and how long it
+#: waits for anything to happen. HOLD must comfortably exceed the *sum* of the
+#: waits performed while the write is held, or the hold expires mid-inspection:
+#: the write completes, and the tier state the probe then examines is
+#: post-write, where a drop-then-write implementation is indistinguishable from
+#: a compliant one. Both numbers are liveness bounds, never discriminators --
+#: nothing here decides what happened by how long it took. The ``finally`` in
+#: each probe releases the hold, so HOLD is only ever reached if the test itself
+#: wedged.
+HOLD_SECONDS = 120
+WAIT_SECONDS = 10
+
+
+def xfail_sqlite_held_write(request, backend_cls):
+    """Mark the held-open-write probes xfail on SQLite, for a reason of its own.
+
+    Both probes start an evicting write and block it inside ``serialize``. On
+    SQLite that write raises the thread-affinity error instead (issue 2.3), so
+    it never completes and neither probe observes the thing it is about. They
+    assert the writer's outcome rather than swallowing it, which is what makes
+    this a marker and not a skip: once issue 2.3 lands, the strict xfail turns
+    the silence back into a failure.
+    """
+    if backend_cls is SqliteBackend:
+        request.applymarker(
+            pytest.mark.xfail(
+                strict=True,
+                reason=(
+                    "the evicting write raises the SQLite thread-affinity error, "
+                    "so the held-open write never completes (issue 2.3)"
+                ),
+            )
+        )

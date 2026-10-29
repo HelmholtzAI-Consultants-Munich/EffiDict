@@ -557,6 +557,59 @@ def test_cache_get_reads_and_records_the_access():
         cache.get("absent")
 
 
+#: How long a lock test waits for a call that should have returned at once.
+#: A liveness bound, never a discriminator: nothing here decides what happened
+#: by how long it took, and a call answering at 4.9s passes like one answering
+#: immediately. It exists only because the failure these tests look for is a
+#: thread that never comes back, which no assertion on that thread can catch.
+WORKER_SECONDS = 5.0
+
+
+def _runs_without_blocking(call, label, diagnosis):
+    """Run ``call`` on a worker thread and fail, rather than hang, if it blocks.
+
+    ``diagnosis`` is what a timeout would mean, and is the whole finding: a
+    hang is the only symptom the caller ever sees, so the message has to say
+    which lock was taken twice and by whom.
+
+    The worker's own exception is re-raised rather than swallowed, because a
+    call that *died* still sets the event -- liveness alone would pass it.
+    """
+    finished = threading.Event()
+    failure = {}
+
+    def run():
+        try:
+            call()
+        except Exception as exc:  # noqa: BLE001 - re-raised below
+            failure["exc"] = exc
+        finally:
+            finished.set()
+
+    threading.Thread(target=run, daemon=True).start()
+    assert finished.wait(WORKER_SECONDS), diagnosis
+    if "exc" in failure:
+        raise AssertionError(
+            f"{label} raised {failure['exc']!r} on a worker thread"
+        ) from failure["exc"]
+
+
+@pytest.fixture
+def manual_collection():
+    """Turn automatic collection off for the test, and back on afterwards.
+
+    Removes scheduling nondeterminism rather than the hazard the cyclic tests
+    probe: with it on, an incidental collection before the probe runs could
+    reap the cycle early and the test would pass without having tested
+    anything. Each of those tests forces the collection it wants instead.
+    """
+    was_enabled = gc.isenabled()
+    gc.disable()
+    yield
+    if was_enabled:
+        gc.enable()
+
+
 def test_store_works_with_a_non_reentrant_lock(storage_dir):
     """Every operation must acquire the lock exactly once.
 
@@ -597,27 +650,12 @@ def test_store_works_with_a_non_reentrant_lock(storage_dir):
             ("delete", lambda: store.delete("b")),
             ("clear", lambda: store.clear()),
         ):
-            finished = threading.Event()
-            failure = {}
-
-            def run(call=call):
-                try:
-                    call()
-                except Exception as exc:  # noqa: BLE001 - re-raised below
-                    failure["exc"] = exc
-                finally:
-                    finished.set()
-
-            worker = threading.Thread(target=run, daemon=True)
-            worker.start()
-            assert finished.wait(5.0), (
-                f"Store.{label} did not return within 5s under a plain Lock, "
-                f"so it acquires the lock more than once"
+            _runs_without_blocking(
+                call,
+                f"Store.{label}",
+                f"Store.{label} did not return within {WORKER_SECONDS}s under "
+                f"a plain Lock, so it acquires the lock more than once",
             )
-            if "exc" in failure:
-                raise AssertionError(
-                    f"Store.{label} raised {failure['exc']!r} on a worker thread"
-                ) from failure["exc"]
     finally:
         backend.destroy()
 
@@ -722,27 +760,13 @@ def test_a_finalizer_never_runs_inside_a_tier_operation(
             "delete": lambda: store.delete("k"),
             "clear": lambda: store.clear(),
         }
-        finished = threading.Event()
-        failure = {}
-
-        def run():
-            try:
-                actions[operation]()
-            except Exception as exc:  # noqa: BLE001 - re-raised below
-                failure["exc"] = exc
-            finally:
-                finished.set()
-
-        worker = threading.Thread(target=run, daemon=True)
-        worker.start()
-        assert finished.wait(5.0), (
-            f"{operation} did not return within 5s: the displaced value's "
-            f"__del__ ran while the lock was held and blocked on it"
+        _runs_without_blocking(
+            actions[operation],
+            operation,
+            f"{operation} did not return within {WORKER_SECONDS}s: the "
+            f"displaced value's __del__ ran while the lock was held and "
+            f"blocked on it",
         )
-        if "exc" in failure:
-            raise AssertionError(
-                f"{operation} raised {failure['exc']!r} on a worker thread"
-            ) from failure["exc"]
 
         assert len(observed) == 1, (
             f"the finalizer ran {len(observed)} times during {operation}; the "
@@ -765,119 +789,6 @@ def test_a_finalizer_never_runs_inside_a_tier_operation(
             )
     finally:
         _FINALIZER_PROBES.pop(tag, None)
-        backend.destroy()
-
-
-class _CollectsOnWrite(PickleBackend):
-    """A backend whose write runs a cyclic collection.
-
-    Stands in for the one thing a test cannot schedule: the collector tripping
-    its threshold partway through a locked operation. Writing allocates, so the
-    real collector may do exactly this at any time -- but *when* is not
-    controllable, and waiting for it does not make a guard. Measured on this
-    tree: 400 store operations under ``gc.set_threshold(1, 1, 1)`` put zero
-    collections inside the critical section, because the surrounding code
-    allocated first every time. Forcing the collection moves the rarity out of
-    the test without changing what is being tested.
-    """
-
-    def serialize(self, key, value):
-        gc.collect()
-        return super().serialize(key, value)
-
-
-def test_a_cyclic_value_cannot_deadlock_the_store(storage_dir):
-    """Re-entry the deferral cannot reach must report itself, not hang.
-
-    The ``released`` lists in ``Store`` hold a displaced value past the unlock,
-    which covers every finalizer that *refcounting* would run. A value in a
-    reference cycle is not one of them: dropping the last reference does not
-    free it, and the collector does, whenever it next runs -- which may be deep
-    inside an unrelated locked operation. No refcount-side strategy reaches
-    that, so the lock refuses same-thread re-entry instead.
-
-    Refusing is what is asserted, not merely surviving. A bare ``Lock`` hangs
-    here, which the bounded wait catches; a reentrant one would let the
-    finalizer through to read a half-applied operation, and then ``contains``
-    returns a bool rather than raising. Only the guard gives ``RuntimeError``,
-    so the error *is* the evidence that the finalizer ran inside the lock.
-
-    Automatic collection is off for the duration, which removes scheduling
-    nondeterminism rather than the hazard: with it on, an incidental collection
-    between the ``delete`` below and the worker could reap the cycle early and
-    the test would pass without having tested anything.
-    """
-    backend = _CollectsOnWrite(str(storage_dir / "store"))
-    recorded = []
-    was_enabled = gc.isenabled()
-    gc.disable()
-    try:
-        store = Store(
-            backend=backend,
-            cache=Cache(policy=RecordingPolicy(), max_items=1),
-        )
-
-        class Cyclic:
-            """Refers to itself, so only the collector can free it."""
-
-            def __init__(self):
-                self.self_ref = self
-
-            def __del__(self):
-                try:
-                    recorded.append(("returned", store.contains("a")))
-                except BaseException as exc:  # noqa: BLE001 - inspected below
-                    recorded.append(("raised", exc))
-
-        store.set("cyclic", Cyclic())
-        store.delete("cyclic")  # unreachable now; the cycle keeps it alive
-
-        finished = threading.Event()
-        failure = {}
-
-        def run():
-            try:
-                store.set("a", "va")
-                store.set("b", "vb")  # over budget -> serialize -> collect
-            except Exception as exc:  # noqa: BLE001 - re-raised below
-                failure["exc"] = exc
-            finally:
-                finished.set()
-
-        worker = threading.Thread(target=run, daemon=True)
-        worker.start()
-        assert finished.wait(5.0), (
-            "a cyclic value's __del__ ran inside the lock and blocked on it: "
-            "the write never returned"
-        )
-        if "exc" in failure:
-            raise AssertionError(
-                f"the write raised {failure['exc']!r} on a worker thread"
-            ) from failure["exc"]
-
-        assert len(recorded) == 1, (
-            f"the cyclic finalizer ran {len(recorded)} times; the test proves "
-            f"nothing unless the collector reaped it during the write"
-        )
-        kind, detail = recorded[0]
-        assert kind == "raised", (
-            f"the finalizer re-entered the store and was served: contains() "
-            f"returned {detail!r} from inside a half-applied operation"
-        )
-        assert isinstance(detail, RuntimeError), (
-            f"re-entry raised {detail!r}, which says nothing a caller can act "
-            f"on; it should name the re-entry"
-        )
-        assert "re-entered" in str(detail), (
-            f"the re-entry error does not explain itself: {detail}"
-        )
-
-        # The refused call must leave the operation under it alone.
-        assert store.get("b") == "vb", "the write that was re-entered was lost"
-        assert not store.contains("cyclic"), "the deleted key came back"
-    finally:
-        if was_enabled:
-            gc.enable()
         backend.destroy()
 
 
@@ -930,7 +841,77 @@ def _assert_reentry_was_refused(recorded, during):
     )
 
 
-def test_stores_sharing_one_lock_share_re_entry_detection(storage_dir):
+class _CollectsOnWrite(PickleBackend):
+    """A backend whose write runs a cyclic collection.
+
+    Stands in for the one thing a test cannot schedule: the collector tripping
+    its threshold partway through a locked operation. Writing allocates, so the
+    real collector may do exactly this at any time -- but *when* is not
+    controllable, and waiting for it does not make a guard. Measured on this
+    tree: 400 store operations under ``gc.set_threshold(1, 1, 1)`` put zero
+    collections inside the critical section, because the surrounding code
+    allocated first every time. Forcing the collection moves the rarity out of
+    the test without changing what is being tested.
+    """
+
+    def serialize(self, key, value):
+        gc.collect()
+        return super().serialize(key, value)
+
+
+def test_a_cyclic_value_cannot_deadlock_the_store(storage_dir, manual_collection):
+    """Re-entry the deferral cannot reach must report itself, not hang.
+
+    The ``released`` lists in ``Store`` hold a displaced value past the unlock,
+    which covers every finalizer that *refcounting* would run. A value in a
+    reference cycle is not one of them: dropping the last reference does not
+    free it, and the collector does, whenever it next runs -- which may be deep
+    inside an unrelated locked operation. No refcount-side strategy reaches
+    that, so the lock refuses same-thread re-entry instead.
+
+    Refusing is what is asserted, not merely surviving. A bare ``Lock`` hangs
+    here, which the bounded wait catches; a reentrant one would let the
+    finalizer through to read a half-applied operation, and then ``contains``
+    returns a bool rather than raising. Only the guard gives ``RuntimeError``,
+    so the error *is* the evidence that the finalizer ran inside the lock.
+
+    """
+    backend = _CollectsOnWrite(str(storage_dir / "store"))
+    recorded = []
+    try:
+        store = Store(
+            backend=backend,
+            cache=Cache(policy=RecordingPolicy(), max_items=1),
+        )
+
+        store.set(
+            "cyclic", _cycle_that_probes(recorded, lambda: store.contains("a"))
+        )
+        store.delete("cyclic")  # unreachable now; the cycle keeps it alive
+
+        def drive():
+            store.set("a", "va")
+            store.set("b", "vb")  # over budget -> serialize -> collect
+
+        _runs_without_blocking(
+            drive,
+            "the write",
+            "a cyclic value's __del__ ran inside the lock and blocked on it: "
+            "the write never returned",
+        )
+
+        _assert_reentry_was_refused(recorded, "the write")
+
+        # The refused call must leave the operation under it alone.
+        assert store.get("b") == "vb", "the write that was re-entered was lost"
+        assert not store.contains("cyclic"), "the deleted key came back"
+    finally:
+        backend.destroy()
+
+
+def test_stores_sharing_one_lock_share_re_entry_detection(
+    storage_dir, manual_collection
+):
     """One lock means one critical section, so it must mean one answer.
 
     ``Store`` takes an injected lock precisely so several stores can be held
@@ -944,8 +925,6 @@ def test_stores_sharing_one_lock_share_re_entry_detection(storage_dir):
     a_backend = _CollectsOnWrite(str(storage_dir / "a"))
     b_backend = PickleBackend(str(storage_dir / "b"))
     recorded = []
-    was_enabled = gc.isenabled()
-    gc.disable()
     try:
         lock = threading.Lock()
         a = Store(
@@ -963,29 +942,17 @@ def test_stores_sharing_one_lock_share_re_entry_detection(storage_dir):
         a.set("cyclic", _cycle_that_probes(recorded, lambda: b.contains("other")))
         a.delete("cyclic")  # unreachable now; the cycle keeps it alive
 
-        finished = threading.Event()
-        failure = {}
+        def drive():
+            a.set("x", "vx")
+            a.set("y", "vy")  # over budget -> serialize -> collect
 
-        def run():
-            try:
-                a.set("x", "vx")
-                a.set("y", "vy")  # over budget -> serialize -> collect
-            except Exception as exc:  # noqa: BLE001 - re-raised below
-                failure["exc"] = exc
-            finally:
-                finished.set()
-
-        worker = threading.Thread(target=run, daemon=True)
-        worker.start()
-        assert finished.wait(5.0), (
+        _runs_without_blocking(
+            drive,
+            "the write",
             "a finalizer collected inside one store's operation queried the "
             "other store sharing its lock, and blocked on it: the write never "
-            "returned"
+            "returned",
         )
-        if "exc" in failure:
-            raise AssertionError(
-                f"the write raised {failure['exc']!r} on a worker thread"
-            ) from failure["exc"]
 
         _assert_reentry_was_refused(recorded, "a store sharing the lock")
 
@@ -993,8 +960,6 @@ def test_stores_sharing_one_lock_share_re_entry_detection(storage_dir):
         assert a.get("y") == "vy", "the write that was re-entered was lost"
         assert b.get("other") == "untouched", "the queried store was disturbed"
     finally:
-        if was_enabled:
-            gc.enable()
         a_backend.destroy()
         b_backend.destroy()
 
@@ -1029,7 +994,9 @@ class _CollectingLock:
 
 
 @pytest.mark.parametrize("collect_in", ["acquire", "release"])
-def test_an_injected_python_lock_cannot_hide_re_entry(collect_in, storage_dir):
+def test_an_injected_python_lock_cannot_hide_re_entry(
+    collect_in, storage_dir, manual_collection
+):
     """Ownership has to span the lock calls, not sit between them.
 
     A finalizer run by a collection inside the injected lock's own ``acquire``
@@ -1041,8 +1008,6 @@ def test_an_injected_python_lock_cannot_hide_re_entry(collect_in, storage_dir):
     """
     backend = PickleBackend(str(storage_dir / "store"))
     recorded = []
-    was_enabled = gc.isenabled()
-    gc.disable()
     try:
         store = Store(
             backend=backend,
@@ -1054,33 +1019,16 @@ def test_an_injected_python_lock_cannot_hide_re_entry(collect_in, storage_dir):
         )
         store.delete("cyclic")  # unreachable now; the cycle keeps it alive
 
-        finished = threading.Event()
-        failure = {}
-
-        def run():
-            try:
-                store.set("x", "vx")
-            except Exception as exc:  # noqa: BLE001 - re-raised below
-                failure["exc"] = exc
-            finally:
-                finished.set()
-
-        worker = threading.Thread(target=run, daemon=True)
-        worker.start()
-        assert finished.wait(5.0), (
+        _runs_without_blocking(
+            lambda: store.set("x", "vx"),
+            "the write",
             f"a finalizer collected inside the lock's own {collect_in}() "
-            f"re-entered the store and blocked: the write never returned"
+            f"re-entered the store and blocked: the write never returned",
         )
-        if "exc" in failure:
-            raise AssertionError(
-                f"the write raised {failure['exc']!r} on a worker thread"
-            ) from failure["exc"]
 
         _assert_reentry_was_refused(recorded, f"the lock's {collect_in}()")
         assert store.get("x") == "vx", "the write that was re-entered was lost"
     finally:
-        if was_enabled:
-            gc.enable()
         backend.destroy()
 
 

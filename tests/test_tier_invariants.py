@@ -22,24 +22,15 @@ import pytest
 from effidict import DiskBackend, EvictionPolicy, SqliteBackend
 
 from .helpers import (
+    HOLD_SECONDS,
     PROMOTING_POLICIES,
+    WAIT_SECONDS,
     cached_bytes,
     cached_keys,
     in_cache,
     on_disk,
+    xfail_sqlite_held_write,
 )
-
-#: How long a probe keeps a write blocked inside ``serialize``, and how long it
-#: waits for anything to happen. HOLD must comfortably exceed the *sum* of the
-#: waits performed while the write is held, or the hold expires mid-inspection:
-#: the write completes, and the tier state the probe then examines is
-#: post-write, where a drop-then-write implementation is indistinguishable from
-#: a compliant one. Both numbers are liveness bounds, never discriminators --
-#: nothing here decides what happened by how long it took. The ``finally`` in
-#: each probe releases the hold, so HOLD is only ever reached if the test itself
-#: wedged.
-HOLD_SECONDS = 120
-WAIT_SECONDS = 10
 
 FILLER = [f"filler{i}" for i in range(12)]
 
@@ -190,16 +181,7 @@ def test_no_key_is_ever_absent_from_both_tiers(
     and the eviction runs on a worker -- which the writer-error assertion below
     catches, so those seven cases stay red until that lands.
     """
-    if backend_cls is SqliteBackend:
-        request.applymarker(
-            pytest.mark.xfail(
-                strict=True,
-                reason=(
-                    "the evicting write raises the SQLite thread-affinity error, "
-                    "so the held-open write never completes (issue 2.3)"
-                ),
-            )
-        )
+    xfail_sqlite_held_write(request, backend_cls)
 
     d = make_dict(max_in_memory=2)
     d["k0"] = "v0"

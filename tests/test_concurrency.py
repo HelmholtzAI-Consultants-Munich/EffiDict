@@ -41,6 +41,11 @@ from effidict import (
 )
 
 from .conftest import release_store
+from .helpers import (
+    HOLD_SECONDS,
+    WAIT_SECONDS,
+    xfail_sqlite_held_write,
+)
 
 pytestmark = pytest.mark.stress
 
@@ -54,17 +59,15 @@ PICKLABLE_BACKENDS = {PickleBackend, JSONBackend}
 #: Backends whose handle is bound to the thread that opened it.
 THREAD_AFFINE_BACKENDS = {SqliteBackend}
 
-#: How long a probe keeps a write blocked inside ``serialize``, and how long it
-#: waits for anything to happen. HOLD must comfortably exceed the *sum* of the
-#: waits performed while the write is held, or the hold expires mid-inspection:
-#: the write completes, and the tier state the probe then examines is
-#: post-write, where a drop-then-write implementation is indistinguishable from
-#: a compliant one. Both numbers are liveness bounds, never discriminators --
-#: nothing here decides what happened by how long it took. The ``finally`` in
-#: each probe releases the hold, so HOLD is only ever reached if the test itself
-#: wedged.
-HOLD_SECONDS = 120
-WAIT_SECONDS = 10
+#: The worker-process specs below all run over the same restricted set: a
+#: backend that cannot be pickled never reaches a worker, so parametrizing over
+#: the whole matrix would only re-report issue 2.3, which
+#: ``test_all_backends_are_picklable`` already owns.
+over_picklable_backends = pytest.mark.parametrize(
+    "backend_cls", sorted(PICKLABLE_BACKENDS, key=lambda c: c.__name__),
+    ids=lambda cls: cls.__name__,
+)
+
 
 WORKER_KEYS = {f"k{i}": f"v{i}" for i in range(6)}
 
@@ -264,16 +267,7 @@ def test_reader_never_observes_a_key_mid_eviction(request, backend_cls, make_dic
     thread-affinity error, which this probe asserts rather than swallows, so
     that backend stays red until issue 2.3.
     """
-    if backend_cls is SqliteBackend:
-        request.applymarker(
-            pytest.mark.xfail(
-                strict=True,
-                reason=(
-                    "the evicting write raises the SQLite thread-affinity error, "
-                    "so the held-open write never completes (issue 2.3)"
-                ),
-            )
-        )
+    xfail_sqlite_held_write(request, backend_cls)
 
     d = make_dict(max_in_memory=2)
     d["k0"] = "v0"
@@ -463,10 +457,7 @@ def test_picklable_backend_table_matches_reality(backend_cls, storage_dir):
         release_store(backend)
 
 
-@pytest.mark.parametrize(
-    "backend_cls", sorted(PICKLABLE_BACKENDS, key=lambda c: c.__name__),
-    ids=lambda cls: cls.__name__,
-)
+@over_picklable_backends
 @pytest.mark.xfail(
     strict=False,  # depends on when a sibling worker is collected; see below
     reason=(
@@ -505,10 +496,7 @@ def test_joblib_workers_can_read(backend_cls, storage_dir):
         release_store(backend)
 
 
-@pytest.mark.parametrize(
-    "backend_cls", sorted(PICKLABLE_BACKENDS, key=lambda c: c.__name__),
-    ids=lambda cls: cls.__name__,
-)
+@over_picklable_backends
 @pytest.mark.xfail(
     strict=True,
     reason=(
@@ -544,10 +532,7 @@ def test_joblib_workers_do_not_destroy_storage(backend_cls, storage_dir):
         release_store(backend)
 
 
-@pytest.mark.parametrize(
-    "backend_cls", sorted(PICKLABLE_BACKENDS, key=lambda c: c.__name__),
-    ids=lambda cls: cls.__name__,
-)
+@over_picklable_backends
 @pytest.mark.xfail(
     strict=True,
     reason=(
