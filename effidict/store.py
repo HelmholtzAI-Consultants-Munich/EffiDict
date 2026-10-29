@@ -169,11 +169,10 @@ class Store:
         # any lock: a caller sharing a plain ``Lock`` across stores, or the
         # ``Lock`` protocol of PLAN.md 3.6, which need not be reentrant.
         #
-        # Reentrant by default would not make the one caller that re-enters on
+        # A reentrant default would not make the one caller that re-enters on
         # its own -- a finalizer -- correct; it would only let it observe a
-        # half-applied operation. The ``released`` lists stop the finalizers
-        # this class triggers itself; the guard catches the rest, including the
-        # ones the cyclic collector runs. See the class docstring.
+        # half-applied operation. How the deferral and the guard divide that
+        # work between them is in the class docstring.
         self._lock = _ReentrancyGuard(
             threading.Lock() if lock is None else lock
         )

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from itertools import islice
 from typing import Iterator
 
 
@@ -135,9 +136,9 @@ class Cache:
             # which ``test_victims_enumerates_in_eviction_order`` pins.
             return iter((self.policy.victim(),))
 
-        candidates = []
-        for key in self.policy.victims():
-            candidates.append(key)
-            if len(candidates) == surplus:
-                break
+        # Taken eagerly, not lazily: ``islice`` straight back would interleave
+        # the policy's walk with the caller's ``discard`` calls, and a policy
+        # that enumerates its live ordering rather than a snapshot would raise
+        # mid-eviction.
+        candidates = list(islice(self.policy.victims(), surplus))
         return iter(candidates)
