@@ -881,6 +881,209 @@ def test_a_cyclic_value_cannot_deadlock_the_store(storage_dir):
         backend.destroy()
 
 
+def _cycle_that_probes(recorded, probe):
+    """Return a self-referential value whose finalizer runs ``probe``.
+
+    Only the collector can free it, so the finalizer fires wherever the next
+    collection lands -- which is the whole point: that may be inside a locked
+    operation. What the probe did is appended to ``recorded``, either as
+    ``("returned", answer)`` or as ``("raised", exception)``.
+    """
+
+    class Cyclic:
+        def __init__(self):
+            self.self_ref = self
+
+        def __del__(self):
+            try:
+                recorded.append(("returned", probe()))
+            except BaseException as exc:  # noqa: BLE001 - inspected by the test
+                recorded.append(("raised", exc))
+
+    return Cyclic()
+
+
+def _assert_reentry_was_refused(recorded, during):
+    """Assert the probe ran once, inside the lock, and was turned away.
+
+    Refusal is what is asserted, not merely survival. A bare ``Lock`` hangs,
+    which the caller's bounded wait catches; a reentrant one serves the
+    finalizer a half-applied operation, and the probe then returns an answer
+    instead of raising. Only the guard raises, so the error *is* the evidence
+    that the finalizer ran inside the lock.
+    """
+    assert len(recorded) == 1, (
+        f"the finalizer ran {len(recorded)} times during {during}; the test "
+        f"proves nothing unless the collector reaped the cycle in there"
+    )
+    kind, detail = recorded[0]
+    assert kind == "raised", (
+        f"the finalizer re-entered during {during} and was served: the probe "
+        f"returned {detail!r} from inside a half-applied operation"
+    )
+    assert isinstance(detail, RuntimeError), (
+        f"re-entry during {during} raised {detail!r}, which says nothing a "
+        f"caller can act on; it should name the re-entry"
+    )
+    assert "re-entered" in str(detail), (
+        f"the re-entry error does not explain itself: {detail}"
+    )
+
+
+def test_stores_sharing_one_lock_share_re_entry_detection(storage_dir):
+    """One lock means one critical section, so it must mean one answer.
+
+    ``Store`` takes an injected lock precisely so several stores can be held
+    consistent under it. A finalizer collected inside store A's operation and
+    querying store B is then re-entering the *lock*, not the store: B's
+    acquire blocks on a lock the calling thread already holds through A, and
+    the thread waits for itself. Detection has to be a property of the lock
+    rather than of either store, which is why the guard tracks the lock's
+    identity and not its own.
+    """
+    a_backend = _CollectsOnWrite(str(storage_dir / "a"))
+    b_backend = PickleBackend(str(storage_dir / "b"))
+    recorded = []
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        lock = threading.Lock()
+        a = Store(
+            backend=a_backend,
+            cache=Cache(policy=RecordingPolicy(), max_items=1),
+            lock=lock,
+        )
+        b = Store(
+            backend=b_backend,
+            cache=Cache(policy=RecordingPolicy(), max_items=4),
+            lock=lock,
+        )
+        b.set("other", "untouched")
+
+        a.set("cyclic", _cycle_that_probes(recorded, lambda: b.contains("other")))
+        a.delete("cyclic")  # unreachable now; the cycle keeps it alive
+
+        finished = threading.Event()
+        failure = {}
+
+        def run():
+            try:
+                a.set("x", "vx")
+                a.set("y", "vy")  # over budget -> serialize -> collect
+            except Exception as exc:  # noqa: BLE001 - re-raised below
+                failure["exc"] = exc
+            finally:
+                finished.set()
+
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        assert finished.wait(5.0), (
+            "a finalizer collected inside one store's operation queried the "
+            "other store sharing its lock, and blocked on it: the write never "
+            "returned"
+        )
+        if "exc" in failure:
+            raise AssertionError(
+                f"the write raised {failure['exc']!r} on a worker thread"
+            ) from failure["exc"]
+
+        _assert_reentry_was_refused(recorded, "a store sharing the lock")
+
+        # Neither store may be left disturbed by the call that was refused.
+        assert a.get("y") == "vy", "the write that was re-entered was lost"
+        assert b.get("other") == "untouched", "the queried store was disturbed"
+    finally:
+        if was_enabled:
+            gc.enable()
+        a_backend.destroy()
+        b_backend.destroy()
+
+
+class _CollectingLock:
+    """A lock written in Python that collects inside ``acquire`` or ``release``.
+
+    The ``Lock`` protocol of PLAN.md 3.6 lets a caller inject any object with
+    these two methods, and a Python one runs Python in both -- so it allocates,
+    so the collector can trip there, while the underlying lock is already held
+    (inside ``acquire``) or still held (inside ``release``). Those are two
+    windows a guard that claims ownership only *between* the calls does not
+    cover. Collecting on purpose puts a finalizer in the window every time
+    rather than once in a long while; the stdlib locks cannot reach it at all,
+    which is why this takes a lock of its own to show.
+    """
+
+    def __init__(self, collect_in):
+        self._lock = threading.Lock()
+        self._collect_in = collect_in
+
+    def acquire(self, *args):
+        acquired = self._lock.acquire(*args)
+        if self._collect_in == "acquire":
+            gc.collect()
+        return acquired
+
+    def release(self):
+        if self._collect_in == "release":
+            gc.collect()
+        self._lock.release()
+
+
+@pytest.mark.parametrize("collect_in", ["acquire", "release"])
+def test_an_injected_python_lock_cannot_hide_re_entry(collect_in, storage_dir):
+    """Ownership has to span the lock calls, not sit between them.
+
+    A finalizer run by a collection inside the injected lock's own ``acquire``
+    or ``release`` arrives while that lock is held, but outside the span a
+    guard would claim if it marked ownership after acquiring and dropped it
+    before releasing. It would then be waved through to block on a lock its
+    own thread holds. Marking before the acquire and clearing after the
+    release closes both ends.
+    """
+    backend = PickleBackend(str(storage_dir / "store"))
+    recorded = []
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        store = Store(
+            backend=backend,
+            cache=Cache(policy=RecordingPolicy(), max_items=4),
+            lock=_CollectingLock(collect_in),
+        )
+        store.set(
+            "cyclic", _cycle_that_probes(recorded, lambda: store.contains("x"))
+        )
+        store.delete("cyclic")  # unreachable now; the cycle keeps it alive
+
+        finished = threading.Event()
+        failure = {}
+
+        def run():
+            try:
+                store.set("x", "vx")
+            except Exception as exc:  # noqa: BLE001 - re-raised below
+                failure["exc"] = exc
+            finally:
+                finished.set()
+
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        assert finished.wait(5.0), (
+            f"a finalizer collected inside the lock's own {collect_in}() "
+            f"re-entered the store and blocked: the write never returned"
+        )
+        if "exc" in failure:
+            raise AssertionError(
+                f"the write raised {failure['exc']!r} on a worker thread"
+            ) from failure["exc"]
+
+        _assert_reentry_was_refused(recorded, f"the lock's {collect_in}()")
+        assert store.get("x") == "vx", "the write that was re-entered was lost"
+    finally:
+        if was_enabled:
+            gc.enable()
+        backend.destroy()
+
+
 def test_store_pop_distinguishes_an_omitted_default_from_none(backend_cls, storage_dir):
     """``pop`` must tell ``pop(key)`` from ``pop(key, None)``.
 

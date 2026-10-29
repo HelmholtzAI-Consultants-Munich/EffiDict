@@ -21,6 +21,26 @@ class _Missing:
 MISSING = _Missing()
 
 
+#: Which locks this thread is inside, by ``id``. Thread-local, so a guard only
+#: ever reads and writes the set belonging to the thread asking -- there is no
+#: shared state to race over, and no other thread's entry to misread. Keyed by
+#: the *underlying* lock rather than by the guard, because two stores handed
+#: one lock share one critical section and must therefore share one answer to
+#: "am I already inside it?". An id identifies its lock unambiguously for as
+#: long as the entry exists: the guard holding the lock keeps it alive, so the
+#: id cannot be handed to a different object while it is in the set.
+_HELD = threading.local()
+
+
+def _held_locks() -> set:
+    """Return this thread's set of entered lock ids, creating it on first use."""
+    try:
+        return _HELD.locks
+    except AttributeError:
+        locks = _HELD.locks = set()
+        return locks
+
+
 class _ReentrancyGuard:
     """The store's lock, with same-thread re-entry turned into an error.
 
@@ -31,42 +51,55 @@ class _ReentrancyGuard:
     option and the only safe one: the re-entrant call never runs, so it cannot
     observe anything, and the operation underneath it is left alone.
 
-    ``_owner`` is read without holding anything, which is safe because only the
-    thread holding the lock ever writes an id to it. Another thread reads
-    either ``None`` or an id that is not its own, and in both cases goes on to
-    block on the real lock.
+    The entry is made *before* ``acquire`` and dropped *after* ``release``, so
+    a thread counts as inside the lock for the whole of both calls. The
+    ``Lock`` protocol of PLAN.md 3.6 admits a lock written in Python, whose
+    ``acquire`` and ``release`` run Python -- and therefore allocate, and
+    therefore may hand the cyclic collector a finalizer -- while the underlying
+    lock is already held or still held. Bracketing the calls rather than
+    sitting inside them is what covers those two windows.
+
+    The bias is deliberate: between ``release`` returning and the entry being
+    dropped the lock is free but still claimed, so a finalizer arriving in that
+    sliver is refused although it could have been served. That is a visible
+    error on a path that would otherwise have worked, against a deadlock on a
+    path that cannot work -- and the window holds no call that can block.
     """
 
     def __init__(self, lock):
         self._lock = lock
-        self._owner = None
+        # Stable for this guard's life: ``self._lock`` keeps the lock alive.
+        self._id = id(lock)
 
     def __enter__(self):
-        current = threading.get_ident()
-        if self._owner == current:
+        held = _held_locks()
+        if self._id in held:
             raise RuntimeError(
                 "Store operation re-entered on the same thread. A stored "
                 "value's __del__ called back into the store -- directly, or "
                 "because the cyclic garbage collector ran that finalizer "
-                "inside an unrelated store operation. Re-entry cannot be "
-                "served: it would read a half-applied operation. Keep the "
-                "store out of the finalizer."
+                "inside an unrelated store operation, possibly on another "
+                "store sharing this lock. Re-entry cannot be served: it would "
+                "read a half-applied operation. Keep the store out of the "
+                "finalizer."
             )
-        self._lock.acquire()
-        self._owner = current
+        held.add(self._id)
+        try:
+            self._lock.acquire()
+        except BaseException:
+            held.discard(self._id)
+            raise
         return self
 
     def __exit__(self, *exc_info):
-        # Bind ``release`` before clearing the owner. Between the two this
-        # thread holds a lock it no longer claims, and a finalizer arriving in
-        # that window would read ``_owner is None``, miss the re-entry and
-        # block on a lock its own thread holds. Binding first leaves nothing
-        # that can allocate in between, so the collector cannot run there.
-        # A lock whose ``release`` is itself written in Python reopens the
-        # window inside that call; the stdlib locks used here do not.
-        release = self._lock.release
-        self._owner = None
-        release()
+        # ``held`` is bound before the release, so once the lock is free the
+        # only step left is the discard -- nothing that can block, and nothing
+        # that needs the lock.
+        held = _held_locks()
+        try:
+            self._lock.release()
+        finally:
+            held.discard(self._id)
 
 
 class Store:
