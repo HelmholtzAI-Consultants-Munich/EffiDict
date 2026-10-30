@@ -60,10 +60,6 @@ needs_rss = pytest.mark.skipif(
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="max_bytes is accepted but never enforced (issue 1.4)",
-)
 def test_cache_respects_max_bytes(make_dict):
     """``max_bytes`` must bound what the cache holds.
 
@@ -144,10 +140,6 @@ print(peak - baseline)
 
 
 @needs_rss
-@pytest.mark.xfail(
-    strict=True,
-    reason="max_bytes is accepted but never enforced, so the process grows with the data (issue 1.4)",
-)
 def test_peak_rss_is_bounded_by_max_bytes(tmp_path):
     """The process must not grow with the size of the data written.
 

@@ -1,7 +1,46 @@
 from __future__ import annotations
 
-from itertools import islice
+import sys
 from typing import Iterator
+
+
+def estimate_size(value) -> int:
+    """Approximate the resident bytes of ``value``.
+
+    Approximate on purpose, and it has to be: an exact accounting of an
+    arbitrary Python object is not achievable. A buffer shared by two cached
+    values is counted twice, and ``sys.getsizeof`` reports a container's own
+    footprint rather than that of what it holds, so a list of large strings
+    measures as a list of pointers. The budget only has to be right to within a
+    small factor to keep a cache bounded, which is all it is for.
+
+    Three rules, in order:
+
+    * anything with a callable ``memory_usage`` -- a pandas ``DataFrame`` or
+      ``Series`` -- is measured with ``memory_usage(deep=True)``, which follows
+      object columns to the strings they point at instead of counting one
+      pointer each.
+    * anything carrying an ``nbytes`` int -- a numpy array, a ``memoryview`` --
+      reports its buffer directly.
+    * everything else falls back to ``sys.getsizeof``.
+
+    Duck-typed rather than imported. numpy and pandas are test dependencies,
+    not runtime ones, and a store holding strings must not import either to
+    measure them.
+    """
+    measure = getattr(value, "memory_usage", None)
+    if callable(measure):
+        # A DataFrame answers per column and needs summing; a Series answers
+        # with the total already.
+        used = measure(deep=True)
+        total = getattr(used, "sum", None)
+        return int(total() if callable(total) else used)
+
+    nbytes = getattr(value, "nbytes", None)
+    if isinstance(nbytes, int):
+        return nbytes
+
+    return sys.getsizeof(value)
 
 
 class Cache:
@@ -23,13 +62,17 @@ class Cache:
         write-before-drop impossible to implement. It is also why the surface
         includes ``peek``, ``is_dirty``, ``dirty_items`` and ``discard`` at all.
 
-        ``max_bytes`` and ``size_estimator`` are recorded but not yet consulted:
-        the byte budget needs ``nbytes``, which is issue #1.4.
+        Each value is measured once, when it is put, and the measurement is
+        kept with it. Re-measuring the whole cache on every write would make a
+        fill quadratic, and ``memory_usage(deep=True)`` is far too expensive to
+        call per resident value per write. The cost of keeping it is that a
+        value mutated in place after it was stored is measured as it was --
+        acceptable for a figure already documented as approximate.
         """
         self.policy = policy
         self.max_items = max_items
         self.max_bytes = max_bytes
-        self.size_estimator = size_estimator
+        self.size_estimator = size_estimator or estimate_size
         #: key -> (value, dirty). One container rather than a parallel
         #: dirty set, so a key cannot be dropped from one and left in the
         #: other -- the phantom-state defect ``on_remove`` exists to avoid
@@ -50,7 +93,7 @@ class Cache:
         Reading does not touch the tag: I6 says a read never marks an entry
         dirty, so a clean entry stays free to evict however often it is read.
         """
-        value, _ = self._values[key]
+        value, _, _ = self._values[key]
         self.policy.on_access(key)
         return value
 
@@ -78,7 +121,7 @@ class Cache:
             self.policy.on_access(key)
         else:
             self.policy.on_insert(key)
-        self._values[key] = (value, dirty)
+        self._values[key] = (value, dirty, self.size_estimator(value))
 
     def discard(self, key) -> None:
         """Remove ``key`` if present without raising when absent."""
@@ -96,8 +139,12 @@ class Cache:
         return len(self._values)
 
     def nbytes(self) -> int:
-        """Return the approximate cached byte size."""
-        raise NotImplementedError("see issue #1.4")
+        """Return the approximate resident byte size.
+
+        Summed over measurements taken at ``put`` time, so this costs no
+        estimator calls -- see :meth:`__init__` for why they are not retaken.
+        """
+        return sum(size for _, _, size in self._values.values())
 
     def is_dirty(self, key) -> bool:
         """Return whether ``key`` has unwritten cache changes.
@@ -116,8 +163,8 @@ class Cache:
         dirty by being written through ``put``, which is the only way its value
         can diverge from disk.
         """
-        value, _ = self._values[key]
-        self._values[key] = (value, False)
+        value, _, size = self._values[key]
+        self._values[key] = (value, False, size)
 
     def dirty_items(self) -> Iterator:
         """Iterate ``(key, value)`` for the entries disk does not have.
@@ -127,7 +174,9 @@ class Cache:
         mutating what it is reading -- ``flush`` collects first for that reason.
         """
         return (
-            (key, value) for key, (value, dirty) in self._values.items() if dirty
+            (key, value)
+            for key, (value, dirty, _) in self._values.items()
+            if dirty
         )
 
     def evict_candidates(self) -> Iterator:
@@ -147,28 +196,41 @@ class Cache:
         would be a different promise. Returned over a snapshot, so the caller
         may discard what it is handed while walking it.
 
-        Only the item budget is consulted. The byte budget needs ``nbytes``,
-        which is issue #1.4.
+        Both budgets, whichever binds first: enough keys to bring the item count
+        inside ``max_items`` *and* the estimated bytes inside ``max_bytes``.
+        Either left as ``None`` constrains nothing, so a cache given only
+        ``max_items`` behaves exactly as it did before the byte budget existed.
         """
-        if self.max_items is None:
+        surplus = (
+            0 if self.max_items is None else len(self._values) - self.max_items
+        )
+        excess = (
+            0 if self.max_bytes is None else self.nbytes() - self.max_bytes
+        )
+        if surplus <= 0 and excess <= 0:
             return iter(())
 
-        surplus = len(self._values) - self.max_items
-        if surplus <= 0:
-            return iter(())
-
-        if surplus == 1:
-            # One write past the bound sheds one key, which is the steady state
-            # and nearly every call. ``victims()`` has to build the whole
+        if surplus == 1 and excess <= 0:
+            # One write past the item bound sheds one key, which is the steady
+            # state and nearly every call. ``victims()`` has to build the whole
             # ordering before it yields anything, so asking it for one key costs
             # the size of the cache and a fill becomes quadratic; ``victim()``
             # reads the ordering's endpoint instead. The two name the same key,
-            # which ``test_victims_enumerates_in_eviction_order`` pins.
+            # which ``test_victims_enumerates_in_eviction_order`` pins. Only
+            # when bytes are inside budget: a byte surplus needs each victim's
+            # size to know when enough has been shed, and ``victim()`` names one.
             return iter((self.policy.victim(),))
 
-        # Taken eagerly, not lazily: ``islice`` straight back would interleave
-        # the policy's walk with the caller's ``discard`` calls, and a policy
-        # that enumerates its live ordering rather than a snapshot would raise
-        # mid-eviction.
-        candidates = list(islice(self.policy.victims(), surplus))
+        # Walked eagerly rather than handed back lazily: the caller discards
+        # what it is given while walking it, and a policy that enumerates its
+        # live ordering rather than a snapshot would raise mid-eviction. The
+        # stopping condition reads both budgets, so whichever is still breached
+        # keeps the walk going.
+        candidates = []
+        freed = 0
+        for key in self.policy.victims():
+            candidates.append(key)
+            freed += self._values[key][2]
+            if len(candidates) >= surplus and freed >= excess:
+                break
         return iter(candidates)

@@ -479,13 +479,6 @@ def test_eviction_writes_the_current_value(
         assert value == f"v{key}", f"evicted {key!r} was written as {value!r}"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "I1/I7: a reassigned key's stale disk copy can only be superseded by a "
-        "write-back, and flush() is still a stub (issue 1.4)"
-    ),
-)
 def test_reassignment_supersedes_the_stale_disk_copy(
     backend_cls, policy_cls, make_dict
 ):
@@ -512,10 +505,6 @@ def test_reassignment_supersedes_the_stale_disk_copy(
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="I7: flush() is still a contract stub (issue 1.4)",
-)
 def test_flush_persists_dirty_entries(backend_cls, policy_cls, make_dict):
     """I7. After flush(), every cached write is on disk.
 
@@ -540,10 +529,6 @@ def test_flush_persists_dirty_entries(backend_cls, policy_cls, make_dict):
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="I8: max_bytes is stored but never enforced (issue 1.4)",
-)
 def test_cache_respects_byte_budget(backend_cls, policy_cls, make_dict):
     """I8. The cache is bounded by bytes, not only by item count.
 

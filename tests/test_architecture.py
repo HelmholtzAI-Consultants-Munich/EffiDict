@@ -426,13 +426,6 @@ def test_cache_reports_what_must_be_shed_for_the_item_budget():
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "the byte budget is not tracked at all: nbytes() is a contract stub "
-        "that raises, so max_bytes is accepted and dropped (issue 1.4)"
-    ),
-)
 def test_cache_reports_what_must_be_shed_for_the_byte_budget():
     """I8, byte half. Going over ``max_bytes`` must put entries on the list too.
 
@@ -621,13 +614,6 @@ def test_cache_candidates_survive_being_discarded_while_walked():
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "size_estimator is recorded and never consulted, and nbytes() raises "
-        "rather than measuring what is resident (issue 1.4)"
-    ),
-)
 def test_cache_measures_values_with_the_size_estimator():
     """``size_estimator`` must actually be used, not assumed to be ``len``.
 
