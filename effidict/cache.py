@@ -78,6 +78,12 @@ class Cache:
         #: other -- the phantom-state defect ``on_remove`` exists to avoid
         #: in the policies.
         self._values = {}
+        #: Running total of the sizes in ``_values``, adjusted by the three
+        #: methods that change what is resident -- ``put``, ``discard`` and
+        #: ``clear`` -- and by nothing else. ``mark_clean`` replaces an entry
+        #: without changing its size. See :meth:`nbytes` for why it is carried
+        #: rather than summed on demand.
+        self._nbytes = 0
 
     def __iter__(self) -> Iterator:
         """Iterate the cached keys, so ``set(cache)`` is the resident key set."""
@@ -116,22 +122,34 @@ class Cache:
         caller that knows disk already holds this exact value may pass
         ``False``, and being wrong about that loses data -- the entry would be
         dropped at eviction without ever being written.
+
+        The estimator runs **first**, before the policy is told anything. It is
+        caller-supplied code over an arbitrary value and may raise; a policy
+        told to track a key the cache then fails to hold goes on offering it as
+        a victim, and the eviction path strands on a key it cannot peek. Doing
+        the one step that can fail before any state changes leaves a rejected
+        write with no trace at all.
         """
-        if key in self._values:
-            self.policy.on_access(key)
-        else:
+        size = self.size_estimator(value)
+        previous = self._values.get(key)
+        if previous is None:
             self.policy.on_insert(key)
-        self._values[key] = (value, dirty, self.size_estimator(value))
+        else:
+            self.policy.on_access(key)
+        self._values[key] = (value, dirty, size)
+        self._nbytes += size - (0 if previous is None else previous[2])
 
     def discard(self, key) -> None:
         """Remove ``key`` if present without raising when absent."""
-        if key in self._values:
-            del self._values[key]
+        entry = self._values.pop(key, None)
+        if entry is not None:
+            self._nbytes -= entry[2]
             self.policy.on_remove(key)
 
     def clear(self) -> None:
         """Remove all cached entries and policy state."""
         self._values.clear()
+        self._nbytes = 0
         self.policy.clear()
 
     def __len__(self) -> int:
@@ -141,10 +159,15 @@ class Cache:
     def nbytes(self) -> int:
         """Return the approximate resident byte size.
 
-        Summed over measurements taken at ``put`` time, so this costs no
-        estimator calls -- see :meth:`__init__` for why they are not retaken.
+        A carried total rather than a sum over the cache. ``evict_candidates``
+        asks on every write once ``max_bytes`` is set, including the writes that
+        shed nothing, so summing here made a fill quadratic: measured at 500,500
+        entry visits for 1,000 writes and 2,001,000 for 2,000.
+
+        The measurements themselves are still taken once per ``put`` -- see
+        :meth:`__init__` for why they are not retaken.
         """
-        return sum(size for _, _, size in self._values.values())
+        return self._nbytes
 
     def is_dirty(self, key) -> bool:
         """Return whether ``key`` has unwritten cache changes.

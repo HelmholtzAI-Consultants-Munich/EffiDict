@@ -328,6 +328,66 @@ def test_stored_size_grows_linearly_with_the_data(request, backend_cls, tmp_path
     )
 
 
+class _CountingValues(dict):
+    """A cache's value dict that counts how many entries get walked.
+
+    Every way of reading a dict's contents in bulk is counted, not just
+    ``values()``, so the guard below measures "did anything traverse the cache"
+    rather than "was it traversed the way I expected".
+    """
+
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.visited = 0
+
+    def _walk(self):
+        self.visited += len(self)
+
+    def values(self):
+        self._walk()
+        return super().values()
+
+    def items(self):
+        self._walk()
+        return super().items()
+
+    def keys(self):
+        self._walk()
+        return super().keys()
+
+    def __iter__(self):
+        self._walk()
+        return super().__iter__()
+
+
+@pytest.mark.parametrize("size", [SMALL, LARGE])
+def test_checking_the_byte_budget_does_not_walk_the_cache(size):
+    """Asking whether the cache is over budget must not cost the cache's size.
+
+    ``Store`` consults ``evict_candidates`` after every single write, and with
+    ``max_bytes`` set that consults the byte total -- including on the writes
+    that shed nothing, which is most of them. A total summed on demand turns a
+    plain fill quadratic: measured at 500,500 entries walked for 1,000 writes
+    and 2,001,000 for 2,000, against zero for a total carried as it changes.
+
+    Counted rather than timed, like the guards above, and asserted as zero
+    rather than as a ratio: nothing in a fill legitimately needs to read the
+    whole cache, so the correct answer does not depend on the size at all.
+    """
+    cache = Cache(policy=LRUPolicy(), max_items=size * 10, max_bytes=10 ** 12)
+    cache._values = _CountingValues(cache._values)
+
+    for index in range(size):
+        cache.put(f"k{index}", "v")
+        list(cache.evict_candidates())
+
+    assert cache._values.visited == 0, (
+        f"filling a {size}-entry cache under a byte budget walked "
+        f"{cache._values.visited} entries; a summed total would give "
+        f"{size * (size + 1) // 2}"
+    )
+
+
 class _CountingPolicy(LRUPolicy):
     """An LRU policy that reports how many keys each selection call walks."""
 
