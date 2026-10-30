@@ -233,16 +233,24 @@ class Cache:
         if surplus <= 0 and excess <= 0:
             return iter(())
 
-        if surplus == 1 and excess <= 0:
-            # One write past the item bound sheds one key, which is the steady
-            # state and nearly every call. ``victims()`` has to build the whole
-            # ordering before it yields anything, so asking it for one key costs
-            # the size of the cache and a fill becomes quadratic; ``victim()``
-            # reads the ordering's endpoint instead. The two name the same key,
-            # which ``test_victims_enumerates_in_eviction_order`` pins. Only
-            # when bytes are inside budget: a byte surplus needs each victim's
-            # size to know when enough has been shed, and ``victim()`` names one.
-            return iter((self.policy.victim(),))
+        if surplus <= 1:
+            # One eviction is the steady state of a bounded cache -- one write
+            # past the bound, one key shed -- so nearly every call lands here.
+            # ``victims()`` has to build the whole ordering before it yields
+            # anything, so asking it for one key costs the size of the cache and
+            # a fill becomes quadratic; ``victim()`` reads the ordering's
+            # endpoint instead. The two name the same key, which
+            # ``test_victims_enumerates_in_eviction_order`` pins.
+            #
+            # A byte excess takes this path too, whenever that one victim covers
+            # it: deciding costs a dict lookup against the size recorded when
+            # the value was put. Only when it does not cover the excess does the
+            # walk below run, starting again from the same end of the same
+            # ordering. With ``excess`` at or below zero the test is trivially
+            # true, which is the item-only case.
+            victim = self.policy.victim()
+            if self._values[victim][2] >= excess:
+                return iter((victim,))
 
         # Walked eagerly rather than handed back lazily: the caller discards
         # what it is given while walking it, and a policy that enumerates its
