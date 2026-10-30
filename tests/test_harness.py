@@ -376,3 +376,66 @@ def test_backend_spy_counts_writes_during_eviction(make_dict, backend_spy):
         d["a"] = 1
         d["b"] = 2
         assert spy.count("serialize") == 1
+
+
+# --------------------------------------------------------------------------
+# xfail reason drift
+# --------------------------------------------------------------------------
+
+
+def test_drifted_xfail_reason_fails_the_run(pytester):
+    """A marker blaming an issue the test never reaches must not pass quietly.
+
+    This is the defect the check exists for, reproduced in a sandbox: the spec
+    is waiting on 3.2, but it dies on 1.4's stub long before it gets there. The
+    strict marker is satisfied either way, so without this the run is green and
+    the spec is watching nothing.
+    """
+    _install_harness(pytester)
+    pytester.makepyfile(
+        """
+        import pytest
+
+        @pytest.mark.xfail(
+            strict=True, reason="clone() is a contract stub (issue 3.2)"
+        )
+        def test_dies_on_an_earlier_stub():
+            raise NotImplementedError("see issue #1.4")
+        """
+    )
+
+    result = pytester.runpytest("-q")
+
+    assert result.ret != 0, (
+        "a marker citing 3.2 while dying on 1.4 left the run green"
+    )
+    result.stdout.fnmatch_lines([
+        "*drifted from their cause*",
+        "*dies on issue #1.4*",
+        "*but cites*3.2*",
+    ])
+
+
+def test_xfail_reason_naming_its_own_cause_is_left_alone(pytester):
+    """The same shape, with the marker naming the issue that actually raised.
+
+    Proves the check discriminates rather than firing on every tagged stub --
+    580 specs in this suite die on one, and all but a drifted few are correct.
+    """
+    _install_harness(pytester)
+    pytester.makepyfile(
+        """
+        import pytest
+
+        @pytest.mark.xfail(
+            strict=True, reason="flush() is a contract stub (issue 1.4)"
+        )
+        def test_dies_on_the_stub_it_names():
+            raise NotImplementedError("see issue #1.4")
+        """
+    )
+
+    result = pytester.runpytest("-q")
+
+    assert result.ret == 0, "a marker naming its own cause was reported as drift"
+    result.assert_outcomes(xfailed=1)

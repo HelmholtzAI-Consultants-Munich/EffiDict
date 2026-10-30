@@ -286,7 +286,19 @@ Uses a one-entry cache and inserts two values.
 
 The second insertion evicts the first, so it verifies exactly one backend `serialize()` call occurred.
 
-In short, this file proves five foundational pieces work correctly: matrix parametrization, dictionary construction, leak detection, value comparison, and backend call spying.
+### `test_drifted_xfail_reason_fails_the_run`
+
+A sandbox spec whose marker cites issue 3.2 while the test dies on 1.4's stub.
+
+The run must end non-zero and name the mismatch. A strict xfail is satisfied by *any* failure, so without this check the marker passes while the spec it guards is stopped at a gate nobody recorded — and the day 3.2 lands, nothing says the spec is still untested. Two markers in this suite had drifted that way.
+
+### `test_xfail_reason_naming_its_own_cause_is_left_alone`
+
+The same shape, with the marker naming the issue that actually raised.
+
+The run must stay green. Most of the 580 expected failures in this suite die on a tagged stub, so a check that fired on all of them would be useless.
+
+In short, this file proves six foundational pieces work correctly: matrix parametrization, dictionary construction, leak detection, value comparison, backend call spying, and the xfail reason drift check.
 
 # Test Architecture
 
