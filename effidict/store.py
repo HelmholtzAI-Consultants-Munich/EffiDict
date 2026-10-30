@@ -125,11 +125,12 @@ class Store:
     Note that keys legitimately reside in both tiers at once; I1 makes disk
     authoritative rather than exclusive. I5 depends on that overlap.
 
-    I2 is not implemented here. Without the clean/dirty tag every eviction has
-    to assume the cached copy is newer, so :meth:`_spill` writes each victim out
-    before dropping it. That satisfies the second half of I5 -- a key is never in
-    neither tier -- at the cost of the first half, which issue #1.3 recovers once
-    entries know whether disk already has them.
+    I2 is the cache's: an entry carries a ``dirty`` tag, set by the write that
+    put it there and cleared only by a caller that has since written it out.
+    :meth:`_spill` reads that tag, which is what makes the first half of I5 --
+    evicting a clean entry costs no I/O -- decidable at all. Every entry is
+    dirty today, because the two callers that could produce a clean one are not
+    here yet: ``flush`` (issue #1.4) and promotion on read (see :meth:`get`).
 
     **No stored value is released while the lock is held.** Dropping the last
     reference to a value runs its ``__del__`` then and there, on this thread,
@@ -173,9 +174,7 @@ class Store:
         # its own -- a finalizer -- correct; it would only let it observe a
         # half-applied operation. How the deferral and the guard divide that
         # work between them is in the class docstring.
-        self._lock = _ReentrancyGuard(
-            threading.Lock() if lock is None else lock
-        )
+        self._lock = _ReentrancyGuard(threading.Lock() if lock is None else lock)
         self._owns_storage = owns_storage
 
     @property
@@ -200,11 +199,18 @@ class Store:
         does not hold, which is the same answer the cache gives, so a miss in
         both tiers reaches the caller unchanged.
 
-        A disk hit is *not* promoted into the cache. Promoting it would evict
-        something, and without the clean/dirty tag (issue #1.3) that eviction
-        writes -- turning a read-only pass into one disk write per key, which is
-        the write amplification ``test_clean_eviction_performs_no_io`` measures.
-        Promotion belongs with the tag, not before it.
+        A disk hit is *not* promoted into the cache. The clean/dirty tag makes
+        a promoted entry free to evict, which removes the write amplification
+        that used to be the objection -- but it does nothing about the other
+        one: promotion changes *what is cached* as a side effect of reading,
+        and two specs forbid exactly that.
+        ``test_full_scan_does_not_evict_the_working_set`` requires a walk to
+        leave the caller's cached keys intact, and
+        ``test_eq_does_not_mutate_either_operand`` requires comparing two stores
+        to leave both unchanged. Both walk every key through a smaller cache,
+        so promotion evicts the caller's working set to hold keys the caller
+        only passed over. A read path that streams without caching is issue
+        #4.2; promotion can only follow it.
         """
         with self._lock:
             return self._get(key)
@@ -233,10 +239,17 @@ class Store:
     def _spill(self, released: list) -> None:
         """Write out and drop whatever the cache says is over budget.
 
-        Write *then* drop, per I5: between the two the key is in both tiers, so
-        a reader looking at either one still finds it. Dropping first would open
-        a window in which the key is in neither, which is the gap
-        ``test_no_key_is_ever_absent_from_both_tiers`` probes.
+        A dirty victim is written *then* dropped, per I5: between the two the
+        key is in both tiers, so a reader looking at either one still finds it.
+        Dropping first would open a window in which the key is in neither, which
+        is the gap ``test_no_key_is_ever_absent_from_both_tiers`` probes.
+
+        A clean victim is dropped without being written, which is the other half
+        of I5. Disk already holds that exact value, so the write would be a copy
+        of what is there -- and a read-only pass over a store larger than its
+        cache is made of such evictions, one per key. The tag is what tells the
+        two cases apart; ``peek`` rather than ``get`` so measuring a victim does
+        not promote it.
 
         Each evicted value goes to ``released``, the caller's list, so that the
         discard here cannot be the drop that runs its ``__del__``.
@@ -244,7 +257,8 @@ class Store:
         for key in self._cache.evict_candidates():
             value = self._cache.peek(key)
             released.append(value)
-            self._backend.serialize(key, value)
+            if self._cache.is_dirty(key):
+                self._backend.serialize(key, value)
             self._cache.discard(key)
 
     def delete(self, key) -> None:
