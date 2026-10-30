@@ -2,24 +2,40 @@ from __future__ import annotations
 
 from typing import Optional
 
+from .cache import Cache
+from .store import MISSING, Store
+
 
 class EffiDict:
-    def __init__(self, disk_backend, replacement_strategy, *, max_bytes: Optional[int] = None):
-        """Create an EffiDict facade.
+    def __init__(
+        self,
+        disk_backend,
+        policy,
+        *,
+        max_in_memory: int,
+        max_bytes: Optional[int] = None,
+    ):
+        """Create an EffiDict facade over a single ``Store``.
 
-        Both tiers are required. They used to default to ``None``, but the last
-        line of this constructor reads ``replacement_strategy.memory``, so
-        either default raised ``AttributeError`` from inside the object -- a
-        declared default that could never be used. Omitting one is now a
-        ``TypeError`` naming the argument.
+        The facade holds no state of its own. Every question about where a key
+        lives goes to the store, which owns the backend, the cache and the lock.
+        It used to own a backend reference and alias the strategy's dict as
+        ``self.memory``, so two objects decided placement and the alias went
+        stale the moment the strategy was replaced.
 
-        ``max_bytes`` is accepted as the future approximate cache byte budget,
-        but it is not enforced yet; see issue #1.4.
+        ``policy`` is an ``EvictionPolicy`` -- pure bookkeeping, no constructor
+        arguments -- so the bound that used to live on the strategy is now
+        ``max_in_memory`` here, and it becomes the cache's item budget. It is
+        required: a store with no bound never spills, which is the one thing
+        this library exists to do.
+
+        ``max_bytes`` is accepted as the approximate cache byte budget, but it is
+        not enforced yet; see issue #1.4.
         """
-        self.disk_backend = disk_backend
-        self.replacement_strategy = replacement_strategy
-        self.max_bytes = max_bytes
-        self.memory = replacement_strategy.memory
+        self._store = Store(
+            backend=disk_backend,
+            cache=Cache(policy=policy, max_items=max_in_memory, max_bytes=max_bytes),
+        )
 
     def __enter__(self):
         return self
@@ -29,8 +45,7 @@ class EffiDict:
 
     def close(self):
         """Explicitly close the backend resources."""
-        if self.disk_backend is not None:
-            self.disk_backend.destroy()
+        self._store.close()
 
     def __iter__(self):
         self._iter_keys = iter(self.keys())
@@ -40,7 +55,7 @@ class EffiDict:
         return next(self._iter_keys)
 
     def __len__(self):
-        return len(self.keys())
+        return self._store.count()
 
     def items(self):
         for key in self.keys():
@@ -51,19 +66,16 @@ class EffiDict:
             yield self[key]
 
     def __contains__(self, key):
-        return key in self.memory or (self.disk_backend and key in self.disk_backend.keys())
+        return self._store.contains(key)
 
-    def pop(self, key, default=None):
-        try:
-            value = self.memory.pop(key)
-        except KeyError:
-            if key in self.keys():
-                value = self[key]
-                self.__delitem__(key)
-            else:
-                return default
+    def pop(self, key, default=MISSING):
+        """Remove ``key`` and return its value, ``dict``-style.
 
-        return value
+        ``MISSING`` rather than ``None``: ``pop(key, None)`` has to return
+        ``None`` while ``pop(key)`` raises, and the two are indistinguishable
+        once the default is spelled ``None``.
+        """
+        return self._store.pop(key, default)
 
     def get(self, key, default=None):
         """Return ``key`` if present, otherwise ``default``."""
@@ -144,21 +156,8 @@ class EffiDict:
         """
         raise NotImplementedError("see issue #6.1")
 
-    @property
-    def _store(self):
-        """Future Store facade used by white-box tier-invariant specs."""
-        raise NotImplementedError("see issue #1.2")
-
     def clear(self):
-        all_keys = self.keys()
-        self.memory.clear()
-        if self.disk_backend:
-            for key in all_keys:
-                self.disk_backend.del_item(key)
-        # Also clear strategy-specific caches like LFU/MFU counts
-        if hasattr(self.replacement_strategy, 'clear'):
-            self.replacement_strategy.clear()
-
+        self._store.clear()
 
     def __del__(self):
         try:
@@ -180,24 +179,16 @@ class EffiDict:
 
     def keys(self):
         """Return a list of all unique keys known to the dictionary (memory + disk)."""
-        mem_keys = set(self.memory.keys())
-        disk_keys = set(self.disk_backend.keys() if self.disk_backend is not None else [])
-        return list(mem_keys.union(disk_keys))
+        return list(self._store.iter_keys())
 
     def __getitem__(self, key):
-        return self.replacement_strategy.get(key)
+        return self._store.get(key)
 
     def __setitem__(self, key, value):
-        self.replacement_strategy.put(key, value)
+        self._store.set(key, value)
 
     def __delitem__(self, key):
-        # Check existence first to raise KeyError properly
-        if key not in self:
-            raise KeyError(key)
-        # The strategy handles its own memory (and secondary_memory for LFU/MFU)
-        self.replacement_strategy.delete(key)
-        # Ensure it's also removed from the disk backend
-        self.disk_backend.del_item(key)
+        self._store.delete(key)
 
     def load_from_dict(self, dictionary):
-        self.disk_backend.load_from_dict(dictionary)
+        self._store.load_from_dict(dictionary)

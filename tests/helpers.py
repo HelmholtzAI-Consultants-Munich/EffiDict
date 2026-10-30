@@ -1,4 +1,5 @@
-"""Value catalogue and comparison helper shared by every Phase 0 spec.
+"""Scaffolding shared by every Phase 0 spec: the value catalogue, the
+comparison helper, and the conventions two or more spec files have to agree on.
 
 The per-backend tables below were derived by round-tripping each value through
 each backend, not by reading the source. Anything asserted here is observed
@@ -11,6 +12,8 @@ from __future__ import annotations
 import inspect
 import math
 import os
+
+import pytest
 
 try:
     import numpy as np
@@ -25,25 +28,9 @@ except ImportError:  # pragma: no cover - pandas is a dev dependency
 from effidict import (
     Hdf5Backend,
     JSONBackend,
-    LFUReplacement,
-    LRUReplacement,
-    MFUReplacement,
-    MRUReplacement,
     PickleBackend,
     SqliteBackend,
 )
-
-#: Policies whose ``get`` writes a disk value back into the cache. Only these
-#: can mutate the cache during a read, so only these violate I6 -- several
-#: specs need to scope their expectations to this set rather than assuming the
-#: defect is universal.
-PROMOTING_POLICIES = {
-    LRUReplacement,
-    MRUReplacement,
-    LFUReplacement,
-    MFUReplacement,
-}
-
 
 def _ndarray():
     if np is None:  # pragma: no cover
@@ -137,38 +124,13 @@ EAGER_ITERATOR_TYPES = frozenset(
 )
 
 
-def build_policy(policy_cls, disk_backend=None, max_in_memory=2, **extra):
-    """Construct ``policy_cls`` with whatever arguments it actually declares.
-
-    Issue 1.1 replaces the ``*Replacement`` classes -- which require
-    ``disk_backend`` and ``max_in_memory`` -- with ``*Policy`` classes that own
-    bookkeeping only and take **no** constructor arguments;
-    ``test_eviction_policies.py`` pins that as ``ALLOWED_INIT_PARAMS =
-    frozenset()``. Hard-coding today's arguments would make every call site raise
-    ``TypeError`` the moment 1.1 lands, and on a strict xfail that reads as
-    "still failing" rather than "failing for a new reason" -- so the guard would
-    never flip green when the defect it pins is actually fixed.
-
-    Only declared parameters are passed, so this spans the change without a flag
-    day.
-    """
-    accepted = inspect.signature(policy_cls.__init__).parameters
-    candidates = {
-        "disk_backend": disk_backend,
-        "max_in_memory": max_in_memory,
-        **extra,
-    }
-    return policy_cls(**{k: v for k, v in candidates.items() if k in accepted})
-
-
 def in_cache(effidict, key):
     """Whether ``key`` currently sits in the in-memory tier.
 
-    Reads today's internals. Issue 1.2 replaces the body with
-    ``effidict._store.in_cache(key)``; keeping the call site behind this helper
-    means the tier-invariant specs do not all need rewriting when it lands.
+    ``Store.in_cache`` deliberately takes no lock, which is what lets the I5
+    specs observe tier residency while an eviction is held open.
     """
-    return key in effidict.replacement_strategy.memory
+    return effidict._store.in_cache(key)
 
 
 def cached_keys(effidict):
@@ -179,12 +141,12 @@ def cached_keys(effidict):
     Issue 1.2 replaces the body with ``set(effidict._store.cache)``.
 
     Behind a helper for the same reason as :func:`in_cache`, and the reason is
-    sharper than tidiness: a spec that reads ``replacement_strategy.memory``
-    directly raises ``AttributeError`` once 1.2 removes that alias, and a strict
+    sharper than tidiness: a spec that read ``replacement_strategy.memory``
+    directly raised ``AttributeError`` once 1.2 removed that alias, and a strict
     xfail cannot tell "still broken" from "broken differently". Those guards
-    would stay red on a correct implementation instead of flipping.
+    would have stayed red on a correct implementation instead of flipping.
     """
-    return set(effidict.replacement_strategy.memory)
+    return set(effidict._store.cache)
 
 
 def cached_bytes(effidict):
@@ -192,20 +154,26 @@ def cached_bytes(effidict):
 
     Issue 1.4 gives the cache a real byte budget and ``Cache.nbytes()`` becomes
     the contract; this becomes ``effidict._store.cache.nbytes()`` then. Until
-    the cache exists, summing ``len`` over the resident values is the only
-    measure available, which is why the budget specs assert with generous
-    headroom rather than an exact figure.
+    that lands, summing ``len`` over the resident values is the only measure
+    available, which is why the budget specs assert with generous headroom
+    rather than an exact figure.
+
+    Read through ``peek``, not ``get``: measuring the cache must not reorder it.
     """
-    return sum(len(value) for value in effidict.replacement_strategy.memory.values())
+    cache = effidict._store.cache
+    total = 0
+    for key in cache:
+        total += len(cache.peek(key))
+    return total
 
 
 def on_disk(effidict, key):
     """Whether ``key`` currently sits in the persistent tier.
 
-    Uses ``keys()`` rather than ``has()`` because ``has()`` is still a contract
-    stub (issue 2.2). Becomes ``effidict._store.backend.has(key)`` in 1.2.
+    ``has()`` rather than ``keys()``: issue 1.2 gave it a naive implementation,
+    and issue 2.2 makes it cheap without changing the answer.
     """
-    return key in effidict.disk_backend.keys()
+    return effidict._store.backend.has(key)
 
 
 def assert_equal_value(actual, expected):
@@ -290,3 +258,42 @@ def store_bytes(path):
         for filename in filenames:
             total += os.path.getsize(os.path.join(dirpath, filename))
     return total
+
+
+# --------------------------------------------------------------------------
+# holding an eviction open
+# --------------------------------------------------------------------------
+
+#: How long a probe keeps a write blocked inside ``serialize``, and how long it
+#: waits for anything to happen. HOLD must comfortably exceed the *sum* of the
+#: waits performed while the write is held, or the hold expires mid-inspection:
+#: the write completes, and the tier state the probe then examines is
+#: post-write, where a drop-then-write implementation is indistinguishable from
+#: a compliant one. Both numbers are liveness bounds, never discriminators --
+#: nothing here decides what happened by how long it took. The ``finally`` in
+#: each probe releases the hold, so HOLD is only ever reached if the test itself
+#: wedged.
+HOLD_SECONDS = 120
+WAIT_SECONDS = 10
+
+
+def xfail_sqlite_held_write(request, backend_cls):
+    """Mark the held-open-write probes xfail on SQLite, for a reason of its own.
+
+    Both probes start an evicting write and block it inside ``serialize``. On
+    SQLite that write raises the thread-affinity error instead (issue 2.3), so
+    it never completes and neither probe observes the thing it is about. They
+    assert the writer's outcome rather than swallowing it, which is what makes
+    this a marker and not a skip: once issue 2.3 lands, the strict xfail turns
+    the silence back into a failure.
+    """
+    if backend_cls is SqliteBackend:
+        request.applymarker(
+            pytest.mark.xfail(
+                strict=True,
+                reason=(
+                    "the evicting write raises the SQLite thread-affinity error, "
+                    "so the held-open write never completes (issue 2.3)"
+                ),
+            )
+        )

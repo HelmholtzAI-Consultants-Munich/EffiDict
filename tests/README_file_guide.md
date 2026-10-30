@@ -54,10 +54,6 @@ The `pytester` plugin allows the harness tests to create temporary tests and run
 
 `helpers.py` centralizes test data and assertions.
 
-## Policy grouping
-
-`PROMOTING_POLICIES` identifies policies whose reads can load disk values into the cache. Tests use it to scope cache-mutation expectations.
-
 ## Value catalog
 
 `VALUE_KINDS` contains fresh factories for:
@@ -290,7 +286,19 @@ Uses a one-entry cache and inserts two values.
 
 The second insertion evicts the first, so it verifies exactly one backend `serialize()` call occurred.
 
-In short, this file proves five foundational pieces work correctly: matrix parametrization, dictionary construction, leak detection, value comparison, and backend call spying.
+### `test_drifted_xfail_reason_fails_the_run`
+
+A sandbox spec whose marker cites issue 3.2 while the test dies on 1.4's stub.
+
+The run must end non-zero and name the mismatch. A strict xfail is satisfied by *any* failure, so without this check the marker passes while the spec it guards is stopped at a gate nobody recorded — and the day 3.2 lands, nothing says the spec is still untested. Two markers in this suite had drifted that way.
+
+### `test_xfail_reason_naming_its_own_cause_is_left_alone`
+
+The same shape, with the marker naming the issue that actually raised.
+
+The run must stay green. Most of the 580 expected failures in this suite die on a tagged stub, so a check that fired on all of them would be useless.
+
+In short, this file proves six foundational pieces work correctly: matrix parametrization, dictionary construction, leak detection, value comparison, backend call spying, and the xfail reason drift check.
 
 # Test Architecture
 
@@ -433,27 +441,47 @@ Tests use it because they need to observe whether `Cache` notified its policy. R
 
 ## Cache budget tests
 
-### `test_cache_reports_what_must_be_shed_for_each_budget`
+### `test_cache_reports_what_must_be_shed_for_the_item_budget`
 
-Expected to fail until issues 1.2 and 1.4.
-
-It verifies item and byte budgets separately.
-
-For the item budget:
+Passes.
 
 - Inserts five entries into a cache limited to two.
 - Requires the cache to retain all five initially.
 - Requires `evict_candidates()` to name exactly three distinct, existing keys.
 - Discards those keys.
-- Verifies the cache is then within budget.
+- Verifies the cache is then within budget and names nothing further.
 
 The cache must not evict entries itself because a dirty entry might need to be persisted first. Instead, it tells `Store` which entries must be shed; `Store` writes dirty values and then discards them.
 
-For the byte budget:
+Split out of a combined budget test. The byte half dies at `nbytes()`, and a single failure marks a whole test expected-to-fail, so this half reported nothing for as long as they shared an id — while the behaviour it pins already worked.
+
+### `test_cache_reports_what_must_be_shed_for_the_byte_budget`
+
+Expected to fail until issue 1.4.
 
 - Inserts roughly 20 KiB into a cache limited to 4 KiB.
 - Requires `nbytes()` to report the excess.
 - Requires enough eviction candidates to return within budget.
+
+### `test_cache_sheds_exactly_the_surplus_in_victim_order`
+
+Passes. Parametrized over FIFO, LIFO, LRU, MRU, LFU and MFU.
+
+- Fills a two-item cache with keys `a` to `e`, then reads `b` twice and `d` once.
+- Requires `evict_candidates()` to return exactly the first three keys of that policy's own ordering, written out as a literal list per policy.
+- Requires the cache to still hold all five afterwards, because naming a key is not removing it.
+
+This covers the branch `Store` never reaches today: it spills after every `put`, so the surplus is always one and the single-key fast path answers. A bulk `update` (issue 4.1) or the byte budget (issue 1.4) would reach it.
+
+### `test_cache_candidates_survive_being_discarded_while_walked`
+
+Passes.
+
+- Uses `_LiveOrderPolicy`, a conforming policy whose `victims()` walks its live `OrderedDict` rather than a snapshot.
+- Discards each candidate as it is yielded, the way `Store._spill` does.
+- Requires the walk to survive, which it can only do if `Cache` read the candidates out of the policy before handing them over.
+
+The seven shipped policies and `RecordingPolicy` all copy their ordering first, so none of them can tell an eager hand-off from a lazy one.
 
 ### `test_cache_measures_values_with_the_size_estimator`
 

@@ -25,7 +25,7 @@ import time
 
 import pytest
 
-from effidict import Hdf5Backend, SqliteBackend
+from effidict import Cache, Hdf5Backend, LRUPolicy, SqliteBackend
 
 from .helpers import store_bytes
 
@@ -85,8 +85,8 @@ def _count_enumerated(backend):
 @pytest.mark.xfail(
     strict=True,
     reason=(
-        "__contains__ calls disk_backend.keys(), so the work it does grows with "
-        "the size of the store (issue 2.2)"
+        "membership reaches backend.has(), which answers by listing every "
+        "key, so the work grows with the size of the store (issue 2.2)"
     ),
 )
 def test_membership_cost_does_not_grow_with_the_store(backend_cls, policy_cls, make_dict):
@@ -103,7 +103,7 @@ def test_membership_cost_does_not_grow_with_the_store(backend_cls, policy_cls, m
         for i in range(size):
             d[f"k{i:05d}"] = "v"
 
-        total, restore = _count_enumerated(d.disk_backend)
+        total, restore = _count_enumerated(d._store.backend)
         try:
             assert ("absent" in d) is False
         finally:
@@ -154,13 +154,6 @@ def test_membership_time_is_flat(make_dict):
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "a promoted entry is never marked clean, so evicting it rewrites a value "
-        "the disk already holds (issue 1.3)"
-    ),
-)
 def test_read_only_pass_performs_no_writes(make_dict, backend_spy):
     """Reading 500 keys through a 50-key cache must not write anything.
 
@@ -181,9 +174,9 @@ def test_read_only_pass_performs_no_writes(make_dict, backend_spy):
     # against a correct implementation. Seeding removes the dependency on which
     # victim the policy picks.
     for key in keys:
-        d.disk_backend.serialize(key, f"v-{key}")
+        d._store.backend.serialize(key, f"v-{key}")
 
-    with backend_spy(d.disk_backend) as spy:
+    with backend_spy(d._store.backend) as spy:
         for key in keys:
             assert d[key] == f"v-{key}"
 
@@ -220,7 +213,7 @@ def test_bulk_write_does_not_issue_one_call_per_item(make_dict, backend_spy):
     items = {f"k{i:05d}": "v" for i in range(3000)}
     d = make_dict(max_in_memory=10)
 
-    with backend_spy(d.disk_backend) as spy:
+    with backend_spy(d._store.backend) as spy:
         d.load_from_dict(items)
 
         per_item = spy.count("serialize")
@@ -332,4 +325,55 @@ def test_stored_size_grows_linearly_with_the_data(request, backend_cls, tmp_path
     assert growth < 4 * 1.6, (
         f"4x the items took {growth:.1f}x the space "
         f"({sizes[250]} -> {sizes[1000]} bytes)"
+    )
+
+
+class _CountingPolicy(LRUPolicy):
+    """An LRU policy that reports how many keys each selection call walks."""
+
+    def __init__(self):
+        super().__init__()
+        self.visited = 0
+
+    def victims(self):
+        order = list(super().victims())
+        self.visited += len(order)
+        return iter(order)
+
+    def victim(self):
+        self.visited += 1
+        return super().victim()
+
+
+@pytest.mark.parametrize("size", [SMALL, LARGE])
+def test_shedding_one_entry_does_not_walk_the_cache(size):
+    """One write past the bound must not cost the size of the cache.
+
+    The steady state of a bounded cache is one eviction per write, so this is
+    nearly every call. ``victims()`` cannot serve it cheaply -- it has to build
+    the whole ordering before it yields anything -- while ``victim()`` reads the
+    ordering's endpoint, which is why the policy has both.
+
+    Counted rather than timed, like the write guards above: the number of keys
+    the policy was asked to walk is the thing that grows, and at 100 entries a
+    timer cannot tell a scan from a lookup. Asserted as a constant rather than a
+    ratio because the correct answer does not depend on the size at all -- one
+    victim, one key visited -- and a ratio would accept a scan that got twice as
+    expensive in both runs.
+    """
+    policy = _CountingPolicy()
+    cache = Cache(policy=policy, max_items=size)
+    for index in range(size):
+        cache.put(f"k{index}", "v")
+    cache.put("one-too-many", "v")
+
+    policy.visited = 0
+    candidates = list(cache.evict_candidates())
+
+    assert len(candidates) == 1, (
+        f"one entry over a {size}-entry budget named {len(candidates)} victims"
+    )
+    assert policy.visited == 1, (
+        f"selecting one victim from a {size}-entry cache walked "
+        f"{policy.visited} keys"
     )

@@ -32,7 +32,6 @@ from effidict import EffiDict
 
 from .helpers import (
     EAGER_ITERATOR_TYPES,
-    PROMOTING_POLICIES,
     cached_keys,
     in_cache,
     on_disk,
@@ -119,15 +118,13 @@ _ORDER_SCRIPT = textwrap.dedent(
     """
     import sys
     sys.path.insert(0, {repo!r})
-    from effidict import EffiDict, {backend}, FIFOReplacement
-    from tests.helpers import build_policy  # see the note in test_concurrency
+    from effidict import EffiDict, {backend}, FIFOPolicy
 
     backend = {backend}({path!r})
     store = EffiDict(
         disk_backend=backend,
-        replacement_strategy=build_policy(
-            FIFOReplacement, disk_backend=backend, max_in_memory=4
-        ),
+        policy=FIFOPolicy(),
+        max_in_memory=4,
     )
     for key in {keys!r}:
         store[key] = key
@@ -411,33 +408,24 @@ def test_equality_between_stores_is_by_contents(make_dict):
 
 
 def test_eq_does_not_mutate_either_operand(
-    request, backend_cls, policy_cls, make_dict, backend_spy
+    backend_cls, policy_cls, make_dict, backend_spy
 ):
     """Comparing two stores must leave both exactly as they were.
 
-    ``__eq__`` reads through ``items()``, so on a promoting policy it pulls disk
-    keys into the cache and evicts others -- an observation that changes what it
-    observes.
+    ``__eq__`` reads through ``items()``, which on a store that pulled disk
+    keys into the cache as it read them would evict others -- an observation
+    that changes what it observes.
 
-    Cache membership alone is too weak to catch this. MRU promotes a key and then
-    immediately evicts it again, because its victim is the entry just inserted, so
-    the set of resident keys is unchanged while a disk write has still happened
-    mid-comparison. The backend spy is what actually detects it, and the xfail is
-    scoped at runtime to the promoting policies -- Random, FIFO and LIFO read
-    straight through without caching and already satisfy this.
+    Cache membership alone is too weak to catch that. MRU promotes a key and
+    then immediately evicts it again, because its victim is the entry just
+    inserted, so the set of resident keys is unchanged while a disk write has
+    still happened mid-comparison. The backend spy is what actually detects it.
+
+    Every policy satisfies this since issue 1.2, which stopped ``Store.get``
+    promoting. The runtime xfail that scoped this to the promoting policies
+    went with them: the set it tested has been empty ever since, so it could
+    never fire.
     """
-    if policy_cls in PROMOTING_POLICIES:
-        request.applymarker(
-            pytest.mark.xfail(
-                strict=True,
-                reason=(
-                    "__eq__ walks items(), which promotes every key through the "
-                    "policy and writes evicted entries back out, so comparing "
-                    "mutates both operands (issue 6.2)"
-                ),
-            )
-        )
-
     left = make_dict(max_in_memory=3)
     right = make_dict(max_in_memory=3)
     for key in ORDERED_KEYS[:8]:
@@ -450,8 +438,8 @@ def test_eq_does_not_mutate_either_operand(
     # Both operands are spied. __eq__ walks self.items() *and* reads other[key],
     # so the right-hand store is promoted too -- watching only the left would let
     # a mutation of the right slip past the assertion this test makes.
-    with backend_spy(left.disk_backend) as left_spy:
-        with backend_spy(right.disk_backend) as right_spy:
+    with backend_spy(left._store.backend) as left_spy:
+        with backend_spy(right._store.backend) as right_spy:
             assert left == right
 
             left_writes = left_spy.count("serialize") + left_spy.count("write_many")
@@ -522,10 +510,10 @@ def test_facade_iter_keys_streams_the_whole_keyspace(make_dict, backend_spy):
     # union has to be a union rather than a concatenation.
     dual = expected[-1]
     assert in_cache(d, dual), "precondition: the last write is still cached"
-    d.disk_backend.serialize(dual, f"v-{dual}")
+    d._store.backend.serialize(dual, f"v-{dual}")
     assert on_disk(d, dual), "precondition: the probe key is now in both tiers"
 
-    with backend_spy(d.disk_backend) as spy:
+    with backend_spy(d._store.backend) as spy:
         stream = d.iter_keys()
 
         assert iter(stream) is stream, (
