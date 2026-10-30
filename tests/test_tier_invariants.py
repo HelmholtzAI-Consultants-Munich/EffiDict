@@ -248,13 +248,14 @@ def test_clean_eviction_performs_no_io(
     A read-only pass over keys already on disk must not write. Measured with a
     call spy, not a timer.
 
-    Every policy satisfies this since issue 1.2: ``Store.get`` answers from one
-    path and promotes nothing, so a read evicts nothing and therefore writes
-    nothing. This used to be scoped at runtime to the policies that promoted on
-    read, against a set that has been empty ever since -- a branch that could
-    not be taken and a marker that could not fire, so both are gone. If issue
-    1.3 brings promotion back, a promoted entry carries the clean tag and still
-    writes nothing here, which is what this spec is for.
+    What this covers, and what it does not. ``Store.get`` does not promote, so
+    the pass below caches nothing, evicts nothing, and reaches zero writes
+    without the clean/dirty tag being consulted at all -- restoring
+    unconditional eviction writes leaves it green. It is still the spec that
+    states the cost in the terms a caller feels, and it becomes load-bearing
+    the moment a read fills the cache (promotion, issue 4.2). The tag itself is
+    guarded by ``test_evicting_a_clean_entry_writes_nothing`` below, which
+    drives the eviction the facade cannot reach yet.
     """
     d = make_dict(max_in_memory=5)
     keys = [f"k{i}" for i in range(30)]
@@ -279,6 +280,64 @@ def test_clean_eviction_performs_no_io(
         # exactly when the code it guards gained a second way to write.
         writes = spy.count("serialize") + spy.count("write_many")
         assert writes == 0, f"a read-only pass issued {writes} writes"
+
+
+
+def test_evicting_a_clean_entry_writes_nothing(
+    backend_cls, policy_cls, make_dict, backend_spy
+):
+    """I5, first half. A victim disk already holds costs nothing to drop.
+
+    The only caller that fills the cache today is a write, and a write is dirty
+    by definition, so no clean entry is reachable through the facade until
+    ``flush`` (issue 1.4) or promotion (issue 4.2). The entries are therefore
+    placed directly, which is the one way to exercise the branch the eviction
+    path takes on them.
+
+    Policy-independent by construction rather than by assumption: three clean
+    entries against a one-item budget leave a surplus of three once the trigger
+    write lands, so whichever three the policy picks, at least two of them are
+    clean. The assertion is per key -- the trigger is dirty and may legitimately
+    be written -- so no policy has to be special-cased.
+    """
+    d = make_dict(max_in_memory=1)
+    clean = {f"clean{index}": f"v-clean{index}" for index in range(3)}
+
+    # Seeded on disk first. "Clean" asserts that disk already holds this exact
+    # value, and an entry marked clean that disk never had is a lie the
+    # eviction believes: it is dropped without ever being written, and the
+    # value is gone.
+    for key, value in clean.items():
+        d._store.backend.serialize(key, value)
+        d._store.cache.put(key, value, dirty=False)
+
+    with backend_spy(d._store.backend) as spy:
+        d["trigger"] = "v-trigger"
+
+        written = {
+            call[1][0] for call in spy.calls if call[0] == "serialize"
+        }
+        # Counting ``serialize`` by key leaves the batch route uncounted, so
+        # this fails loudly rather than quietly if issue 4.1 routes eviction
+        # through ``write_many`` before this spec learns to read its keys.
+        assert spy.count("write_many") == 0, (
+            "eviction wrote through write_many; this spec only reads keys out "
+            "of serialize and would stop seeing clean writes"
+        )
+
+    evicted = [key for key in clean if not in_cache(d, key)]
+    assert len(evicted) >= 2, (
+        f"three clean entries over a one-item budget should have shed at "
+        f"least two, but {len(evicted)} left the cache: the eviction this "
+        f"spec measures did not happen"
+    )
+    assert not written & set(evicted), (
+        f"evicting a clean entry wrote it back: {sorted(written & set(evicted))}"
+    )
+
+    # And the drop was safe: disk still answers for every one of them.
+    for key, value in clean.items():
+        assert d[key] == value, f"{key} did not survive its eviction"
 
 
 def test_reading_a_cached_key_never_writes(backend_cls, policy_cls, make_dict, backend_spy):
