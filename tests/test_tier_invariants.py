@@ -23,7 +23,6 @@ from effidict import DiskBackend, EvictionPolicy, SqliteBackend
 
 from .helpers import (
     HOLD_SECONDS,
-    PROMOTING_POLICIES,
     WAIT_SECONDS,
     cached_bytes,
     cached_keys,
@@ -242,29 +241,21 @@ def test_no_key_is_ever_absent_from_both_tiers(
 
 
 def test_clean_eviction_performs_no_io(
-    request, backend_cls, policy_cls, make_dict, backend_spy
+    backend_cls, policy_cls, make_dict, backend_spy
 ):
     """I5, I6. Evicting an unmodified entry is a memory drop with zero writes.
 
     A read-only pass over keys already on disk must not write. Measured with a
     call spy, not a timer.
 
-    The defect is policy-scoped, so the xfail is applied at runtime rather than
-    as a blanket decorator: Random/FIFO/LIFO read straight through without
-    caching, so they never evict during a read and already satisfy I5. Only the
-    promoting policies write back a value the disk already holds.
+    Every policy satisfies this since issue 1.2: ``Store.get`` answers from one
+    path and promotes nothing, so a read evicts nothing and therefore writes
+    nothing. This used to be scoped at runtime to the policies that promoted on
+    read, against a set that has been empty ever since -- a branch that could
+    not be taken and a marker that could not fire, so both are gone. If issue
+    1.3 brings promotion back, a promoted entry carries the clean tag and still
+    writes nothing here, which is what this spec is for.
     """
-    if policy_cls in PROMOTING_POLICIES:
-        request.applymarker(
-            pytest.mark.xfail(
-                strict=True,
-                reason=(
-                    "I5/I6: a promoted entry is never marked clean, so evicting "
-                    "it rewrites a value the disk already holds (issue 1.3)"
-                ),
-            )
-        )
-
     d = make_dict(max_in_memory=5)
     keys = [f"k{i}" for i in range(30)]
 
@@ -335,7 +326,10 @@ def test_membership_of_a_cached_key_never_touches_the_backend(
 
 @pytest.mark.xfail(
     strict=True,
-    reason="I3: __contains__ calls disk_backend.keys(), an O(N) scan (issue 2.2)",
+    reason=(
+        "I3: backend.has() answers by listing every key, so membership still "
+        "scans the keyspace (issue 2.2)"
+    ),
 )
 @pytest.mark.parametrize("resident", [False, True], ids=["miss", "on-disk"])
 def test_membership_never_lists_the_keyspace(

@@ -85,8 +85,8 @@ def _count_enumerated(backend):
 @pytest.mark.xfail(
     strict=True,
     reason=(
-        "__contains__ calls disk_backend.keys(), so the work it does grows with "
-        "the size of the store (issue 2.2)"
+        "membership reaches backend.has(), which answers by listing every "
+        "key, so the work grows with the size of the store (issue 2.2)"
     ),
 )
 def test_membership_cost_does_not_grow_with_the_store(backend_cls, policy_cls, make_dict):

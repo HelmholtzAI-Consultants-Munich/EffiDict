@@ -32,20 +32,6 @@ from effidict import (
     SqliteBackend,
 )
 
-#: Policies whose ``get`` writes a disk value back into the cache. Only these
-#: can mutate the cache during a read, so only these violate I6 -- several
-#: specs need to scope their expectations to this set rather than assuming the
-#: defect is universal.
-#:
-#: Empty since issue 1.2. Promotion used to be per-strategy: four of the seven
-#: wrote the loaded value back, three read straight through. ``Store.get`` now
-#: answers from one path for every policy and does not promote, because
-#: promoting without the clean/dirty tag means evicting, and evicting means
-#: writing a value the disk already holds. Issue 1.3 may reintroduce promotion
-#: once that tag exists, and this set is where it would be recorded.
-PROMOTING_POLICIES = set()
-
-
 def _ndarray():
     if np is None:  # pragma: no cover
         raise RuntimeError("numpy is required for the 'ndarray' value kind")

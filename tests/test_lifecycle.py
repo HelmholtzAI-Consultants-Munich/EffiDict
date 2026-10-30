@@ -162,7 +162,11 @@ def test_copying_does_not_destroy_the_originals_storage(backend_cls, make_dict):
 
 @pytest.mark.xfail(
     strict=True,
-    reason="clone() is a contract stub (issue 3.2)",
+    reason=(
+        "flush() is a contract stub (issue 1.4), so this stops there and "
+        "never reaches the clone() it is about -- which is a stub of its own "
+        "(issue 3.2), so 1.4 alone will not turn it green"
+    ),
 )
 def test_clone_produces_independent_store(backend_cls, make_dict, storage_dir):
     """``clone(new_path)`` must produce a store that shares nothing.

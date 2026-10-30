@@ -325,7 +325,11 @@ def test_temporary_stores_clean_up_after_themselves(backend_cls):
 
 @pytest.mark.xfail(
     strict=True,
-    reason="close() is a contract stub on the backend (issue 3.1)",
+    reason=(
+        "create() is a contract stub (issue 2.1), so this stops there and "
+        "never reaches the close() it is about -- which is a stub of its own "
+        "(issue 3.1), so 2.1 alone will not turn it green"
+    ),
 )
 def test_backend_close_is_idempotent_and_keeps_the_storage(backend_cls, storage_dir):
     """``close()`` must release handles, survive a second call, and keep the data.

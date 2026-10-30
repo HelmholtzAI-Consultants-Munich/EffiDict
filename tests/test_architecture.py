@@ -34,10 +34,23 @@ from __future__ import annotations
 import gc
 import inspect
 import threading
+from collections import OrderedDict
 
 import pytest
 
-from effidict import Cache, EffiDict, EvictionPolicy, PickleBackend, Store
+from effidict import (
+    Cache,
+    EffiDict,
+    EvictionPolicy,
+    FIFOPolicy,
+    LFUPolicy,
+    LIFOPolicy,
+    LRUPolicy,
+    MFUPolicy,
+    MRUPolicy,
+    PickleBackend,
+    Store,
+)
 
 #: The documented ``Store`` surface, as issue 0.1 wrote it. Each entry is the
 #: name plus the positional parameter names after ``self``, so a Phase 1
@@ -290,7 +303,10 @@ def test_effidict_delegates_placement_to_a_store(make_dict):
 
 @pytest.mark.xfail(
     strict=True,
-    reason="Cache is a contract stub; clean/dirty tagging does not exist (issue 1.3)",
+    reason=(
+        "is_dirty/mark_clean/dirty_items raise: there is no clean/dirty tag "
+        "for them to answer from (issue 1.3)"
+    ),
 )
 def test_cache_tags_entries_clean_or_dirty():
     """I2. A cache entry must know whether disk already has it.
@@ -357,21 +373,8 @@ class RecordingPolicy(EvictionPolicy):
         self.order.clear()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Cache is a contract stub, so this dies at the constructor (issue 1.2) "
-        "before it can reach the thing it pins -- neither budget is enforced "
-        "(issue 1.4). It also exercises has/discard, which are 1.2 as well, so "
-        "it stays red until both land"
-    ),
-)
-def test_cache_reports_what_must_be_shed_for_each_budget():
-    """I8. Either budget alone must put entries on the eviction list.
-
-    Two budgets, two separate failure modes: today ``max_in_memory`` counts items
-    and ``max_bytes`` is accepted and dropped, which is how a hundred 1 MB values
-    fit a "hundred-item" cache.
+def test_cache_reports_what_must_be_shed_for_the_item_budget():
+    """I8, item half. Going over ``max_items`` must put entries on the list.
 
     Asserted as *what the cache says must go*, not as the cache having already
     dropped it. An earlier version of this spec demanded ``len(cache) <= 2``
@@ -387,6 +390,12 @@ def test_cache_reports_what_must_be_shed_for_each_budget():
     falls outside the contract as written. If issue 1.4 wants watermark
     eviction, this assertion and that docstring change together -- which is the
     point of pinning it here rather than discovering the disagreement later.
+
+    Green since issue 1.2, and red for longer than it had to be: this used to
+    share a test with the byte budget, which dies at ``nbytes()``, and one
+    failure marks a whole test expected-to-fail. The two budgets are missing
+    for different reasons and land in different issues, so they are pinned
+    apart -- and this half guards the item path again.
     """
     by_items = Cache(policy=RecordingPolicy(), max_items=2)
     for index in range(5):
@@ -423,6 +432,26 @@ def test_cache_reports_what_must_be_shed_for_each_budget():
         "the cache is inside its budget but still names candidates to shed"
     )
 
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "the byte budget is not tracked at all: nbytes() is a contract stub "
+        "that raises, so max_bytes is accepted and dropped (issue 1.4)"
+    ),
+)
+def test_cache_reports_what_must_be_shed_for_the_byte_budget():
+    """I8, byte half. Going over ``max_bytes`` must put entries on the list too.
+
+    Two budgets, two separate failure modes: ``max_items`` counts items and is
+    enforced, while ``max_bytes`` is recorded and never consulted -- which is
+    how a hundred 1 MB values fit a "hundred-item" cache. The first assertion
+    below is where that shows, since ``nbytes()`` cannot even report what is
+    resident.
+
+    The item half is
+    ``test_cache_reports_what_must_be_shed_for_the_item_budget``, which passes.
+    """
     by_bytes = Cache(
         policy=RecordingPolicy(),
         max_items=1000,
@@ -454,9 +483,157 @@ def test_cache_reports_what_must_be_shed_for_each_budget():
     )
 
 
+#: What each policy has to give up when the cache is three entries over a
+#: two-item budget. Derived from the policy semantics, not from a run: five keys
+#: go in as ``a`` to ``e``, then ``b`` is read twice and ``d`` once. That leaves
+#: insertion order a,b,c,d,e; last-use order a,c,e,b,d; and use counts a=1, b=3,
+#: c=1, d=2, e=1, with ties broken oldest-first. Each entry below is the first
+#: three of that policy's own ordering.
+MULTI_KEY_SHED = {
+    FIFOPolicy: ["a", "b", "c"],  # oldest inserted first
+    LIFOPolicy: ["e", "d", "c"],  # newest inserted first
+    LRUPolicy: ["a", "c", "e"],   # least recently used first
+    MRUPolicy: ["d", "b", "e"],   # most recently used first
+    LFUPolicy: ["a", "c", "e"],   # the three keys still at one use
+    MFUPolicy: ["b", "d", "a"],   # 3 uses, then 2, then the oldest of the ones
+}
+
+
+def _over_budget_by_three(policy):
+    """A two-item cache holding the five keys the table above was derived from."""
+    cache = Cache(policy=policy, max_items=2)
+    for key in "abcde":
+        cache.put(key, f"v-{key}")
+    for key in ("b", "b", "d"):
+        cache.get(key)
+    return cache
+
+
+@pytest.mark.parametrize(
+    "policy_cls, expected",
+    [pytest.param(cls, shed, id=cls.__name__) for cls, shed in MULTI_KEY_SHED.items()],
+)
+def test_cache_sheds_exactly_the_surplus_in_victim_order(policy_cls, expected):
+    """Several keys at once, in the policy's order, and not one key more.
+
+    The single-key shed is the steady state -- ``Store`` spills after every
+    ``put``, so the surplus is one -- and it has a fast path of its own that
+    reads the ordering's endpoint. This is the other branch: the one a bulk
+    ``update`` (issue #4.1) or a byte budget (issue #1.4) reaches, where the
+    cache is several entries over at once and has to take a *prefix* of the
+    policy's ordering rather than its first element.
+
+    Two things are pinned, and the literal list pins both: the count, because
+    "the keys that must be shed to get back inside budget" is exactly the
+    surplus and a cache shedding to a low-water mark would be answering a
+    different question; and the order, because the owner writes these out in
+    the order it is handed them, so a prefix of the wrong end of the ordering
+    evicts the keys the policy was protecting.
+    """
+    cache = _over_budget_by_three(policy_cls())
+
+    candidates = list(cache.evict_candidates())
+
+    assert candidates == expected, (
+        f"{policy_cls.__name__} is three entries over a two-item budget and "
+        f"named {candidates}; its own ordering gives {expected}"
+    )
+    # Naming is not removing. The owner has to peek the value and write it out
+    # before it goes, which it cannot do for a key the cache already dropped --
+    # the half of I5 that keeps a dirty victim recoverable.
+    assert len(cache) == 5, (
+        f"evict_candidates dropped entries by itself: {len(cache)} of 5 held"
+    )
+    assert all(cache.has(key) for key in expected), (
+        f"evict_candidates removed keys it had only named: "
+        f"{[key for key in expected if not cache.has(key)]}"
+    )
+
+
+class _LiveOrderPolicy(EvictionPolicy):
+    """A conforming policy that enumerates its live ordering, not a snapshot.
+
+    ``EvictionPolicy.victims`` asks for the tracked keys in eviction order and
+    says nothing about copying them first. The seven shipped policies do copy,
+    for reasons of their own, and so does :class:`RecordingPolicy` -- so none of
+    them can tell whether ``Cache`` reads the candidates out before handing
+    them over or passes a half-finished walk to the caller. This one can.
+
+    Eviction order is insertion order, which is all this needs; ``on_access``
+    has nothing to record.
+    """
+
+    def __init__(self):
+        self._keys = OrderedDict()
+
+    def on_insert(self, key):
+        self._keys[key] = None
+
+    def on_access(self, key):
+        """Nothing to record: eviction order here is insertion order."""
+
+    def on_remove(self, key):
+        self._keys.pop(key, None)
+
+    def victim(self):
+        if not self._keys:
+            raise KeyError("no keys are being tracked")
+        return next(iter(self._keys))
+
+    def victims(self):
+        return iter(self._keys)
+
+    def clear(self):
+        self._keys.clear()
+
+
+def test_cache_candidates_survive_being_discarded_while_walked():
+    """The owner discards as it walks, so the walk cannot still be running.
+
+    ``Store._spill`` peeks a candidate, writes it out and discards it before
+    asking for the next one. It has to: holding every victim until the end
+    would keep the memory it is restoring. ``Cache`` therefore promises the
+    candidates are read out of the policy *before* they are handed over -- "the
+    caller may discard what it is handed while walking it".
+
+    A cache that passed the policy's iterator straight through, taking keys
+    only as the caller asked for them, satisfies every other assertion in this
+    file: the shipped policies copy their ordering first, so the discards land
+    on something the walk is not reading. Against a policy that does not copy,
+    the discard mutates the ordering mid-walk and the next key raises instead
+    of arriving.
+    """
+    cache = Cache(policy=_LiveOrderPolicy(), max_items=2)
+    for key in "abcde":
+        cache.put(key, f"v-{key}")
+
+    shed = []
+    try:
+        for key in cache.evict_candidates():
+            shed.append(key)
+            cache.discard(key)
+    except RuntimeError as exc:
+        raise AssertionError(
+            f"the candidates were handed over as an unfinished walk, so the "
+            f"owner's own discard broke it after {shed}: {exc}"
+        ) from exc
+
+    assert shed == ["a", "b", "c"], (
+        f"three entries over a two-item budget, oldest first, should shed "
+        f"a, b, c; shed {shed}"
+    )
+    assert len(cache) == 2, (
+        f"{len(cache)} entries are left against a two-item budget after "
+        f"discarding every candidate the cache named"
+    )
+
+
 @pytest.mark.xfail(
     strict=True,
-    reason="Cache is a contract stub; size_estimator is never consulted (issue 1.4)",
+    reason=(
+        "size_estimator is recorded and never consulted, and nbytes() raises "
+        "rather than measuring what is resident (issue 1.4)"
+    ),
 )
 def test_cache_measures_values_with_the_size_estimator():
     """``size_estimator`` must actually be used, not assumed to be ``len``.
