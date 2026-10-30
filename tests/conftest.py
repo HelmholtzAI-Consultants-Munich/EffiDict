@@ -286,6 +286,12 @@ class BackendSpy:
 #: that really stopped it while its strict marker goes on passing, so nobody is
 #: told the thing it was written for is still untested. Two markers in this
 #: suite had drifted that way before this check existed.
+#:
+#: Scaffolding, with an end date. It is worth having only while most of this
+#: suite is red; once the implementation phases are done nothing raises
+#: ``see issue #N`` any more, there is nothing left to compare, and this costs a
+#: hook call per test for no answer. PLAN.md's Phase 8 lists it for removal,
+#: together with its two specs in ``test_harness.py``.
 _STUB_ISSUE = re.compile(r"see issue #(\d+\.\d+)")
 _CITED_ISSUE = re.compile(r"\d+\.\d+")
 
