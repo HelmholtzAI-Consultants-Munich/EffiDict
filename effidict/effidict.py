@@ -110,8 +110,8 @@ class EffiDict:
         raise NotImplementedError("see issue #4.2")
 
     def flush(self):
-        """Flush dirty cached entries to storage."""
-        raise NotImplementedError("see issue #1.4")
+        """Write every dirty cached entry to storage (I7)."""
+        self._store.flush()
 
     def clone(self, new_path):
         """Clone this dictionary to ``new_path``."""

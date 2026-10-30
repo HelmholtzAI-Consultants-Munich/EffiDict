@@ -384,8 +384,28 @@ class Store:
             self._backend.load_from_dict(dictionary)
 
     def flush(self) -> None:
-        """Write dirty cached items to the backend."""
-        raise NotImplementedError("see issue #1.4")
+        """Write every dirty cached entry to the backend and mark it clean.
+
+        I7: after this returns, disk holds every write the cache was carrying.
+        Until it is called, a value written into a cache with room never
+        reaches the backend at all -- there was no way to force it there, which
+        is what made an unflushed store unrecoverable.
+
+        Collected before writing, not walked lazily: ``mark_clean`` replaces the
+        entry it is marking, and ``dirty_items`` reads the live dict, so
+        consuming the two together would mutate what is being iterated.
+
+        One write per entry for now. The batch path that makes this one call is
+        issue #4.1, and ``write_many`` is its contract stub today.
+
+        Marking clean is what makes the flush worth anything beyond the write:
+        those entries can then be evicted without being written again, which is
+        the half of I5 that costs nothing.
+        """
+        with self._lock:
+            for key, value in list(self._cache.dirty_items()):
+                self._backend.serialize(key, value)
+                self._cache.mark_clean(key)
 
     def close(self) -> None:
         """Close store resources without destroying storage.

@@ -426,13 +426,6 @@ def test_cache_reports_what_must_be_shed_for_the_item_budget():
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "the byte budget is not tracked at all: nbytes() is a contract stub "
-        "that raises, so max_bytes is accepted and dropped (issue 1.4)"
-    ),
-)
 def test_cache_reports_what_must_be_shed_for_the_byte_budget():
     """I8, byte half. Going over ``max_bytes`` must put entries on the list too.
 
@@ -543,6 +536,53 @@ def test_cache_sheds_exactly_the_surplus_in_victim_order(policy_cls, expected):
     )
 
 
+def test_a_write_the_estimator_rejects_leaves_no_trace():
+    """A value the cache cannot size must not be half-recorded.
+
+    ``size_estimator`` is caller-supplied code running over an arbitrary value,
+    so it can raise -- a custom estimator refusing a type, pandas unhappy with
+    an exotic dtype. Everything else ``put`` does is bookkeeping that cannot
+    fail, which makes the order the whole story: estimate first and a rejected
+    write leaves nothing behind; tell the policy first and it goes on offering
+    a key the cache does not hold.
+
+    The consequence is not confined to the failed call. The policy names that
+    phantom as a victim on some later, perfectly valid write, and the eviction
+    path strands on a key it cannot peek -- so the caller sees ``KeyError`` for
+    a key they never successfully stored, nowhere near the write that caused it.
+    """
+
+    def picky(value):
+        if value == "unmeasurable":
+            raise TypeError("cannot size this")
+        return 10
+
+    policy = RecordingPolicy()
+    cache = Cache(policy=policy, max_items=2, size_estimator=picky)
+
+    with pytest.raises(TypeError):
+        cache.put("rejected", "unmeasurable")
+
+    assert not cache.has("rejected"), "the rejected value was stored anyway"
+    assert policy.calls == [], (
+        f"the policy was told about a write that failed: {policy.calls}"
+    )
+    assert cache.nbytes() == 0, (
+        f"a rejected write left {cache.nbytes()} bytes on the books"
+    )
+
+    # The delayed half: eviction must still only ever name residents.
+    for key in ("a", "b", "c"):
+        cache.put(key, "v")
+    victims = list(cache.evict_candidates())
+    assert victims, "precondition: three entries over a two-item budget shed one"
+    stranded = [key for key in victims if not cache.has(key)]
+    assert not stranded, (
+        f"eviction named {stranded}, which the cache does not hold: a failed "
+        f"write left the policy tracking it"
+    )
+
+
 class _LiveOrderPolicy(EvictionPolicy):
     """A conforming policy that enumerates its live ordering, not a snapshot.
 
@@ -621,13 +661,6 @@ def test_cache_candidates_survive_being_discarded_while_walked():
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "size_estimator is recorded and never consulted, and nbytes() raises "
-        "rather than measuring what is resident (issue 1.4)"
-    ),
-)
 def test_cache_measures_values_with_the_size_estimator():
     """``size_estimator`` must actually be used, not assumed to be ``len``.
 
