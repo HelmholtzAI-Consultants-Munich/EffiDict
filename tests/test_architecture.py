@@ -301,13 +301,6 @@ def test_effidict_delegates_placement_to_a_store(make_dict):
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "is_dirty/mark_clean/dirty_items raise: there is no clean/dirty tag "
-        "for them to answer from (issue 1.3)"
-    ),
-)
 def test_cache_tags_entries_clean_or_dirty():
     """I2. A cache entry must know whether disk already has it.
 

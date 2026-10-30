@@ -30,6 +30,10 @@ class Cache:
         self.max_items = max_items
         self.max_bytes = max_bytes
         self.size_estimator = size_estimator
+        #: key -> (value, dirty). One container rather than a parallel
+        #: dirty set, so a key cannot be dropped from one and left in the
+        #: other -- the phantom-state defect ``on_remove`` exists to avoid
+        #: in the policies.
         self._values = {}
 
     def __iter__(self) -> Iterator:
@@ -41,14 +45,18 @@ class Cache:
         return key in self._values
 
     def get(self, key):
-        """Return ``key`` and record access, or raise ``KeyError`` if absent."""
-        value = self._values[key]
+        """Return ``key`` and record access, or raise ``KeyError`` if absent.
+
+        Reading does not touch the tag: I6 says a read never marks an entry
+        dirty, so a clean entry stays free to evict however often it is read.
+        """
+        value, _ = self._values[key]
         self.policy.on_access(key)
         return value
 
     def peek(self, key):
         """Return ``key`` without recording access, or raise ``KeyError``."""
-        return self._values[key]
+        return self._values[key][0]
 
     def put(self, key, value, dirty: bool = True) -> None:
         """Store ``value`` under ``key`` and record dirty state.
@@ -60,14 +68,17 @@ class Cache:
         ``test_mfu_replacement_keeps_frequency_across_a_value_update`` pins
         against the strategies this class replaces.
 
-        ``dirty`` is recorded by issue #1.3, which adds the clean/dirty tag.
-        Until then ``Store`` writes every victim out, not only the dirty ones.
+        ``dirty=True`` is the right default because the ordinary caller is a
+        write: ``Store.set`` puts a value the disk does not have yet. Only a
+        caller that knows disk already holds this exact value may pass
+        ``False``, and being wrong about that loses data -- the entry would be
+        dropped at eviction without ever being written.
         """
         if key in self._values:
             self.policy.on_access(key)
         else:
             self.policy.on_insert(key)
-        self._values[key] = value
+        self._values[key] = (value, dirty)
 
     def discard(self, key) -> None:
         """Remove ``key`` if present without raising when absent."""
@@ -89,16 +100,35 @@ class Cache:
         raise NotImplementedError("see issue #1.4")
 
     def is_dirty(self, key) -> bool:
-        """Return whether ``key`` has unwritten cache changes."""
-        raise NotImplementedError("see issue #1.3")
+        """Return whether ``key`` has unwritten cache changes.
+
+        Raises ``KeyError`` for a key the cache does not hold, like ``peek``:
+        "is it dirty?" has no answer for an absent key, and returning ``False``
+        would read as "clean, safe to drop".
+        """
+        return self._values[key][1]
 
     def mark_clean(self, key) -> None:
-        """Mark ``key`` as having no unwritten cache changes."""
-        raise NotImplementedError("see issue #1.3")
+        """Mark ``key`` as having no unwritten cache changes.
+
+        For the caller that has just written the value out -- ``flush`` in
+        issue #1.4. There is deliberately no ``mark_dirty``: an entry becomes
+        dirty by being written through ``put``, which is the only way its value
+        can diverge from disk.
+        """
+        value, _ = self._values[key]
+        self._values[key] = (value, False)
 
     def dirty_items(self) -> Iterator:
-        """Iterate over cached items with unwritten changes."""
-        raise NotImplementedError("see issue #1.3")
+        """Iterate ``(key, value)`` for the entries disk does not have.
+
+        What ``flush`` has to write (I7, issue #1.4). A generator over the live
+        dict, so a caller that marks entries clean while walking it would be
+        mutating what it is reading -- ``flush`` collects first for that reason.
+        """
+        return (
+            (key, value) for key, (value, dirty) in self._values.items() if dirty
+        )
 
     def evict_candidates(self) -> Iterator:
         """Iterate over keys that must be shed to get back inside budget.
