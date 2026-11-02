@@ -29,8 +29,12 @@ class EffiDict:
         required: a store with no bound never spills, which is the one thing
         this library exists to do.
 
-        ``max_bytes`` is accepted as the approximate cache byte budget, but it is
-        not enforced yet; see issue #1.4.
+        ``max_bytes`` is the cache's byte budget, enforced alongside
+        ``max_in_memory``: entries are shed while either bound is exceeded,
+        whichever binds first. Left as ``None`` it constrains nothing and the
+        item count is the only bound. Approximate, because the sizes come from
+        an estimator over arbitrary Python objects -- ``Cache`` documents what
+        that can and cannot account for.
         """
         self._store = Store(
             backend=disk_backend,
