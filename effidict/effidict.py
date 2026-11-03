@@ -28,7 +28,14 @@ class EffiDict:
         arguments -- so the bound that used to live on the strategy is now
         ``max_in_memory`` here, and it becomes the cache's item budget. It is
         required: a store with no bound never spills, which is the one thing
-        this library exists to do.
+        this library exists to do. Being *declared* required is not enough --
+        ``max_in_memory=None`` satisfies the signature and then reaches
+        ``Cache`` as "no item budget", where fifty writes stay fifty resident
+        entries and nothing reaches the backend at all. It is checked here
+        rather than left to ``Cache``, because this is the boundary the
+        documented API presents. ``0`` is refused with it: a cache with no room
+        evicts every value as it is written, which may well be a reasonable
+        mode one day, but it is not one anything here tests.
 
         ``max_bytes`` is the cache's byte budget, enforced alongside
         ``max_in_memory``: entries are shed while either bound is exceeded,
@@ -44,6 +51,16 @@ class EffiDict:
         than that of what it holds. It is consulted on every write, so
         ``nbytes()`` answers whether or not ``max_bytes`` is set.
         """
+        if isinstance(max_in_memory, bool) or not isinstance(max_in_memory, int):
+            raise TypeError(
+                f"max_in_memory must be an int, not "
+                f"{type(max_in_memory).__name__}"
+            )
+        if max_in_memory < 1:
+            raise ValueError(
+                f"max_in_memory must be at least 1, not {max_in_memory}"
+            )
+
         self._store = Store(
             backend=disk_backend,
             cache=Cache(

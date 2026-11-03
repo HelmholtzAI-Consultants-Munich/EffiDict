@@ -119,6 +119,46 @@ def test_delitem_removes_key_from_both_tiers(backend_cls, policy_cls, make_dict)
     assert "target" not in d
 
 
+def test_a_failed_delete_leaves_both_tiers_as_they_were(
+    backend_cls, policy_cls, make_dict
+):
+    """I4. A delete that fails must not take the cached value with it.
+
+    ``del_item`` is the step that can fail -- a storage error, or SQLite
+    refusing a call from the thread it was not opened on (issue 2.3). Dropping
+    the cached copy before making that call means a *failed* delete discards
+    the newer in-memory value and leaves the stale copy on disk: the caller is
+    told the delete failed, and a later read then quietly answers with the old
+    value instead of the one they last wrote.
+
+    Both tiers have to survive the failure together, so that a delete which
+    raised simply did not happen.
+    """
+
+    class DeleteFails(backend_cls):
+        def del_item(self, key):
+            raise OSError("storage is unavailable")
+
+    # The class, not an instance: ``make_dict`` builds the backend itself so
+    # the leak detector can release it afterwards.
+    d = make_dict(backend=DeleteFails)
+    d["k"] = "old"
+    d.flush()               # disk holds "old"
+    d["k"] = "new"          # the cache is now ahead of disk
+
+    with pytest.raises(OSError):
+        del d["k"]
+
+    assert in_cache(d, "k"), (
+        "a delete that failed still dropped the cached value, so the stale "
+        "disk copy is all that is left"
+    )
+    assert d["k"] == "new", (
+        f"after a failed delete a read returned {d['k']!r}, the copy from "
+        f"before the last write"
+    )
+
+
 def test_delitem_missing_key_raises(backend_cls, policy_cls, make_dict):
     """I4. Deleting an absent key raises KeyError, like dict."""
     d = make_dict(max_in_memory=2)

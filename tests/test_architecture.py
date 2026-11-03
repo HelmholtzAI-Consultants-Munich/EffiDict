@@ -903,6 +903,74 @@ def test_a_store_given_a_lock_to_share_refuses_to_be_pickled(storage_dir):
         backend.destroy()
 
 
+def test_a_falsy_size_estimator_is_still_used():
+    """An estimator is a callable, not a truth value.
+
+    ``size_estimator or estimate_size`` reads as "use the default when none was
+    given", but it also replaces any estimator that happens to be falsy -- and
+    a callable object defining ``__len__``, such as one keeping a cache of
+    sizes it has already measured, is falsy for exactly as long as it is empty.
+    That is every call, because it never gets one. The cache then measures with
+    the default and nothing says so.
+    """
+
+    class Measured:
+        """Callable, and falsy until it has measured something."""
+
+        def __init__(self):
+            self.seen = 0
+
+        def __call__(self, value):
+            self.seen += 1
+            return 10
+
+        def __len__(self):
+            return self.seen
+
+    estimator = Measured()
+    cache = Cache(policy=RecordingPolicy(), max_items=10, size_estimator=estimator)
+    cache.put("a", "x")
+
+    assert estimator.seen == 1, (
+        "the cache never called the estimator it was given, so it fell back to "
+        "the default"
+    )
+    assert cache.nbytes() == 10, (
+        f"nbytes() reported {cache.nbytes()} for one value the estimator sizes "
+        f"at ten; sys.getsizeof would give about fifty"
+    )
+
+
+@pytest.mark.parametrize(
+    "bound, expected",
+    [(None, TypeError), ("ten", TypeError), (0, ValueError), (-1, ValueError)],
+    ids=["none", "string", "zero", "negative"],
+)
+def test_a_store_without_a_usable_bound_is_refused(bound, expected, storage_dir):
+    """Declaring ``max_in_memory`` required is not the same as requiring it.
+
+    ``max_in_memory=None`` satisfies the signature -- the parameter was passed
+    -- and reaches ``Cache`` as "no item budget", where nothing is ever over
+    budget, nothing is ever shed, and nothing reaches the backend. Fifty writes
+    leave fifty resident entries and an empty store on disk, which is the one
+    outcome this library exists to prevent, reached by the documented API
+    without a word of complaint.
+    """
+    backend = PickleBackend(str(storage_dir / "store"))
+    try:
+        with pytest.raises(expected) as raised:
+            EffiDict(
+                disk_backend=backend,
+                policy=FIFOPolicy(),
+                max_in_memory=bound,
+            )
+        assert "max_in_memory" in str(raised.value), (
+            f"the refusal does not name the parameter at fault: {raised.value}"
+        )
+    finally:
+        backend.destroy()
+
+
 class _TaggedText(str):
     """A ``str`` subclass carrying state its holder can change in place.
 

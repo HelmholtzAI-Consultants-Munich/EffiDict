@@ -72,7 +72,14 @@ class Cache:
         self.policy = policy
         self.max_items = max_items
         self.max_bytes = max_bytes
-        self.size_estimator = size_estimator or estimate_size
+        # ``is None``, not ``or``: an estimator is a callable, and a callable
+        # may be falsy. One that defines ``__len__`` -- an estimator object
+        # keeping a cache of sizes, say -- is falsy while empty, so ``or``
+        # would silently drop it on exactly the first call and every call
+        # after, and the cache would quietly measure with the default instead.
+        self.size_estimator = (
+            estimate_size if size_estimator is None else size_estimator
+        )
         #: key -> (value, dirty). One container rather than a parallel
         #: dirty set, so a key cannot be dropped from one and left in the
         #: other -- the phantom-state defect ``on_remove`` exists to avoid

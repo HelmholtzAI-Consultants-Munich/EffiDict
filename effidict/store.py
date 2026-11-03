@@ -348,13 +348,22 @@ class Store:
 
         ``released`` takes the cached value, so the window between the two
         tiers -- the one I4 is about -- cannot be handed to a finalizer.
+
+        The backend goes first, and the order is the whole of the failure
+        behaviour. ``del_item`` is the step that can fail -- a storage error,
+        or SQLite refusing a call from the wrong thread (issue #2.3) -- and
+        dropping the cached copy before it means a *failed* delete throws away
+        the newer in-memory value while leaving the stale copy on disk. The
+        caller sees the error, and then a later read quietly answers with the
+        old value. This way a failure leaves both tiers as they were: the
+        delete simply did not happen.
         """
         if not self._contains(key):
             raise KeyError(key)
         if self._cache.has(key):
             released.append(self._cache.peek(key))
-        self._cache.discard(key)
         self._backend.del_item(key)
+        self._cache.discard(key)
 
     def pop(self, key, default=MISSING):
         """Remove ``key`` and return its value.
