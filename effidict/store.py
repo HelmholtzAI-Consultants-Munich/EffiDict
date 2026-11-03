@@ -475,6 +475,14 @@ class Store:
         for a value the caller can still change. The cost is a rewrite at
         eviction for those values, which is what *every* eviction did before
         the tag existed.
+
+        Conservative on purpose, and owed another look in issue #4.1. Every
+        dict, list, ndarray and DataFrame pays that write, which for most real
+        workloads is every value the store holds. The batch write path lands in
+        4.1 and changes what the write costs, which is the moment to weigh the
+        alternatives again -- copying on put, a mutation-tracking boundary, or
+        marking everything clean and documenting the limit. Widening the rule
+        without picking one of those brings the silent loss back.
         """
         with self._lock:
             for key, value in list(self._cache.dirty_items()):
