@@ -1,6 +1,46 @@
 from __future__ import annotations
 
+import sys
 from typing import Iterator
+
+
+def estimate_size(value) -> int:
+    """Approximate the resident bytes of ``value``.
+
+    Approximate on purpose, and it has to be: an exact accounting of an
+    arbitrary Python object is not achievable. A buffer shared by two cached
+    values is counted twice, and ``sys.getsizeof`` reports a container's own
+    footprint rather than that of what it holds, so a list of large strings
+    measures as a list of pointers. The budget only has to be right to within a
+    small factor to keep a cache bounded, which is all it is for.
+
+    Three rules, in order:
+
+    * anything with a callable ``memory_usage`` -- a pandas ``DataFrame`` or
+      ``Series`` -- is measured with ``memory_usage(deep=True)``, which follows
+      object columns to the strings they point at instead of counting one
+      pointer each.
+    * anything carrying an ``nbytes`` int -- a numpy array, a ``memoryview`` --
+      reports its buffer directly.
+    * everything else falls back to ``sys.getsizeof``.
+
+    Duck-typed rather than imported. numpy and pandas are test dependencies,
+    not runtime ones, and a store holding strings must not import either to
+    measure them.
+    """
+    measure = getattr(value, "memory_usage", None)
+    if callable(measure):
+        # A DataFrame answers per column and needs summing; a Series answers
+        # with the total already.
+        used = measure(deep=True)
+        total = getattr(used, "sum", None)
+        return int(total() if callable(total) else used)
+
+    nbytes = getattr(value, "nbytes", None)
+    if isinstance(nbytes, int):
+        return nbytes
+
+    return sys.getsizeof(value)
 
 
 class Cache:
@@ -21,52 +61,153 @@ class Cache:
         write it to, so a cache that dropped its own victims would make
         write-before-drop impossible to implement. It is also why the surface
         includes ``peek``, ``is_dirty``, ``dirty_items`` and ``discard`` at all.
+
+        Each value is measured once, when it is put, and the measurement is
+        kept with it. Re-measuring the whole cache on every write would make a
+        fill quadratic, and ``memory_usage(deep=True)`` is far too expensive to
+        call per resident value per write. The cost of keeping it is that a
+        value mutated in place after it was stored is measured as it was --
+        acceptable for a figure already documented as approximate.
         """
-        raise NotImplementedError("see issue #1.2")
+        self.policy = policy
+        self.max_items = max_items
+        self.max_bytes = max_bytes
+        # ``is None``, not ``or``: an estimator is a callable, and a callable
+        # may be falsy. One that defines ``__len__`` -- an estimator object
+        # keeping a cache of sizes, say -- is falsy while empty, so ``or``
+        # would silently drop it on exactly the first call and every call
+        # after, and the cache would quietly measure with the default instead.
+        self.size_estimator = (
+            estimate_size if size_estimator is None else size_estimator
+        )
+        #: key -> (value, dirty). One container rather than a parallel
+        #: dirty set, so a key cannot be dropped from one and left in the
+        #: other -- the phantom-state defect ``on_remove`` exists to avoid
+        #: in the policies.
+        self._values = {}
+        #: Running total of the sizes in ``_values``, adjusted by the three
+        #: methods that change what is resident -- ``put``, ``discard`` and
+        #: ``clear`` -- and by nothing else. ``mark_clean`` replaces an entry
+        #: without changing its size. See :meth:`nbytes` for why it is carried
+        #: rather than summed on demand.
+        self._nbytes = 0
+
+    def __iter__(self) -> Iterator:
+        """Iterate the cached keys, so ``set(cache)`` is the resident key set."""
+        return iter(self._values)
 
     def has(self, key) -> bool:
         """Return whether ``key`` is present in the cache."""
-        raise NotImplementedError("see issue #1.2")
+        return key in self._values
 
     def get(self, key):
-        """Return ``key`` and record access, or raise ``KeyError`` if absent."""
-        raise NotImplementedError("see issue #1.2")
+        """Return ``key`` and record access, or raise ``KeyError`` if absent.
+
+        Reading does not touch the tag: I6 says a read never marks an entry
+        dirty, so a clean entry stays free to evict however often it is read.
+        """
+        value, _, _ = self._values[key]
+        self.policy.on_access(key)
+        return value
 
     def peek(self, key):
         """Return ``key`` without recording access, or raise ``KeyError``."""
-        raise NotImplementedError("see issue #1.2")
+        return self._values[key][0]
 
     def put(self, key, value, dirty: bool = True) -> None:
-        """Store ``value`` under ``key`` and record dirty state."""
-        raise NotImplementedError("see issue #1.2")
+        """Store ``value`` under ``key`` and record dirty state.
+
+        A rewrite is reported to the policy as an access, not an insertion.
+        ``on_insert`` restarts a key's bookkeeping -- frequency back to one --
+        so routing an update through it would discard the usage history of a key
+        that never left the cache. That is the defect
+        ``test_mfu_replacement_keeps_frequency_across_a_value_update`` pins
+        against the strategies this class replaces.
+
+        ``dirty=True`` is the right default because the ordinary caller is a
+        write: ``Store.set`` puts a value the disk does not have yet. Only a
+        caller that knows disk already holds this exact value may pass
+        ``False``, and being wrong about that loses data -- the entry would be
+        dropped at eviction without ever being written.
+
+        The estimator runs **first**, before the policy is told anything. It is
+        caller-supplied code over an arbitrary value and may raise; a policy
+        told to track a key the cache then fails to hold goes on offering it as
+        a victim, and the eviction path strands on a key it cannot peek. Doing
+        the one step that can fail before any state changes leaves a rejected
+        write with no trace at all.
+        """
+        size = self.size_estimator(value)
+        previous = self._values.get(key)
+        if previous is None:
+            self.policy.on_insert(key)
+        else:
+            self.policy.on_access(key)
+        self._values[key] = (value, dirty, size)
+        self._nbytes += size - (0 if previous is None else previous[2])
 
     def discard(self, key) -> None:
         """Remove ``key`` if present without raising when absent."""
-        raise NotImplementedError("see issue #1.2")
+        entry = self._values.pop(key, None)
+        if entry is not None:
+            self._nbytes -= entry[2]
+            self.policy.on_remove(key)
 
     def clear(self) -> None:
         """Remove all cached entries and policy state."""
-        raise NotImplementedError("see issue #1.2")
+        self._values.clear()
+        self._nbytes = 0
+        self.policy.clear()
 
     def __len__(self) -> int:
         """Return the number of cached items."""
-        raise NotImplementedError("see issue #1.2")
+        return len(self._values)
 
     def nbytes(self) -> int:
-        """Return the approximate cached byte size."""
-        raise NotImplementedError("see issue #1.4")
+        """Return the approximate resident byte size.
+
+        A carried total rather than a sum over the cache. ``evict_candidates``
+        asks on every write once ``max_bytes`` is set, including the writes that
+        shed nothing, so summing here made a fill quadratic: measured at 500,500
+        entry visits for 1,000 writes and 2,001,000 for 2,000.
+
+        The measurements themselves are still taken once per ``put`` -- see
+        :meth:`__init__` for why they are not retaken.
+        """
+        return self._nbytes
 
     def is_dirty(self, key) -> bool:
-        """Return whether ``key`` has unwritten cache changes."""
-        raise NotImplementedError("see issue #1.3")
+        """Return whether ``key`` has unwritten cache changes.
+
+        Raises ``KeyError`` for a key the cache does not hold, like ``peek``:
+        "is it dirty?" has no answer for an absent key, and returning ``False``
+        would read as "clean, safe to drop".
+        """
+        return self._values[key][1]
 
     def mark_clean(self, key) -> None:
-        """Mark ``key`` as having no unwritten cache changes."""
-        raise NotImplementedError("see issue #1.3")
+        """Mark ``key`` as having no unwritten cache changes.
+
+        For the caller that has just written the value out -- ``flush`` in
+        issue #1.4. There is deliberately no ``mark_dirty``: an entry becomes
+        dirty by being written through ``put``, which is the only way its value
+        can diverge from disk.
+        """
+        value, _, size = self._values[key]
+        self._values[key] = (value, False, size)
 
     def dirty_items(self) -> Iterator:
-        """Iterate over cached items with unwritten changes."""
-        raise NotImplementedError("see issue #1.3")
+        """Iterate ``(key, value)`` for the entries disk does not have.
+
+        What ``flush`` has to write (I7, issue #1.4). A generator over the live
+        dict, so a caller that marks entries clean while walking it would be
+        mutating what it is reading -- ``flush`` collects first for that reason.
+        """
+        return (
+            (key, value)
+            for key, (value, dirty, _) in self._values.items()
+            if dirty
+        )
 
     def evict_candidates(self) -> Iterator:
         """Iterate over keys that must be shed to get back inside budget.
@@ -79,5 +220,55 @@ class Cache:
         Built on ``EvictionPolicy.victims()`` rather than repeated ``victim()``
         calls -- ``victim()`` only advances when a key is removed, so it cannot
         enumerate without mutating.
+
+        Exactly the surplus, never more: the promise is "the keys that must be
+        shed to get back inside budget", so shedding further to a low-water mark
+        would be a different promise. Returned over a snapshot, so the caller
+        may discard what it is handed while walking it.
+
+        Both budgets, whichever binds first: enough keys to bring the item count
+        inside ``max_items`` *and* the estimated bytes inside ``max_bytes``.
+        Either left as ``None`` constrains nothing, so a cache given only
+        ``max_items`` behaves exactly as it did before the byte budget existed.
         """
-        raise NotImplementedError("see issue #1.2")
+        surplus = (
+            0 if self.max_items is None else len(self._values) - self.max_items
+        )
+        excess = (
+            0 if self.max_bytes is None else self.nbytes() - self.max_bytes
+        )
+        if surplus <= 0 and excess <= 0:
+            return iter(())
+
+        if surplus <= 1:
+            # One eviction is the steady state of a bounded cache -- one write
+            # past the bound, one key shed -- so nearly every call lands here.
+            # ``victims()`` has to build the whole ordering before it yields
+            # anything, so asking it for one key costs the size of the cache and
+            # a fill becomes quadratic; ``victim()`` reads the ordering's
+            # endpoint instead. The two name the same key, which
+            # ``test_victims_enumerates_in_eviction_order`` pins.
+            #
+            # A byte excess takes this path too, whenever that one victim covers
+            # it: deciding costs a dict lookup against the size recorded when
+            # the value was put. Only when it does not cover the excess does the
+            # walk below run, starting again from the same end of the same
+            # ordering. With ``excess`` at or below zero the test is trivially
+            # true, which is the item-only case.
+            victim = self.policy.victim()
+            if self._values[victim][2] >= excess:
+                return iter((victim,))
+
+        # Walked eagerly rather than handed back lazily: the caller discards
+        # what it is given while walking it, and a policy that enumerates its
+        # live ordering rather than a snapshot would raise mid-eviction. The
+        # stopping condition reads both budgets, so whichever is still breached
+        # keeps the walk going.
+        candidates = []
+        freed = 0
+        for key in self.policy.victims():
+            candidates.append(key)
+            freed += self._values[key][2]
+            if len(candidates) >= surplus and freed >= excess:
+                break
+        return iter(candidates)

@@ -1,9 +1,9 @@
 """Specs for the eviction policies as pure bookkeeping -- no disk, no values.
 
 Written against the ``EvictionPolicy`` contract declared in issue 0.1 and
-implemented in issue 1.1. Today's ``*Replacement`` classes cannot satisfy these:
-they take a backend in ``__init__`` and write to it during eviction, which is
-exactly the coupling 1.1 removes.
+implemented in issue 1.1. The ``*Replacement`` classes they replaced could not
+satisfy these: they took a backend in ``__init__`` and wrote to it during
+eviction, which is exactly the coupling 1.1 removed and 1.2 deleted.
 
 **These tests pin the concrete class names too.** Issue 0.1 declared the
 ``EvictionPolicy`` base but named no implementations, so this spec fixes them as
@@ -29,8 +29,6 @@ import inspect
 from collections import abc
 
 import pytest
-
-from effidict import MFUReplacement
 
 POLICY_NAMES = ["Random", "FIFO", "LIFO", "LRU", "MRU", "LFU", "MFU"]
 
@@ -289,10 +287,6 @@ SCENARIOS = {
 }
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="the EvictionPolicy implementations do not exist yet (issue 1.1)",
-)
 @pytest.mark.parametrize("scenario", sorted(SCENARIOS))
 @pytest.mark.parametrize("name", DETERMINISTIC)
 def test_victim_order(name, scenario):
@@ -306,10 +300,6 @@ def test_victim_order(name, scenario):
     assert _victim_sequence(policy) == expected
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="the EvictionPolicy implementations do not exist yet (issue 1.1)",
-)
 def test_lfu_evicts_the_least_frequently_used():
     """LFU gives up the coldest key first, regardless of when it arrived."""
     policy = _policy_class("LFU")()
@@ -322,19 +312,13 @@ def test_lfu_evicts_the_least_frequently_used():
     assert policy.victim() == "cold"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="the EvictionPolicy implementations do not exist yet (issue 1.1)",
-)
 def test_mfu_evicts_the_most_frequently_used():
     """MFU gives up the hottest key first.
 
-    States the contract issue 1.1 has to satisfy. It cannot reach the defect it
-    was written for: ``_policy_class("MFU")`` resolves
-    ``effidict.policies.MFUPolicy``, which does not exist, so this raises
-    ``NotImplementedError`` before any shipped code runs.
-    ``test_mfu_replacement_keeps_frequency_across_a_value_update`` below is the
-    pin that does reach it.
+    States the contract issue 1.1 satisfies, against ``MFUPolicy``. The
+    duplicated-class-body defect this was originally written for lived on the
+    legacy ``MFUReplacement``; 1.2 deleted that class, and the spec that pinned
+    the defect went with it.
     """
     policy = _policy_class("MFU")()
     for key in ("hot", "warm", "cold"):
@@ -346,63 +330,12 @@ def test_mfu_evicts_the_most_frequently_used():
     assert policy.victim() == "hot"
 
 
-class _NullBackend:
-    """Absorbs the write an eviction performs. The shipped policies do their own
-    I/O, which issue 1.1 removes; until then a victim cannot be observed without
-    one."""
-
-    def serialize(self, key, value):
-        pass
-
-
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "MFUReplacement's surviving put() resets secondary_memory[key] to 1, so "
-        "a value update discards the key's recorded frequency and the policy "
-        "evicts by stale counts (issue 1.1)"
-    ),
-)
-def test_mfu_replacement_keeps_frequency_across_a_value_update():
-    """The *shipped* MFU policy must not forget a key's frequency on rewrite.
-
-    Aimed at ``MFUReplacement`` rather than the future ``MFUPolicy``, so it
-    actually executes the duplicated class body. Derived from the MFU rule
-    stated in this module's docstring, not from the implementation: ``a`` is used
-    four times and ``b`` twice, so ``a`` is the hottest key and MFU must give it
-    up. Rewriting ``a``'s *value* changes no usage count, so the victim is
-    unchanged by it.
-
-    The counts are what discriminate here. With the reset, ``a`` drops to 1
-    against ``b``'s 2, and the policy evicts ``b`` -- the coldest key, the exact
-    opposite of MFU.
-    """
-    policy = MFUReplacement(disk_backend=_NullBackend(), max_in_memory=2)
-    policy.put("a", "va")
-    policy.put("b", "vb")
-    for _ in range(3):
-        policy.get("a")
-    policy.get("b")
-
-    policy.put("a", "va-updated")
-    policy.put("c", "vc")
-
-    assert sorted(policy.memory) == ["b", "c"], (
-        f"MFU kept {sorted(policy.memory)}; 'a' was the hottest key (4 uses "
-        f"against 2) and should have been the victim"
-    )
-
-
-@pytest.mark.xfail(
-    strict=True,
-    reason="the EvictionPolicy implementations do not exist yet (issue 1.1)",
-)
 @pytest.mark.parametrize("name", POLICY_NAMES)
 def test_policy_never_touches_the_backend(name):
     """A policy must have no way to reach storage.
 
-    Today every ``*Replacement`` takes a backend and serializes its own victims,
-    which is what makes them impossible to unit-test without a filesystem.
+    Every ``*Replacement`` took a backend and serialized its own victims, which
+    is what made them impossible to unit-test without a filesystem.
 
     Checked four ways, because no single one is sufficient. A denylist of
     parameter names is the weakest: it misses ``*args``/``**kwargs``, which can
@@ -472,10 +405,6 @@ def test_policy_never_touches_the_backend(name):
     assert not held, f"{cls.__name__} holds a backend-like object: {held}"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="the EvictionPolicy implementations do not exist yet (issue 1.1)",
-)
 @pytest.mark.parametrize("name", POLICY_NAMES)
 def test_forget_removes_all_policy_state(name):
     """``on_remove`` must drop every trace of a key.
@@ -511,10 +440,6 @@ def test_forget_removes_all_policy_state(name):
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="the EvictionPolicy implementations do not exist yet (issue 1.1)",
-)
 def test_random_policy_only_ever_names_tracked_keys():
     """Random cannot be pinned to a sequence, so pin what must still hold.
 
@@ -542,10 +467,47 @@ def test_random_policy_only_ever_names_tracked_keys():
     assert sorted(_victim_sequence(policy)) == sorted(keys)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="the EvictionPolicy implementations do not exist yet (issue 1.1)",
-)
+def test_random_stays_uniform_as_keys_are_replaced():
+    """Random must stay uniform once membership has turned over.
+
+    The test above fills a fresh policy and takes one victim, which every
+    plausible implementation passes. The failure this covers only appears after
+    keys have been replaced: a policy that gives each key a fixed random
+    priority and always evicts the lowest is selecting its survivors *on those
+    priorities*, so the keys still resident are the ones that drew high and an
+    incoming key with a fresh draw is almost always the lowest. It is then not
+    random replacement but a store of the luckiest keys ever inserted, and
+    nothing else in this file can see it.
+
+    Modelled on a full cache of ten: insert, then evict one of the eleven
+    candidates. Uniform replacement names the incoming key 1 time in 11, so
+    about 91 of 1000 insertions; the fixed-priority version measured ~950.
+
+    The bounds are wide rather than tight on purpose. The count is binomial with
+    standard deviation 9, so 30 and 160 sit more than six deviations from the
+    mean on either side -- an unbiased policy effectively never trips them,
+    while both ways of getting this wrong are far outside. A policy that never
+    evicts the incoming key lands near 0 and fails the lower bound.
+    """
+    policy = _policy_class("Random")()
+    for index in range(10):
+        policy.on_insert(f"resident-{index}")
+
+    evicted_immediately = 0
+    for index in range(1000):
+        incoming = f"key-{index}"
+        policy.on_insert(incoming)
+        victim = policy.victim()
+        policy.on_remove(victim)
+        if victim == incoming:
+            evicted_immediately += 1
+
+    assert 30 < evicted_immediately < 160, (
+        f"{evicted_immediately} of 1000 incoming keys were evicted immediately; "
+        f"uniform replacement over 11 candidates gives about 91"
+    )
+
+
 @pytest.mark.parametrize("name", POLICY_NAMES)
 def test_clear_drops_everything(name):
     """``clear()`` must leave the policy indistinguishable from a fresh one.
@@ -617,10 +579,53 @@ def test_clear_drops_everything(name):
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="the EvictionPolicy implementations do not exist yet (issue 1.1)",
-)
+@pytest.mark.parametrize("name", POLICY_NAMES)
+def test_victim_peek_is_stable(name):
+    """``victim()`` must keep naming the same key until that key is removed.
+
+    It peeks, it does not draw. The ``EvictionPolicy`` contract from issue 0.1
+    says the only thing that advances it is ``on_remove``, and the cache depends
+    on exactly that: it peeks, writes the value out if it is dirty, and only
+    then removes. A policy that decides afresh on every call names a different
+    key each time it is asked, so the key the cache wrote out and the key it
+    goes on to drop need not be the same one.
+
+    Parametrized over every policy rather than the deterministic six. Random is
+    the one that can pass every other spec in this file while failing this, and
+    ``test_victims_enumerates_in_eviction_order`` cannot see it: that spec is
+    over ``DETERMINISTIC``, because Random has no expected sequence to compare
+    against.
+    """
+    policy = _policy_class(name)()
+    for key in ("a", "b", "c", "d"):
+        policy.on_insert(key)
+    policy.on_access("b")
+
+    before = _state_snapshot(policy)
+    peeked = policy.victim()
+    repeats = [policy.victim() for _ in range(5)]
+
+    assert repeats == [peeked] * 5, (
+        f"{name}.victim() first named {peeked!r}, then {repeats}"
+    )
+    # A peek that reshuffles need not mutate the policy to be wrong, and a peek
+    # that mutates need not change its answer, so both are worth asserting.
+    assert _state_snapshot(policy) == before, (
+        f"{name}.victim() changed the policy:\n"
+        f"  before: {before}\n  after:  {_state_snapshot(policy)}"
+    )
+
+    # Removing the peeked key is the one thing that may advance the answer.
+    policy.on_remove(peeked)
+    advanced = policy.victim()
+    assert advanced != peeked, (
+        f"{name}.victim() still names {peeked!r} after it was removed"
+    )
+    assert [policy.victim() for _ in range(3)] == [advanced] * 3, (
+        f"{name}.victim() is unstable again after advancing to {advanced!r}"
+    )
+
+
 @pytest.mark.parametrize("name", DETERMINISTIC)
 def test_victims_enumerates_in_eviction_order(name):
     """``victims()`` must list every tracked key, most-evictable first.
@@ -655,10 +660,35 @@ def test_victims_enumerates_in_eviction_order(name):
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="the EvictionPolicy implementations do not exist yet (issue 1.1)",
-)
+def test_random_victims_agrees_with_victim():
+    """The same check for Random, which the spec above cannot be run against.
+
+    ``victims()`` and ``victim()`` have to describe one ordering, and that claim
+    is not probabilistic: whichever order a Random policy settles on, draining
+    it one victim at a time must walk that same order. Only the order itself is
+    unpredictable, which is why this is checked per instance instead of against
+    a hardcoded sequence.
+
+    Over several instances, since a single draw could agree by luck -- with five
+    keys there is a 1-in-120 chance of two independent orderings matching.
+    """
+    cls = _policy_class("Random")
+
+    for attempt in range(20):
+        policy = cls()
+        for key in ("a", "b", "c", "d", "e"):
+            policy.on_insert(key)
+        policy.on_access("c")
+
+        listed = list(policy.victims())
+        drained = _victim_sequence(policy)
+
+        assert listed == drained, (
+            f"attempt {attempt}: Random.victims() gave {listed}, "
+            f"draining victim() gives {drained}"
+        )
+
+
 @pytest.mark.parametrize("name", POLICY_NAMES)
 def test_victims_records_nothing(name):
     """Walking ``victims()`` must leave the policy exactly as it was.

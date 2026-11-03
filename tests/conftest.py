@@ -9,6 +9,9 @@ Provides:
 ``backend_spy``
     Records backend method calls. Most non-functional guards count calls rather
     than measure time, so this lives here rather than in individual specs.
+xfail reason drift check
+    Fails the run when a spec dies on one issue's stub while its xfail marker
+    blames another.
 autouse leak detector
     Releases every store the test created, then asserts the storage directory is
     empty. Anything left behind is a library-level leak.
@@ -17,25 +20,24 @@ autouse leak detector
 from __future__ import annotations
 
 import contextlib
+import re
 
 import pytest
 
 from effidict import (
     EffiDict,
-    FIFOReplacement,
+    FIFOPolicy,
     Hdf5Backend,
     JSONBackend,
-    LFUReplacement,
-    LIFOReplacement,
-    LRUReplacement,
-    MFUReplacement,
-    MRUReplacement,
+    LFUPolicy,
+    LIFOPolicy,
+    LRUPolicy,
+    MFUPolicy,
+    MRUPolicy,
     PickleBackend,
-    RandomReplacement,
+    RandomPolicy,
     SqliteBackend,
 )
-
-from .helpers import build_policy
 
 try:
     import h5py
@@ -49,20 +51,20 @@ pytest_plugins = ["pytester"]
 BACKENDS = [SqliteBackend, PickleBackend, JSONBackend, Hdf5Backend]
 
 POLICIES = [
-    RandomReplacement,
-    FIFOReplacement,
-    LIFOReplacement,
-    LRUReplacement,
-    MRUReplacement,
-    LFUReplacement,
-    MFUReplacement,
+    RandomPolicy,
+    FIFOPolicy,
+    LIFOPolicy,
+    LRUPolicy,
+    MRUPolicy,
+    LFUPolicy,
+    MFUPolicy,
 ]
 
 #: Used when a test asks for `make_dict` without joining the matrix. Pickle
 #: accepts every value kind and LRU is the most common policy, so an
 #: unparametrized test exercises the least surprising combination.
 DEFAULT_BACKEND = PickleBackend
-DEFAULT_POLICY = LRUReplacement
+DEFAULT_POLICY = LRUPolicy
 
 
 def backend_marks(backend_cls):
@@ -86,11 +88,7 @@ def backend_cls(request):
 
 @pytest.fixture(params=POLICIES, ids=[cls.__name__ for cls in POLICIES])
 def policy_cls(request):
-    """One replacement policy class per parametrization.
-
-    Named ``policy`` rather than ``strategy`` for the post-1.1 API; it currently
-    receives the ``*Replacement`` classes.
-    """
+    """One eviction policy class per parametrization."""
     return request.param
 
 
@@ -186,14 +184,11 @@ def make_dict(request, storage_dir, _open_stores):
 
         effidict = EffiDict(
             disk_backend=disk_backend,
-            # Through build_policy, like every other construction site: issue
-            # 1.1 drops both of these arguments, and this is the fixture nearly
-            # every spec in the suite goes through -- hard-coding them here would
-            # fail the whole suite at fixture construction rather than let each
-            # spec fail on the thing it actually pins.
-            replacement_strategy=build_policy(
-                policy, disk_backend=disk_backend, max_in_memory=max_in_memory
-            ),
+            # A policy takes no constructor arguments since issue 1.1, and the
+            # bound it used to carry is now the cache's item budget, which the
+            # facade routes through for us.
+            policy=policy(),
+            max_in_memory=max_in_memory,
             # Passed unconditionally: silently dropping it would let issue 0.4's
             # byte-budget spec pass a budget that never arrives.
             max_bytes=max_bytes,
@@ -277,3 +272,81 @@ class BackendSpy:
             return original(*args, **kwargs)
 
         return recorder
+
+
+# --------------------------------------------------------------------------
+# xfail reason drift
+# --------------------------------------------------------------------------
+
+#: A stub names the issue that owns it in the exception it raises
+#: (``NotImplementedError("see issue #1.4")``), and an xfail reason names the
+#: issue the spec is waiting for. When a test dies on a tagged stub the two have
+#: to agree. When they do not, the marker is pointing at a gate the test never
+#: reaches -- and the day that issue lands, the spec stays red behind the gate
+#: that really stopped it while its strict marker goes on passing, so nobody is
+#: told the thing it was written for is still untested. Two markers in this
+#: suite had drifted that way before this check existed.
+#:
+#: Scaffolding, with an end date. It is worth having only while most of this
+#: suite is red; once the implementation phases are done nothing raises
+#: ``see issue #N`` any more, there is nothing left to compare, and this costs a
+#: hook call per test for no answer. PLAN.md's Phase 8 lists it for removal,
+#: together with its two specs in ``test_harness.py``.
+_STUB_ISSUE = re.compile(r"see issue #(\d+\.\d+)")
+_CITED_ISSUE = re.compile(r"\d+\.\d+")
+
+#: Per-``Config`` rather than module-level: ``pytester`` runs its sub-pytest in
+#: this same process, and shared state would let a sandbox's deliberate drift
+#: fail the outer run.
+_DRIFT = pytest.StashKey[dict]()
+
+
+def pytest_configure(config):
+    config.stash[_DRIFT] = {}
+
+
+def pytest_runtest_makereport(item, call):
+    """Record xfail reasons that disagree with what the test actually died on.
+
+    An observer: it returns ``None``, so pytest builds the report itself. A
+    hook rather than a fixture because ``call.excinfo`` is the only place the
+    raising issue can be read, and a fixture never sees the exception.
+    """
+    if call.when != "call" or call.excinfo is None:
+        return None
+    raised = _STUB_ISSUE.search(str(call.excinfo.value))
+    if raised is None:
+        return None
+
+    for marker in item.iter_markers(name="xfail"):
+        reason = " ".join(str(marker.kwargs.get("reason", "")).split())
+        cited = set(_CITED_ISSUE.findall(reason))
+        # No issue cited is not drift: the marker simply makes no claim this
+        # check can test.
+        if cited and raised.group(1) not in cited:
+            item.config.stash[_DRIFT][item.originalname or item.name] = (
+                f"  {item.originalname or item.name}\n"
+                f"      dies on issue #{raised.group(1)}: "
+                f"{str(call.excinfo.value)[:70]}\n"
+                f"      but cites {sorted(cited)}: {reason[:100]}"
+            )
+    return None
+
+
+def pytest_terminal_summary(terminalreporter):
+    drift = terminalreporter.config.stash.get(_DRIFT, None) or {}
+    if not drift:
+        return
+    terminalreporter.section("xfail reasons that drifted from their cause")
+    for message in sorted(drift.values()):
+        terminalreporter.write_line(message)
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Fail the run on drift, whatever the tests themselves reported.
+
+    A drifted marker makes its spec pass while watching nothing, so leaving
+    this as a warning would be leaving it unread.
+    """
+    if session.config.stash.get(_DRIFT, None):
+        session.exitstatus = 1

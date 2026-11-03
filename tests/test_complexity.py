@@ -25,7 +25,7 @@ import time
 
 import pytest
 
-from effidict import Hdf5Backend, SqliteBackend
+from effidict import Cache, Hdf5Backend, LRUPolicy, SqliteBackend
 
 from .helpers import store_bytes
 
@@ -85,8 +85,8 @@ def _count_enumerated(backend):
 @pytest.mark.xfail(
     strict=True,
     reason=(
-        "__contains__ calls disk_backend.keys(), so the work it does grows with "
-        "the size of the store (issue 2.2)"
+        "membership reaches backend.has(), which answers by listing every "
+        "key, so the work grows with the size of the store (issue 2.2)"
     ),
 )
 def test_membership_cost_does_not_grow_with_the_store(backend_cls, policy_cls, make_dict):
@@ -103,7 +103,7 @@ def test_membership_cost_does_not_grow_with_the_store(backend_cls, policy_cls, m
         for i in range(size):
             d[f"k{i:05d}"] = "v"
 
-        total, restore = _count_enumerated(d.disk_backend)
+        total, restore = _count_enumerated(d._store.backend)
         try:
             assert ("absent" in d) is False
         finally:
@@ -154,13 +154,6 @@ def test_membership_time_is_flat(make_dict):
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "a promoted entry is never marked clean, so evicting it rewrites a value "
-        "the disk already holds (issue 1.3)"
-    ),
-)
 def test_read_only_pass_performs_no_writes(make_dict, backend_spy):
     """Reading 500 keys through a 50-key cache must not write anything.
 
@@ -181,9 +174,9 @@ def test_read_only_pass_performs_no_writes(make_dict, backend_spy):
     # against a correct implementation. Seeding removes the dependency on which
     # victim the policy picks.
     for key in keys:
-        d.disk_backend.serialize(key, f"v-{key}")
+        d._store.backend.serialize(key, f"v-{key}")
 
-    with backend_spy(d.disk_backend) as spy:
+    with backend_spy(d._store.backend) as spy:
         for key in keys:
             assert d[key] == f"v-{key}"
 
@@ -220,7 +213,7 @@ def test_bulk_write_does_not_issue_one_call_per_item(make_dict, backend_spy):
     items = {f"k{i:05d}": "v" for i in range(3000)}
     d = make_dict(max_in_memory=10)
 
-    with backend_spy(d.disk_backend) as spy:
+    with backend_spy(d._store.backend) as spy:
         d.load_from_dict(items)
 
         per_item = spy.count("serialize")
@@ -332,4 +325,153 @@ def test_stored_size_grows_linearly_with_the_data(request, backend_cls, tmp_path
     assert growth < 4 * 1.6, (
         f"4x the items took {growth:.1f}x the space "
         f"({sizes[250]} -> {sizes[1000]} bytes)"
+    )
+
+
+class _CountingValues(dict):
+    """A cache's value dict that counts how many entries get walked.
+
+    Every way of reading a dict's contents in bulk is counted, not just
+    ``values()``, so the guard below measures "did anything traverse the cache"
+    rather than "was it traversed the way I expected".
+    """
+
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.visited = 0
+
+    def _walk(self):
+        self.visited += len(self)
+
+    def values(self):
+        self._walk()
+        return super().values()
+
+    def items(self):
+        self._walk()
+        return super().items()
+
+    def keys(self):
+        self._walk()
+        return super().keys()
+
+    def __iter__(self):
+        self._walk()
+        return super().__iter__()
+
+
+@pytest.mark.parametrize("size", [SMALL, LARGE])
+def test_checking_the_byte_budget_does_not_walk_the_cache(size):
+    """Asking whether the cache is over budget must not cost the cache's size.
+
+    ``Store`` consults ``evict_candidates`` after every single write, and with
+    ``max_bytes`` set that consults the byte total -- including on the writes
+    that shed nothing, which is most of them. A total summed on demand turns a
+    plain fill quadratic: measured at 500,500 entries walked for 1,000 writes
+    and 2,001,000 for 2,000, against zero for a total carried as it changes.
+
+    Counted rather than timed, like the guards above, and asserted as zero
+    rather than as a ratio: nothing in a fill legitimately needs to read the
+    whole cache, so the correct answer does not depend on the size at all.
+    """
+    cache = Cache(policy=LRUPolicy(), max_items=size * 10, max_bytes=10 ** 12)
+    cache._values = _CountingValues(cache._values)
+
+    for index in range(size):
+        cache.put(f"k{index}", "v")
+        list(cache.evict_candidates())
+
+    assert cache._values.visited == 0, (
+        f"filling a {size}-entry cache under a byte budget walked "
+        f"{cache._values.visited} entries; a summed total would give "
+        f"{size * (size + 1) // 2}"
+    )
+
+
+class _CountingPolicy(LRUPolicy):
+    """An LRU policy that reports how many keys each selection call walks."""
+
+    def __init__(self):
+        super().__init__()
+        self.visited = 0
+
+    def victims(self):
+        order = list(super().victims())
+        self.visited += len(order)
+        return iter(order)
+
+    def victim(self):
+        self.visited += 1
+        return super().victim()
+
+
+@pytest.mark.parametrize("size", [SMALL, LARGE])
+def test_shedding_one_entry_does_not_walk_the_cache(size):
+    """One write past the bound must not cost the size of the cache.
+
+    The steady state of a bounded cache is one eviction per write, so this is
+    nearly every call. ``victims()`` cannot serve it cheaply -- it has to build
+    the whole ordering before it yields anything -- while ``victim()`` reads the
+    ordering's endpoint, which is why the policy has both.
+
+    Counted rather than timed, like the write guards above: the number of keys
+    the policy was asked to walk is the thing that grows, and at 100 entries a
+    timer cannot tell a scan from a lookup. Asserted as a constant rather than a
+    ratio because the correct answer does not depend on the size at all -- one
+    victim, one key visited -- and a ratio would accept a scan that got twice as
+    expensive in both runs.
+    """
+    policy = _CountingPolicy()
+    cache = Cache(policy=policy, max_items=size)
+    for index in range(size):
+        cache.put(f"k{index}", "v")
+    cache.put("one-too-many", "v")
+
+    policy.visited = 0
+    candidates = list(cache.evict_candidates())
+
+    assert len(candidates) == 1, (
+        f"one entry over a {size}-entry budget named {len(candidates)} victims"
+    )
+    assert policy.visited == 1, (
+        f"selecting one victim from a {size}-entry cache walked "
+        f"{policy.visited} keys"
+    )
+
+
+@pytest.mark.parametrize("size", [SMALL, LARGE])
+def test_shedding_one_entry_by_bytes_does_not_walk_the_cache(size):
+    """The same steady state, reached through the byte budget instead.
+
+    A byte-bounded cache sheds one victim per write exactly as an item-bounded
+    one does, so it has the same claim on the cheap path. Sending every byte
+    excess through ``victims()`` instead cost the size of the cache per
+    eviction: 1,001,000 policy entries copied across 1,000 single-entry
+    evictions from a 1,000-entry cache, against 1,000 for the identical
+    item-bounded run above.
+
+    ``max_items`` is left unset so only the byte excess can reach the
+    selection, and the budget is taken from the cache once it is full rather
+    than computed from the estimator -- the claim is about one entry over the
+    bound, whatever the estimator makes an entry weigh.
+    """
+    policy = _CountingPolicy()
+    value = "v" * 64
+    cache = Cache(policy=policy, max_bytes=10 ** 12)
+    for index in range(size):
+        cache.put(f"k{index}", value)
+
+    cache.max_bytes = cache.nbytes()          # exactly full, by its own measure
+    cache.put("one-too-many", value)
+
+    policy.visited = 0
+    candidates = list(cache.evict_candidates())
+
+    assert len(candidates) == 1, (
+        f"one entry over a {size}-entry byte budget named "
+        f"{len(candidates)} victims"
+    )
+    assert policy.visited == 1, (
+        f"selecting one victim from a {size}-entry cache walked "
+        f"{policy.visited} keys"
     )

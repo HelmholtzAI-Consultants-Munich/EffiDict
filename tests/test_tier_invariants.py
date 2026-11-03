@@ -5,7 +5,7 @@ Each test names its invariant in the docstring. The invariants are owned by
 point of this file.
 
 Tier membership is read through ``helpers.in_cache`` / ``helpers.on_disk`` rather
-than by touching ``replacement_strategy.memory`` directly, so issue 1.2 can
+than by touching the cache directly, so issue 1.2 could
 repoint them at ``_store`` without rewriting ten tests.
 
 Values are strings throughout. HDF5 widens ``int`` to ``int64`` and SQLite/JSON
@@ -19,27 +19,17 @@ import threading
 
 import pytest
 
-from effidict import DiskBackend, EvictionPolicy, ReplacementStrategy
+from effidict import DiskBackend, EvictionPolicy, SqliteBackend
 
 from .helpers import (
-    PROMOTING_POLICIES,
+    HOLD_SECONDS,
+    WAIT_SECONDS,
     cached_bytes,
     cached_keys,
     in_cache,
     on_disk,
+    xfail_sqlite_held_write,
 )
-
-#: How long a probe keeps a write blocked inside ``serialize``, and how long it
-#: waits for anything to happen. HOLD must comfortably exceed the *sum* of the
-#: waits performed while the write is held, or the hold expires mid-inspection:
-#: the write completes, and the tier state the probe then examines is
-#: post-write, where a drop-then-write implementation is indistinguishable from
-#: a compliant one. Both numbers are liveness bounds, never discriminators --
-#: nothing here decides what happened by how long it took. The ``finally`` in
-#: each probe releases the hold, so HOLD is only ever reached if the test itself
-#: wedged.
-HOLD_SECONDS = 120
-WAIT_SECONDS = 10
 
 FILLER = [f"filler{i}" for i in range(12)]
 
@@ -62,8 +52,8 @@ def _spill_to_disk(effidict, key):
     eviction path.
     """
     value = effidict[key]
-    effidict.disk_backend.serialize(key, value)
-    effidict.replacement_strategy.delete(key)
+    effidict._store.backend.serialize(key, value)
+    effidict._store.cache.discard(key)
     assert on_disk(effidict, key), "helper failed to place the key on disk"
     assert not in_cache(effidict, key), "helper failed to clear the cache copy"
 
@@ -87,13 +77,6 @@ def _seed_in_both_tiers(effidict, key, value):
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "I4: pop() returns via the self.memory.pop(key) path and never touches "
-        "the backend, so the disk copy survives (issue 1.2)"
-    ),
-)
 def test_pop_removes_key_from_both_tiers(backend_cls, policy_cls, make_dict):
     """I4. pop() must clear every tier, not just the cache.
 
@@ -136,6 +119,46 @@ def test_delitem_removes_key_from_both_tiers(backend_cls, policy_cls, make_dict)
     assert "target" not in d
 
 
+def test_a_failed_delete_leaves_both_tiers_as_they_were(
+    backend_cls, policy_cls, make_dict
+):
+    """I4. A delete that fails must not take the cached value with it.
+
+    ``del_item`` is the step that can fail -- a storage error, or SQLite
+    refusing a call from the thread it was not opened on (issue 2.3). Dropping
+    the cached copy before making that call means a *failed* delete discards
+    the newer in-memory value and leaves the stale copy on disk: the caller is
+    told the delete failed, and a later read then quietly answers with the old
+    value instead of the one they last wrote.
+
+    Both tiers have to survive the failure together, so that a delete which
+    raised simply did not happen.
+    """
+
+    class DeleteFails(backend_cls):
+        def del_item(self, key):
+            raise OSError("storage is unavailable")
+
+    # The class, not an instance: ``make_dict`` builds the backend itself so
+    # the leak detector can release it afterwards.
+    d = make_dict(backend=DeleteFails)
+    d["k"] = "old"
+    d.flush()               # disk holds "old"
+    d["k"] = "new"          # the cache is now ahead of disk
+
+    with pytest.raises(OSError):
+        del d["k"]
+
+    assert in_cache(d, "k"), (
+        "a delete that failed still dropped the cached value, so the stale "
+        "disk copy is all that is left"
+    )
+    assert d["k"] == "new", (
+        f"after a failed delete a read returned {d['k']!r}, the copy from "
+        f"before the last write"
+    )
+
+
 def test_delitem_missing_key_raises(backend_cls, policy_cls, make_dict):
     """I4. Deleting an absent key raises KeyError, like dict."""
     d = make_dict(max_in_memory=2)
@@ -156,7 +179,7 @@ def test_clear_removes_from_both_tiers(backend_cls, policy_cls, make_dict):
 
     assert len(d) == 0
     assert list(d.keys()) == []
-    assert d.disk_backend.keys() == []
+    assert d._store.backend.keys() == []
     for i in range(6):
         assert not in_cache(d, f"k{i}")
         assert not on_disk(d, f"k{i}")
@@ -167,18 +190,9 @@ def test_clear_removes_from_both_tiers(backend_cls, policy_cls, make_dict):
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "I5: eviction drops the cache copy before the disk write completes, so "
-        "the key is briefly in neither tier (issues 1.3, 5.1). On SQLite the "
-        "evicting write additionally fails with the thread-affinity error -- the "
-        "connection is opened on the main thread and the eviction runs on a "
-        "worker -- which the writer-error assertion below catches, so the seven "
-        "SQLite cases stay red until that lands too (issue 2.3)"
-    ),
-)
-def test_no_key_is_ever_absent_from_both_tiers(backend_cls, policy_cls, make_dict):
+def test_no_key_is_ever_absent_from_both_tiers(
+    request, backend_cls, policy_cls, make_dict
+):
     """I5. A dirty eviction must write *then* drop, never drop then write.
 
     Blocks inside ``serialize`` and asks for the victim while the write is in
@@ -199,12 +213,20 @@ def test_no_key_is_ever_absent_from_both_tiers(backend_cls, policy_cls, make_dic
     implementation passes it too, and the probe no longer measures I5 at all.
     The two tier readers touch the cache dict and the backend directly, so they
     observe the gap while it is open.
+
+    Backend-scoped rather than blanket since issue 1.2, which made eviction
+    write *then* drop and closed the gap everywhere. On SQLite the evicting
+    write still fails outright -- the connection is opened on the main thread
+    and the eviction runs on a worker -- which the writer-error assertion below
+    catches, so those seven cases stay red until that lands.
     """
+    xfail_sqlite_held_write(request, backend_cls)
+
     d = make_dict(max_in_memory=2)
     d["k0"] = "v0"
     d["k1"] = "v1"
 
-    original = d.disk_backend.serialize
+    original = d._store.backend.serialize
     started = threading.Event()
     release = threading.Event()
     victim = {}
@@ -226,7 +248,7 @@ def test_no_key_is_ever_absent_from_both_tiers(backend_cls, policy_cls, make_dic
         except Exception as exc:  # noqa: BLE001
             writer_error["exc"] = exc
 
-    d.disk_backend.serialize = blocking_serialize
+    d._store.backend.serialize = blocking_serialize
     writer = threading.Thread(target=write, daemon=True)
     writer.start()
     try:
@@ -255,33 +277,26 @@ def test_no_key_is_ever_absent_from_both_tiers(backend_cls, policy_cls, make_dic
     finally:
         release.set()  # idempotent; frees the writer if an assertion above failed
         writer.join(WAIT_SECONDS)
-        d.disk_backend.serialize = original
+        d._store.backend.serialize = original
 
 
 def test_clean_eviction_performs_no_io(
-    request, backend_cls, policy_cls, make_dict, backend_spy
+    backend_cls, policy_cls, make_dict, backend_spy
 ):
     """I5, I6. Evicting an unmodified entry is a memory drop with zero writes.
 
     A read-only pass over keys already on disk must not write. Measured with a
     call spy, not a timer.
 
-    The defect is policy-scoped, so the xfail is applied at runtime rather than
-    as a blanket decorator: Random/FIFO/LIFO read straight through without
-    caching, so they never evict during a read and already satisfy I5. Only the
-    promoting policies write back a value the disk already holds.
+    What this covers, and what it does not. ``Store.get`` does not promote, so
+    the pass below caches nothing, evicts nothing, and reaches zero writes
+    without the clean/dirty tag being consulted at all -- restoring
+    unconditional eviction writes leaves it green. It is still the spec that
+    states the cost in the terms a caller feels, and it becomes load-bearing
+    the moment a read fills the cache (promotion, issue 4.2). The tag itself is
+    guarded by ``test_evicting_a_clean_entry_writes_nothing`` below, which
+    drives the eviction the facade cannot reach yet.
     """
-    if policy_cls in PROMOTING_POLICIES:
-        request.applymarker(
-            pytest.mark.xfail(
-                strict=True,
-                reason=(
-                    "I5/I6: a promoted entry is never marked clean, so evicting "
-                    "it rewrites a value the disk already holds (issue 1.3)"
-                ),
-            )
-        )
-
     d = make_dict(max_in_memory=5)
     keys = [f"k{i}" for i in range(30)]
 
@@ -293,9 +308,9 @@ def test_clean_eviction_performs_no_io(
     # against a correct implementation. Seeding removes the dependency on which
     # victim the policy picks.
     for key in keys:
-        d.disk_backend.serialize(key, f"v-{key}")
+        d._store.backend.serialize(key, f"v-{key}")
 
-    with backend_spy(d.disk_backend) as spy:
+    with backend_spy(d._store.backend) as spy:
         for key in keys:
             assert d[key] == f"v-{key}"
 
@@ -307,12 +322,70 @@ def test_clean_eviction_performs_no_io(
         assert writes == 0, f"a read-only pass issued {writes} writes"
 
 
+
+def test_evicting_a_clean_entry_writes_nothing(
+    backend_cls, policy_cls, make_dict, backend_spy
+):
+    """I5, first half. A victim disk already holds costs nothing to drop.
+
+    The only caller that fills the cache today is a write, and a write is dirty
+    by definition, so no clean entry is reachable through the facade until
+    ``flush`` (issue 1.4) or promotion (issue 4.2). The entries are therefore
+    placed directly, which is the one way to exercise the branch the eviction
+    path takes on them.
+
+    Policy-independent by construction rather than by assumption: three clean
+    entries against a one-item budget leave a surplus of three once the trigger
+    write lands, so whichever three the policy picks, at least two of them are
+    clean. The assertion is per key -- the trigger is dirty and may legitimately
+    be written -- so no policy has to be special-cased.
+    """
+    d = make_dict(max_in_memory=1)
+    clean = {f"clean{index}": f"v-clean{index}" for index in range(3)}
+
+    # Seeded on disk first. "Clean" asserts that disk already holds this exact
+    # value, and an entry marked clean that disk never had is a lie the
+    # eviction believes: it is dropped without ever being written, and the
+    # value is gone.
+    for key, value in clean.items():
+        d._store.backend.serialize(key, value)
+        d._store.cache.put(key, value, dirty=False)
+
+    with backend_spy(d._store.backend) as spy:
+        d["trigger"] = "v-trigger"
+
+        written = {
+            call[1][0] for call in spy.calls if call[0] == "serialize"
+        }
+        # Counting ``serialize`` by key leaves the batch route uncounted, so
+        # this fails loudly rather than quietly if issue 4.1 routes eviction
+        # through ``write_many`` before this spec learns to read its keys.
+        assert spy.count("write_many") == 0, (
+            "eviction wrote through write_many; this spec only reads keys out "
+            "of serialize and would stop seeing clean writes"
+        )
+
+    evicted = [key for key in clean if not in_cache(d, key)]
+    assert len(evicted) >= 2, (
+        f"three clean entries over a one-item budget should have shed at "
+        f"least two, but {len(evicted)} left the cache: the eviction this "
+        f"spec measures did not happen"
+    )
+    assert not written & set(evicted), (
+        f"evicting a clean entry wrote it back: {sorted(written & set(evicted))}"
+    )
+
+    # And the drop was safe: disk still answers for every one of them.
+    for key, value in clean.items():
+        assert d[key] == value, f"{key} did not survive its eviction"
+
+
 def test_reading_a_cached_key_never_writes(backend_cls, policy_cls, make_dict, backend_spy):
     """I6. Re-reading a key already in the cache must not touch the backend."""
     d = make_dict(max_in_memory=5)
     d["hot"] = "payload"
 
-    with backend_spy(d.disk_backend) as spy:
+    with backend_spy(d._store.backend) as spy:
         for _ in range(5):
             assert d["hot"] == "payload"
 
@@ -337,7 +410,7 @@ def test_membership_of_a_cached_key_never_touches_the_backend(
     d["hot"] = "payload"
     assert in_cache(d, "hot")
 
-    with backend_spy(d.disk_backend) as spy:
+    with backend_spy(d._store.backend) as spy:
         assert "hot" in d
 
         # The claim is that the backend is not consulted, so no call of any
@@ -352,7 +425,10 @@ def test_membership_of_a_cached_key_never_touches_the_backend(
 
 @pytest.mark.xfail(
     strict=True,
-    reason="I3: __contains__ calls disk_backend.keys(), an O(N) scan (issue 2.2)",
+    reason=(
+        "I3: backend.has() answers by listing every key, so membership still "
+        "scans the keyspace (issue 2.2)"
+    ),
 )
 @pytest.mark.parametrize("resident", [False, True], ids=["miss", "on-disk"])
 def test_membership_never_lists_the_keyspace(
@@ -373,7 +449,7 @@ def test_membership_never_lists_the_keyspace(
     else:
         probe = "never-written"
 
-    with backend_spy(d.disk_backend) as spy:
+    with backend_spy(d._store.backend) as spy:
         assert (probe in d) is resident
 
         assert spy.count("keys") == 0, "__contains__ listed the whole keyspace"
@@ -434,7 +510,7 @@ def test_eviction_writes_the_current_value(
     d["a"] = "va"
     d["b"] = "vb"
 
-    with backend_spy(d.disk_backend) as spy:
+    with backend_spy(d._store.backend) as spy:
         d["c"] = "vc"
         writes = [call for call in spy.calls if call[0] == "serialize"]
 
@@ -443,13 +519,6 @@ def test_eviction_writes_the_current_value(
         assert value == f"v{key}", f"evicted {key!r} was written as {value!r}"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "I1/I7: a reassigned key's stale disk copy can only be superseded by a "
-        "write-back, and flush() is still a stub (issue 1.4)"
-    ),
-)
 def test_reassignment_supersedes_the_stale_disk_copy(
     backend_cls, policy_cls, make_dict
 ):
@@ -462,12 +531,12 @@ def test_reassignment_supersedes_the_stale_disk_copy(
     d = make_dict(max_in_memory=2)
     d["target"] = "first"
     _spill_to_disk(d, "target")
-    assert d.disk_backend.deserialize("target") == "first"
+    assert d._store.backend.deserialize("target") == "first"
 
     d["target"] = "second"
     d.flush()
 
-    assert d.disk_backend.deserialize("target") == "second"
+    assert d._store.backend.deserialize("target") == "second"
     assert d["target"] == "second"
 
 
@@ -476,10 +545,6 @@ def test_reassignment_supersedes_the_stale_disk_copy(
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="I7: flush() is still a contract stub (issue 1.4)",
-)
 def test_flush_persists_dirty_entries(backend_cls, policy_cls, make_dict):
     """I7. After flush(), every cached write is on disk.
 
@@ -490,13 +555,13 @@ def test_flush_persists_dirty_entries(backend_cls, policy_cls, make_dict):
     for i in range(5):
         d[f"k{i}"] = f"v{i}"
 
-    assert d.disk_backend.keys() == [], "precondition: nothing spilled yet"
+    assert d._store.backend.keys() == [], "precondition: nothing spilled yet"
 
     d.flush()
 
     for i in range(5):
         assert on_disk(d, f"k{i}"), f"k{i} still not persisted after flush()"
-        assert d.disk_backend.deserialize(f"k{i}") == f"v{i}"
+        assert d._store.backend.deserialize(f"k{i}") == f"v{i}"
 
 
 # --------------------------------------------------------------------------
@@ -504,10 +569,43 @@ def test_flush_persists_dirty_entries(backend_cls, policy_cls, make_dict):
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="I8: max_bytes is stored but never enforced (issue 1.4)",
-)
+def test_mutating_a_value_after_flush_does_not_lose_it(
+    backend_cls, policy_cls, make_dict
+):
+    """I5/I7. Flushing must not promise more about a value than it can keep.
+
+    ``flush`` marks what it wrote clean, and a clean entry is dropped at
+    eviction without being written -- which is correct exactly while "disk has
+    this exact value" stays true. The caller holds the same object the cache
+    does, so for a mutable value that claim can be falsified in place, with
+    nothing told: the change is then dropped at eviction and the key reads back
+    as it was at flush time.
+
+    Asserted against disk after a second flush rather than against a read after
+    an eviction. The loss the caller feels is the eviction, but whether ``k`` is
+    the victim depends on the policy -- LIFO and MRU shed the key just written,
+    so ``k`` survives and the defect cannot show there at all. Going through
+    disk puts the same claim to every policy: what is still dirty gets written,
+    and a clean tag makes the second flush skip the key and leave ``[]`` behind.
+
+    A list is the value here because it round-trips faithfully through all four
+    backends -- it is in neither the unsupported nor the lossy table -- so a
+    failure is about the tag and not about the codec.
+    """
+    d = make_dict(max_in_memory=1)
+    d["k"] = []
+    d.flush()
+
+    d["k"].append(1)
+    d.flush()
+
+    assert d._store.backend.deserialize("k") == [1], (
+        "the in-place change never reached disk: the entry was marked clean by "
+        "the first flush, so the second one passed over it"
+    )
+    assert d["k"] == [1], "the store no longer reads back what it was given"
+
+
 def test_cache_respects_byte_budget(backend_cls, policy_cls, make_dict):
     """I8. The cache is bounded by bytes, not only by item count.
 
@@ -551,7 +649,7 @@ def test_cache_respects_byte_budget(backend_cls, policy_cls, make_dict):
 
 @pytest.mark.parametrize(
     "base",
-    [DiskBackend, EvictionPolicy, ReplacementStrategy],
+    [DiskBackend, EvictionPolicy],
     ids=lambda c: c.__name__,
 )
 def test_abstract_bases_cannot_be_instantiated(base):
@@ -580,10 +678,10 @@ def test_abstract_bases_cannot_be_instantiated(base):
     contradict the specs in ``test_architecture.py``, which construct
     ``Cache(...)`` and ``Store(...)`` directly.
 
-    ``ReplacementStrategy`` is the legacy base and is listed for a sharper
-    reason: it shipped carrying three ``@abstractmethod`` decorators while not
-    being an ABC at all, so they bound nothing across seven live subclasses. It
-    is scheduled for removal in Phase 1, and this row goes with it when it goes.
+    ``ReplacementStrategy`` was listed here too, for a sharper reason: it
+    shipped carrying three ``@abstractmethod`` decorators while not being an ABC
+    at all, so they bound nothing across seven live subclasses. Issue 1.2 deleted
+    the class, and this row went with it as that docstring said it would.
     """
     assert getattr(base, "__abstractmethods__", frozenset()), (
         f"{base.__name__} declares no abstract methods, so @abstractmethod is "

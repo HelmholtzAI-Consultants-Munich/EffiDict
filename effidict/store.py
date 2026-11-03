@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from typing import Iterator
 
 
@@ -18,6 +19,118 @@ class _Missing:
 
 
 MISSING = _Missing()
+
+
+#: Types whose values cannot change once stored. The clean tag asserts that
+#: disk holds *this exact value*, and the caller is holding the same object the
+#: cache is -- so for anything outside this set the assertion can be falsified
+#: in place, by the caller, with nothing told about it.
+_IMMUTABLE_TYPES = frozenset({str, bytes, int, float, complex, bool, type(None)})
+
+
+def _is_immutable(value) -> bool:
+    """Whether ``value`` can be trusted not to change behind the cache's back.
+
+    Exact type, not ``isinstance``. A subclass of an immutable type is not
+    itself immutable: ``class Tagged(str)`` with a list attribute passes any
+    ``isinstance(value, str)`` test while carrying state the holder can change
+    in place, which is the very thing this is here to catch. Subclasses are
+    therefore treated as mutable -- including ``namedtuple``, which costs it
+    the free eviction and costs nothing else.
+
+    A container counts only if everything inside it does. A ``tuple`` cannot be
+    reassigned, but it can hold a list, and mutating that list changes what the
+    tuple means just as surely as changing the tuple would.
+
+    Conservative by construction: anything unrecognised is treated as mutable,
+    which costs a rewrite at eviction and never costs the change itself.
+    """
+    if type(value) in _IMMUTABLE_TYPES:
+        return True
+    if type(value) in (tuple, frozenset):
+        return all(_is_immutable(item) for item in value)
+    return False
+
+
+#: Which locks this thread is inside, by ``id``. Thread-local, so a guard only
+#: ever reads and writes the set belonging to the thread asking -- there is no
+#: shared state to race over, and no other thread's entry to misread. Keyed by
+#: the *underlying* lock rather than by the guard, because two stores handed
+#: one lock share one critical section and must therefore share one answer to
+#: "am I already inside it?". An id identifies its lock unambiguously for as
+#: long as the entry exists: the guard holding the lock keeps it alive, so the
+#: id cannot be handed to a different object while it is in the set.
+_HELD = threading.local()
+
+
+def _held_locks() -> set:
+    """Return this thread's set of entered lock ids, creating it on first use."""
+    try:
+        return _HELD.locks
+    except AttributeError:
+        locks = _HELD.locks = set()
+        return locks
+
+
+class _ReentrancyGuard:
+    """The store's lock, with same-thread re-entry turned into an error.
+
+    Nothing in :class:`Store` re-enters; the callers that can are finalizers,
+    and they arrive in the middle of whatever tier operation was running. A
+    plain lock hangs on them with no diagnosis, and a reentrant one lets them
+    read the half-applied state I4 exists to hide. Refusing is the third
+    option and the only safe one: the re-entrant call never runs, so it cannot
+    observe anything, and the operation underneath it is left alone.
+
+    The entry is made *before* ``acquire`` and dropped *after* ``release``, so
+    a thread counts as inside the lock for the whole of both calls. The
+    ``Lock`` protocol of PLAN.md 3.6 admits a lock written in Python, whose
+    ``acquire`` and ``release`` run Python -- and therefore allocate, and
+    therefore may hand the cyclic collector a finalizer -- while the underlying
+    lock is already held or still held. Bracketing the calls rather than
+    sitting inside them is what covers those two windows.
+
+    The bias is deliberate: between ``release`` returning and the entry being
+    dropped the lock is free but still claimed, so a finalizer arriving in that
+    sliver is refused although it could have been served. That is a visible
+    error on a path that would otherwise have worked, against a deadlock on a
+    path that cannot work -- and the window holds no call that can block.
+    """
+
+    def __init__(self, lock):
+        self._lock = lock
+        # Stable for this guard's life: ``self._lock`` keeps the lock alive.
+        self._id = id(lock)
+
+    def __enter__(self):
+        held = _held_locks()
+        if self._id in held:
+            raise RuntimeError(
+                "Store operation re-entered on the same thread. A stored "
+                "value's __del__ called back into the store -- directly, or "
+                "because the cyclic garbage collector ran that finalizer "
+                "inside an unrelated store operation, possibly on another "
+                "store sharing this lock. Re-entry cannot be served: it would "
+                "read a half-applied operation. Keep the store out of the "
+                "finalizer."
+            )
+        held.add(self._id)
+        try:
+            self._lock.acquire()
+        except BaseException:
+            held.discard(self._id)
+            raise
+        return self
+
+    def __exit__(self, *exc_info):
+        # ``held`` is bound before the release, so once the lock is free the
+        # only step left is the discard -- nothing that can block, and nothing
+        # that needs the lock.
+        held = _held_locks()
+        try:
+            self._lock.release()
+        finally:
+            held.discard(self._id)
 
 
 class Store:
@@ -42,37 +155,215 @@ class Store:
 
     Note that keys legitimately reside in both tiers at once; I1 makes disk
     authoritative rather than exclusive. I5 depends on that overlap.
+
+    I2 is the cache's: an entry carries a ``dirty`` tag, set by the write that
+    put it there and cleared only by a caller that has since written it out.
+    :meth:`_spill` reads that tag, which is what makes the first half of I5 --
+    evicting a clean entry costs no I/O -- decidable at all. Every entry is
+    dirty today, because the two callers that could produce a clean one are not
+    here yet: ``flush`` (issue #1.4) and promotion on read (see :meth:`get`).
+
+    **No stored value is released while the lock is held.** Dropping the last
+    reference to a value runs its ``__del__`` then and there, on this thread,
+    inside the critical section -- so overwriting a cached entry, evicting one
+    or deleting one hands control to arbitrary user code in the middle of a
+    tier operation. A finalizer that queries the store would then read the
+    half-finished state I4 forbids: during :meth:`delete`, after the cache has
+    dropped the key and before the backend has, ``get`` still answers from
+    disk. The mutating methods therefore keep every displaced value alive in a
+    local ``released`` list and let it die after the ``with`` block, which runs
+    those finalizers against a store that is whole again.
+
+    Deferral reaches only the references this class drops. A value in a
+    reference *cycle* outlives them: the collector frees it whenever it next
+    runs, which may be inside any later locked operation, and no refcount-side
+    strategy can reach that. Nor does deferral help a value whose
+    ``__reduce__`` re-enters, since pickling runs under the lock by necessity
+    -- I4 forbids releasing it around the write.
+
+    What is left over is therefore reported rather than allowed or waited on:
+    the lock is a :class:`_ReentrancyGuard`, which raises on same-thread
+    re-entry. Measured, with a collection forced inside the lock: a bare
+    ``Lock`` hangs there indefinitely, and the guard raises instead, leaving
+    the operation underneath untouched. CPython prints the error from the
+    finalizer and carries on.
     """
 
     def __init__(self, backend, cache, lock=None, owns_storage: bool = True):
-        raise NotImplementedError("see issue #1.2")
+        self._backend = backend
+        self._cache = cache
+        # A plain ``Lock``, because nothing here re-acquires. The tier
+        # operations are written in terms of each other -- ``pop`` is ``get``
+        # then ``delete``, ``delete`` asks ``contains`` -- and I4 requires the
+        # whole sequence to hold one lock rather than releasing it between the
+        # two tiers, so each public method acquires once and calls the private
+        # held-lock form of the others. That is what lets an injected lock be
+        # any lock: a caller sharing a plain ``Lock`` across stores, or the
+        # ``Lock`` protocol of PLAN.md 3.6, which need not be reentrant.
+        #
+        # A reentrant default would not make the one caller that re-enters on
+        # its own -- a finalizer -- correct; it would only let it observe a
+        # half-applied operation. How the deferral and the guard divide that
+        # work between them is in the class docstring.
+        # Whether the lock is ours to recreate. A caller who injected one did
+        # so to share it; see :meth:`__getstate__`.
+        self._owns_lock = lock is None
+        self._lock = _ReentrancyGuard(threading.Lock() if lock is None else lock)
+        self._owns_storage = owns_storage
+
+    def __getstate__(self):
+        """Pickle everything except the lock, which does not survive a copy.
+
+        A ``threading.Lock`` cannot be pickled, so without this the whole
+        facade is unpicklable and never reaches a worker process -- joblib
+        fails at dispatch, before any of the storage-ownership behaviour the
+        worker specs are about.
+
+        Dropping it is right rather than merely convenient: a lock excludes
+        threads within one process, and the copy on the other side of a pickle
+        is in another process, where the original's lock means nothing. It gets
+        a fresh one of its own in :meth:`__setstate__`.
+
+        An **injected** lock is refused instead. The caller passed one in order
+        to share it -- across stores, or with code of their own -- and neither
+        answer is safe to pick silently: a copy carrying a new lock stops
+        excluding the original while looking like it still does, and a copy
+        that somehow kept the original would be coordinating across a process
+        boundary that ``threading`` locks do not cross.
+        """
+        if not self._owns_lock:
+            raise TypeError(
+                "this Store was given a lock to share, and a pickled copy "
+                "cannot share it: a copy with a lock of its own would silently "
+                "stop excluding the original. Pickle a store that makes its "
+                "own lock, or hand the worker a path and let it open its own."
+            )
+        state = self.__dict__.copy()
+        del state["_lock"]
+        return state
+
+    def __setstate__(self, state):
+        """Restore the store with a lock of this process's own."""
+        self.__dict__.update(state)
+        self._lock = _ReentrancyGuard(threading.Lock())
 
     @property
     def backend(self):
         """Return the backing persistent store."""
-        raise NotImplementedError("see issue #1.2")
+        return self._backend
 
     @property
     def cache(self):
         """Return the in-memory cache."""
-        raise NotImplementedError("see issue #1.2")
+        return self._cache
 
     @property
     def owns_storage(self) -> bool:
         """Return whether this store owns the backend storage lifecycle."""
-        raise NotImplementedError("see issue #3.1")
+        return self._owns_storage
 
     def get(self, key):
-        """Return ``key`` from the store."""
-        raise NotImplementedError("see issue #1.2")
+        """Return ``key`` from the store.
+
+        Cache first, then disk; the backend raises ``KeyError`` for a key it
+        does not hold, which is the same answer the cache gives, so a miss in
+        both tiers reaches the caller unchanged.
+
+        A disk hit is *not* promoted into the cache. The clean/dirty tag makes
+        a promoted entry free to evict, which removes the write amplification
+        that used to be the objection -- but it does nothing about the other
+        one: promotion changes *what is cached* as a side effect of reading,
+        and two specs forbid exactly that.
+        ``test_full_scan_does_not_evict_the_working_set`` requires a walk to
+        leave the caller's cached keys intact, and
+        ``test_eq_does_not_mutate_either_operand`` requires comparing two stores
+        to leave both unchanged. Both walk every key through a smaller cache,
+        so promotion evicts the caller's working set to hold keys the caller
+        only passed over. A read path that streams without caching is issue
+        #4.2; promotion can only follow it.
+        """
+        with self._lock:
+            return self._get(key)
+
+    def _get(self, key):
+        """:meth:`get` with the lock already held."""
+        try:
+            return self._cache.get(key)
+        except KeyError:
+            return self._backend.deserialize(key)
 
     def set(self, key, value) -> None:
-        """Store ``value`` under ``key``."""
-        raise NotImplementedError("see issue #1.2")
+        """Store ``value`` under ``key``.
+
+        Overwriting a cached key displaces the value that was there, and that
+        value must outlive the lock: see the class docstring.
+        """
+        released = []
+        with self._lock:
+            if self._cache.has(key):
+                released.append(self._cache.peek(key))
+            self._cache.put(key, value)
+            self._spill(released)
+        del released
+
+    def _spill(self, released: list) -> None:
+        """Write out and drop whatever the cache says is over budget.
+
+        A dirty victim is written *then* dropped, per I5: between the two the
+        key is in both tiers, so a reader looking at either one still finds it.
+        Dropping first would open a window in which the key is in neither, which
+        is the gap ``test_no_key_is_ever_absent_from_both_tiers`` probes.
+
+        A clean victim is dropped without being written, which is the other half
+        of I5. Disk already holds that exact value, so the write would be a copy
+        of what is there -- and a read-only pass over a store larger than its
+        cache is made of such evictions, one per key. The tag is what tells the
+        two cases apart; ``peek`` rather than ``get`` so measuring a victim does
+        not promote it.
+
+        Each evicted value goes to ``released``, the caller's list, so that the
+        discard here cannot be the drop that runs its ``__del__``.
+        """
+        for key in self._cache.evict_candidates():
+            value = self._cache.peek(key)
+            released.append(value)
+            if self._cache.is_dirty(key):
+                self._backend.serialize(key, value)
+            self._cache.discard(key)
 
     def delete(self, key) -> None:
-        """Remove ``key`` from all tiers."""
-        raise NotImplementedError("see issue #1.2")
+        """Remove ``key`` from all tiers.
+
+        I4: both tiers under one lock. ``del_item`` is tolerant of a key the
+        backend never held, so a cache-only key needs no special case here --
+        the check in :meth:`_delete` is what turns a missing key into ``KeyError``.
+        """
+        released = []
+        with self._lock:
+            self._delete(key, released)
+        del released
+
+    def _delete(self, key, released: list) -> None:
+        """:meth:`delete` with the lock already held.
+
+        ``released`` takes the cached value, so the window between the two
+        tiers -- the one I4 is about -- cannot be handed to a finalizer.
+
+        The backend goes first, and the order is the whole of the failure
+        behaviour. ``del_item`` is the step that can fail -- a storage error,
+        or SQLite refusing a call from the wrong thread (issue #2.3) -- and
+        dropping the cached copy before it means a *failed* delete throws away
+        the newer in-memory value while leaving the stale copy on disk. The
+        caller sees the error, and then a later read quietly answers with the
+        old value. This way a failure leaves both tiers as they were: the
+        delete simply did not happen.
+        """
+        if not self._contains(key):
+            raise KeyError(key)
+        if self._cache.has(key):
+            released.append(self._cache.peek(key))
+        self._backend.del_item(key)
+        self._cache.discard(key)
 
     def pop(self, key, default=MISSING):
         """Remove ``key`` and return its value.
@@ -80,28 +371,74 @@ class Store:
         Returns ``default`` if the key is absent and a default was given; raises
         ``KeyError`` if it is absent and none was. ``dict`` semantics, including
         ``pop(key, None)`` returning ``None`` rather than raising.
+
+        Read then delete, on the same path as :meth:`delete`. The bug this
+        replaces popped the in-memory copy and returned, leaving the disk copy
+        behind: a second ``pop`` of the same key then succeeded.
         """
-        raise NotImplementedError("see issue #1.2")
+        released = []
+        with self._lock:
+            try:
+                value = self._get(key)
+            except KeyError:
+                if default is MISSING:
+                    raise
+                return default
+            self._delete(key, released)
+        del released
+        return value
 
     def clear(self) -> None:
-        """Remove all entries from all tiers."""
-        raise NotImplementedError("see issue #1.2")
+        """Remove all entries from all tiers.
+
+        Every cached value is displaced at once, so ``released`` holds the lot
+        until the lock is gone: see the class docstring.
+        """
+        released = []
+        with self._lock:
+            released.extend(self._cache.peek(key) for key in self._cache)
+            for key in list(self._backend.keys()):
+                self._backend.del_item(key)
+            self._cache.clear()
+        del released
 
     def update(self, items) -> None:
         """Store multiple items."""
         raise NotImplementedError("see issue #4.1")
 
     def contains(self, key) -> bool:
-        """Return whether ``key`` is present in any tier."""
-        raise NotImplementedError("see issue #1.2")
+        """Return whether ``key`` is present in any tier.
+
+        I3, as the invariant states it: ``cache.has(key) or backend.has(key)``.
+        Making ``backend.has`` cheaper than a key listing is issue #2.2; the
+        shape of the answer is settled here.
+        """
+        with self._lock:
+            return self._contains(key)
+
+    def _contains(self, key) -> bool:
+        """:meth:`contains` with the lock already held."""
+        return self._cache.has(key) or self._backend.has(key)
 
     def count(self) -> int:
         """Return the number of distinct keys in the store."""
-        raise NotImplementedError("see issue #1.2")
+        with self._lock:
+            return len(self._key_set())
 
     def iter_keys(self) -> Iterator:
-        """Iterate over all distinct keys in the store."""
-        raise NotImplementedError("see issue #4.2")
+        """Iterate over all distinct keys in the store.
+
+        Materialised: the union is built as a set before anything is yielded.
+        Issue #4.2 makes it lazy, which is what
+        ``test_keys_does_not_materialise_the_whole_keyspace`` is about. The union
+        itself lives here because this is the one object that knows both tiers.
+        """
+        with self._lock:
+            return iter(self._key_set())
+
+    def _key_set(self):
+        """Every distinct key across both tiers, with the lock already held."""
+        return set(self._cache) | set(self._backend.keys())
 
     def in_cache(self, key) -> bool:
         """White-box hook for tier-invariant specs to assert preconditions.
@@ -112,15 +449,80 @@ class Store:
         the write completed, at which point a drop-then-write implementation
         looks identical to a compliant one.
         """
-        raise NotImplementedError("see issue #1.2")
+        return self._cache.has(key)
+
+    def load_from_dict(self, dictionary) -> None:
+        """Bulk-load ``dictionary`` straight into the backend.
+
+        A pass-through to the backend's own bulk loader, kept so the facade does
+        not have to reach past the store to call it. That it bypasses the cache
+        is a real defect -- ``test_batch_and_single_writes_are_equivalent`` pins
+        it -- and it is issue #4.1's to fix along with :meth:`update`.
+        """
+        with self._lock:
+            self._backend.load_from_dict(dictionary)
 
     def flush(self) -> None:
-        """Write dirty cached items to the backend."""
-        raise NotImplementedError("see issue #1.4")
+        """Write every dirty cached entry to the backend and mark it clean.
+
+        I7: after this returns, disk holds every write the cache was carrying.
+        Until it is called, a value written into a cache with room never
+        reaches the backend at all -- there was no way to force it there, which
+        is what made an unflushed store unrecoverable.
+
+        Collected before writing, not walked lazily: ``mark_clean`` replaces the
+        entry it is marking, and ``dirty_items`` reads the live dict, so
+        consuming the two together would mutate what is being iterated.
+
+        One write per entry for now. The batch path that makes this one call is
+        issue #4.1, and ``write_many`` is its contract stub today.
+
+        Marking clean is what makes the flush worth anything beyond the write:
+        those entries can then be evicted without being written again, which is
+        the half of I5 that costs nothing.
+
+        Only an immutable value is marked, though. The caller holds the same
+        object the cache does, so for a mutable one the tag can be falsified
+        without anything being told: ``d["k"] = []``, ``flush()``,
+        ``d["k"].append(1)`` leaves the cache holding ``[1]`` under a tag
+        claiming disk has it, and the next eviction drops it unwritten -- the
+        append is gone and the key reads ``[]`` again. Nothing in a write-back
+        cache can observe an in-place change, so "dirty" is the only honest tag
+        for a value the caller can still change. The cost is a rewrite at
+        eviction for those values, which is what *every* eviction did before
+        the tag existed.
+
+        Conservative on purpose, and owed another look in issue #4.1. Every
+        dict, list, ndarray and DataFrame pays that write, which for most real
+        workloads is every value the store holds. The batch write path lands in
+        4.1 and changes what the write costs, which is the moment to weigh the
+        alternatives again -- copying on put, a mutation-tracking boundary, or
+        marking everything clean and documenting the limit. Widening the rule
+        without picking one of those brings the silent loss back.
+
+        "Disk holds this value" means as faithfully as the backend can hold it.
+        A lossy codec -- a tuple through JSON, an ``int`` through HDF5 --
+        changes the value on the way out, and does so whether or not the entry
+        is marked clean, because the write happens either way. That is the
+        backends' value domain to fix (issue #7.2), not this tag's to work
+        around.
+        """
+        with self._lock:
+            for key, value in list(self._cache.dirty_items()):
+                self._backend.serialize(key, value)
+                if _is_immutable(value):
+                    self._cache.mark_clean(key)
 
     def close(self) -> None:
-        """Close store resources without destroying storage."""
-        raise NotImplementedError("see issue #1.2")
+        """Close store resources without destroying storage.
+
+        Destroys today, which is what ``EffiDict.close`` has always done. Issue
+        #3.1 separates the two; doing it here instead would be a lifecycle change
+        in a key-placement PR, and three lifecycle specs are marked as expected
+        failures against today's behaviour.
+        """
+        with self._lock:
+            self._backend.destroy()
 
     def destroy(self) -> None:
         """Destroy owned storage resources."""

@@ -31,9 +31,10 @@ class DiskBackend(ABC):
     Phase 0 carries three further user-visible changes, listed here so the set
     is in one place:
 
-    * ``ReplacementStrategy`` became an ABC for the same reason, so an
-      out-of-tree policy missing ``get``, ``put`` or ``get_memory`` now raises
-      ``TypeError`` at construction.
+    * ``ReplacementStrategy`` became an ABC for the same reason. Issue 1.2 then
+      removed it and the seven ``*Replacement`` classes outright, so an
+      out-of-tree subclass of any of them no longer imports; ``EvictionPolicy``
+      and the ``*Policy`` classes replace them.
     * ``Hdf5Backend`` no longer requires ``numpy``. It never used it, and h5py
       depends on numpy anyway, so the gate could not fire; the ``ImportError``
       text changed with it.
@@ -77,8 +78,14 @@ class DiskBackend(ABC):
             self.serialize(key, value)
 
     def has(self, key) -> bool:
-        """Return whether ``key`` exists in this backend."""
-        raise NotImplementedError("see issue #2.2")
+        """Return whether ``key`` exists in this backend.
+
+        Naive on purpose: one full key listing per call. I3 needs a correct
+        answer here, and issue #2.2 makes it cheap per backend -- the complexity
+        guard ``test_membership_cost_does_not_grow_with_the_store`` is what that
+        issue has to satisfy, and this implementation does not.
+        """
+        return key in self.keys()
 
     def count(self) -> int:
         """Return the number of keys in this backend."""

@@ -31,11 +31,27 @@ below, which construct ``Cache(...)`` and ``Store(...)`` directly.
 
 from __future__ import annotations
 
+import gc
 import inspect
+import pickle
+import threading
+from collections import OrderedDict
 
 import pytest
 
-from effidict import Cache, EffiDict, EvictionPolicy, Store
+from effidict import (
+    Cache,
+    EffiDict,
+    EvictionPolicy,
+    FIFOPolicy,
+    LFUPolicy,
+    LIFOPolicy,
+    LRUPolicy,
+    MFUPolicy,
+    MRUPolicy,
+    PickleBackend,
+    Store,
+)
 
 #: The documented ``Store`` surface, as issue 0.1 wrote it. Each entry is the
 #: name plus the positional parameter names after ``self``, so a Phase 1
@@ -210,10 +226,6 @@ def test_unimplemented_methods_name_their_issue(owner):
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Store.__init__ and Cache.__init__ are contract stubs (issue 1.2)",
-)
 def test_store_can_be_built_over_a_backend_and_a_cache(backend_cls, storage_dir):
     """The composition root must actually compose.
 
@@ -235,34 +247,34 @@ def test_store_can_be_built_over_a_backend_and_a_cache(backend_cls, storage_dir)
 
 
 def test_both_tiers_are_required_to_construct():
-    """Neither constructor argument may carry a default it cannot honour.
+    """No constructor argument may carry a default it cannot honour.
 
-    ``__init__`` ends with ``self.memory = replacement_strategy.memory``, so a
-    ``None`` default could only ever raise ``AttributeError`` from inside the
-    object. A caller who omits an argument should be told which one, by the
-    signature, before any attribute lookup happens.
+    Three are required, for two different reasons. The backend and the policy
+    are the tiers themselves: before issue 1.2 they defaulted to ``None`` and
+    ``__init__`` ended with ``self.memory = replacement_strategy.memory``, so
+    either default could only raise ``AttributeError`` from inside the object.
+    ``max_in_memory`` is required because a default would be *usable* and wrong
+    -- an unbounded cache never spills, which is the one thing this library
+    exists to do, and the store would silently become a dict that also writes
+    files.
+
+    A caller who omits one should be told which, by the signature, before any
+    attribute lookup happens.
     """
     parameters = inspect.signature(EffiDict.__init__).parameters
-    for name in ("disk_backend", "replacement_strategy"):
+    for name in ("disk_backend", "policy", "max_in_memory"):
         assert parameters[name].default is inspect.Parameter.empty, (
             f"{name} declares a default that __init__ cannot work with"
         )
 
     with pytest.raises(TypeError) as raised:
         EffiDict()
-    assert "replacement_strategy" in str(raised.value), (
+    assert "policy" in str(raised.value), (
         f"constructing without arguments reported {raised.value!r}, which does "
         f"not name the missing argument"
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "EffiDict holds its own disk_backend and aliases the policy's dict as "
-        "self.memory, so nothing owns key placement (issue 1.2)"
-    ),
-)
 def test_effidict_delegates_placement_to_a_store(make_dict):
     """``EffiDict`` must be a facade over one ``Store``, not a second owner.
 
@@ -290,10 +302,6 @@ def test_effidict_delegates_placement_to_a_store(make_dict):
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Cache is a contract stub; clean/dirty tagging does not exist (issue 1.3)",
-)
 def test_cache_tags_entries_clean_or_dirty():
     """I2. A cache entry must know whether disk already has it.
 
@@ -320,13 +328,10 @@ def test_cache_tags_entries_clean_or_dirty():
 #: "peek did not promote" is a statement about a call that must *not* happen,
 #: which is unobservable from the outside.
 #:
-#: Used by every Cache spec here in place of the matrix ``policy_cls``, and not
-#: only for observability: ``Cache`` takes an ``EvictionPolicy``, while the
-#: matrix still supplies the legacy ``*Replacement`` classes, which do not grow
-#: ``on_insert``/``victim`` until issue 1.1. Handing one to a correct ``Cache``
-#: raises ``AttributeError``, so these specs were unsatisfiable by the very
-#: implementation they are meant to describe -- found by running them against a
-#: reference ``Cache`` rather than by reading them.
+#: Used by every Cache spec here in place of the matrix ``policy_cls``. The
+#: matrix now supplies real ``*Policy`` classes, which a ``Cache`` accepts, but
+#: those keep their bookkeeping private: what these specs assert is which calls
+#: the cache made, and that is only visible from a policy that records them.
 class RecordingPolicy(EvictionPolicy):
     def __init__(self):
         self.calls = []
@@ -362,21 +367,8 @@ class RecordingPolicy(EvictionPolicy):
         self.order.clear()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Cache is a contract stub, so this dies at the constructor (issue 1.2) "
-        "before it can reach the thing it pins -- neither budget is enforced "
-        "(issue 1.4). It also exercises has/discard, which are 1.2 as well, so "
-        "it stays red until both land"
-    ),
-)
-def test_cache_reports_what_must_be_shed_for_each_budget():
-    """I8. Either budget alone must put entries on the eviction list.
-
-    Two budgets, two separate failure modes: today ``max_in_memory`` counts items
-    and ``max_bytes`` is accepted and dropped, which is how a hundred 1 MB values
-    fit a "hundred-item" cache.
+def test_cache_reports_what_must_be_shed_for_the_item_budget():
+    """I8, item half. Going over ``max_items`` must put entries on the list.
 
     Asserted as *what the cache says must go*, not as the cache having already
     dropped it. An earlier version of this spec demanded ``len(cache) <= 2``
@@ -392,6 +384,12 @@ def test_cache_reports_what_must_be_shed_for_each_budget():
     falls outside the contract as written. If issue 1.4 wants watermark
     eviction, this assertion and that docstring change together -- which is the
     point of pinning it here rather than discovering the disagreement later.
+
+    Green since issue 1.2, and red for longer than it had to be: this used to
+    share a test with the byte budget, which dies at ``nbytes()``, and one
+    failure marks a whole test expected-to-fail. The two budgets are missing
+    for different reasons and land in different issues, so they are pinned
+    apart -- and this half guards the item path again.
     """
     by_items = Cache(policy=RecordingPolicy(), max_items=2)
     for index in range(5):
@@ -428,6 +426,19 @@ def test_cache_reports_what_must_be_shed_for_each_budget():
         "the cache is inside its budget but still names candidates to shed"
     )
 
+
+def test_cache_reports_what_must_be_shed_for_the_byte_budget():
+    """I8, byte half. Going over ``max_bytes`` must put entries on the list too.
+
+    Two budgets, two separate failure modes: ``max_items`` counts items and is
+    enforced, while ``max_bytes`` is recorded and never consulted -- which is
+    how a hundred 1 MB values fit a "hundred-item" cache. The first assertion
+    below is where that shows, since ``nbytes()`` cannot even report what is
+    resident.
+
+    The item half is
+    ``test_cache_reports_what_must_be_shed_for_the_item_budget``, which passes.
+    """
     by_bytes = Cache(
         policy=RecordingPolicy(),
         max_items=1000,
@@ -459,10 +470,198 @@ def test_cache_reports_what_must_be_shed_for_each_budget():
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Cache is a contract stub; size_estimator is never consulted (issue 1.4)",
+#: What each policy has to give up when the cache is three entries over a
+#: two-item budget. Derived from the policy semantics, not from a run: five keys
+#: go in as ``a`` to ``e``, then ``b`` is read twice and ``d`` once. That leaves
+#: insertion order a,b,c,d,e; last-use order a,c,e,b,d; and use counts a=1, b=3,
+#: c=1, d=2, e=1, with ties broken oldest-first. Each entry below is the first
+#: three of that policy's own ordering.
+MULTI_KEY_SHED = {
+    FIFOPolicy: ["a", "b", "c"],  # oldest inserted first
+    LIFOPolicy: ["e", "d", "c"],  # newest inserted first
+    LRUPolicy: ["a", "c", "e"],   # least recently used first
+    MRUPolicy: ["d", "b", "e"],   # most recently used first
+    LFUPolicy: ["a", "c", "e"],   # the three keys still at one use
+    MFUPolicy: ["b", "d", "a"],   # 3 uses, then 2, then the oldest of the ones
+}
+
+
+def _over_budget_by_three(policy):
+    """A two-item cache holding the five keys the table above was derived from."""
+    cache = Cache(policy=policy, max_items=2)
+    for key in "abcde":
+        cache.put(key, f"v-{key}")
+    for key in ("b", "b", "d"):
+        cache.get(key)
+    return cache
+
+
+@pytest.mark.parametrize(
+    "policy_cls, expected",
+    [pytest.param(cls, shed, id=cls.__name__) for cls, shed in MULTI_KEY_SHED.items()],
 )
+def test_cache_sheds_exactly_the_surplus_in_victim_order(policy_cls, expected):
+    """Several keys at once, in the policy's order, and not one key more.
+
+    The single-key shed is the steady state -- ``Store`` spills after every
+    ``put``, so the surplus is one -- and it has a fast path of its own that
+    reads the ordering's endpoint. This is the other branch: the one a bulk
+    ``update`` (issue #4.1) or a byte budget (issue #1.4) reaches, where the
+    cache is several entries over at once and has to take a *prefix* of the
+    policy's ordering rather than its first element.
+
+    Two things are pinned, and the literal list pins both: the count, because
+    "the keys that must be shed to get back inside budget" is exactly the
+    surplus and a cache shedding to a low-water mark would be answering a
+    different question; and the order, because the owner writes these out in
+    the order it is handed them, so a prefix of the wrong end of the ordering
+    evicts the keys the policy was protecting.
+    """
+    cache = _over_budget_by_three(policy_cls())
+
+    candidates = list(cache.evict_candidates())
+
+    assert candidates == expected, (
+        f"{policy_cls.__name__} is three entries over a two-item budget and "
+        f"named {candidates}; its own ordering gives {expected}"
+    )
+    # Naming is not removing. The owner has to peek the value and write it out
+    # before it goes, which it cannot do for a key the cache already dropped --
+    # the half of I5 that keeps a dirty victim recoverable.
+    assert len(cache) == 5, (
+        f"evict_candidates dropped entries by itself: {len(cache)} of 5 held"
+    )
+    assert all(cache.has(key) for key in expected), (
+        f"evict_candidates removed keys it had only named: "
+        f"{[key for key in expected if not cache.has(key)]}"
+    )
+
+
+def test_a_write_the_estimator_rejects_leaves_no_trace():
+    """A value the cache cannot size must not be half-recorded.
+
+    ``size_estimator`` is caller-supplied code running over an arbitrary value,
+    so it can raise -- a custom estimator refusing a type, pandas unhappy with
+    an exotic dtype. Everything else ``put`` does is bookkeeping that cannot
+    fail, which makes the order the whole story: estimate first and a rejected
+    write leaves nothing behind; tell the policy first and it goes on offering
+    a key the cache does not hold.
+
+    The consequence is not confined to the failed call. The policy names that
+    phantom as a victim on some later, perfectly valid write, and the eviction
+    path strands on a key it cannot peek -- so the caller sees ``KeyError`` for
+    a key they never successfully stored, nowhere near the write that caused it.
+    """
+
+    def picky(value):
+        if value == "unmeasurable":
+            raise TypeError("cannot size this")
+        return 10
+
+    policy = RecordingPolicy()
+    cache = Cache(policy=policy, max_items=2, size_estimator=picky)
+
+    with pytest.raises(TypeError):
+        cache.put("rejected", "unmeasurable")
+
+    assert not cache.has("rejected"), "the rejected value was stored anyway"
+    assert policy.calls == [], (
+        f"the policy was told about a write that failed: {policy.calls}"
+    )
+    assert cache.nbytes() == 0, (
+        f"a rejected write left {cache.nbytes()} bytes on the books"
+    )
+
+    # The delayed half: eviction must still only ever name residents.
+    for key in ("a", "b", "c"):
+        cache.put(key, "v")
+    victims = list(cache.evict_candidates())
+    assert victims, "precondition: three entries over a two-item budget shed one"
+    stranded = [key for key in victims if not cache.has(key)]
+    assert not stranded, (
+        f"eviction named {stranded}, which the cache does not hold: a failed "
+        f"write left the policy tracking it"
+    )
+
+
+class _LiveOrderPolicy(EvictionPolicy):
+    """A conforming policy that enumerates its live ordering, not a snapshot.
+
+    ``EvictionPolicy.victims`` asks for the tracked keys in eviction order and
+    says nothing about copying them first. The seven shipped policies do copy,
+    for reasons of their own, and so does :class:`RecordingPolicy` -- so none of
+    them can tell whether ``Cache`` reads the candidates out before handing
+    them over or passes a half-finished walk to the caller. This one can.
+
+    Eviction order is insertion order, which is all this needs; ``on_access``
+    has nothing to record.
+    """
+
+    def __init__(self):
+        self._keys = OrderedDict()
+
+    def on_insert(self, key):
+        self._keys[key] = None
+
+    def on_access(self, key):
+        """Nothing to record: eviction order here is insertion order."""
+
+    def on_remove(self, key):
+        self._keys.pop(key, None)
+
+    def victim(self):
+        if not self._keys:
+            raise KeyError("no keys are being tracked")
+        return next(iter(self._keys))
+
+    def victims(self):
+        return iter(self._keys)
+
+    def clear(self):
+        self._keys.clear()
+
+
+def test_cache_candidates_survive_being_discarded_while_walked():
+    """The owner discards as it walks, so the walk cannot still be running.
+
+    ``Store._spill`` peeks a candidate, writes it out and discards it before
+    asking for the next one. It has to: holding every victim until the end
+    would keep the memory it is restoring. ``Cache`` therefore promises the
+    candidates are read out of the policy *before* they are handed over -- "the
+    caller may discard what it is handed while walking it".
+
+    A cache that passed the policy's iterator straight through, taking keys
+    only as the caller asked for them, satisfies every other assertion in this
+    file: the shipped policies copy their ordering first, so the discards land
+    on something the walk is not reading. Against a policy that does not copy,
+    the discard mutates the ordering mid-walk and the next key raises instead
+    of arriving.
+    """
+    cache = Cache(policy=_LiveOrderPolicy(), max_items=2)
+    for key in "abcde":
+        cache.put(key, f"v-{key}")
+
+    shed = []
+    try:
+        for key in cache.evict_candidates():
+            shed.append(key)
+            cache.discard(key)
+    except RuntimeError as exc:
+        raise AssertionError(
+            f"the candidates were handed over as an unfinished walk, so the "
+            f"owner's own discard broke it after {shed}: {exc}"
+        ) from exc
+
+    assert shed == ["a", "b", "c"], (
+        f"three entries over a two-item budget, oldest first, should shed "
+        f"a, b, c; shed {shed}"
+    )
+    assert len(cache) == 2, (
+        f"{len(cache)} entries are left against a two-item budget after "
+        f"discarding every candidate the cache named"
+    )
+
+
 def test_cache_measures_values_with_the_size_estimator():
     """``size_estimator`` must actually be used, not assumed to be ``len``.
 
@@ -494,10 +693,6 @@ def test_cache_measures_values_with_the_size_estimator():
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Cache is a contract stub (issue 1.2)",
-)
 def test_cache_peek_does_not_promote():
     """I6. ``peek`` must read without telling the policy.
 
@@ -532,10 +727,6 @@ def test_cache_peek_does_not_promote():
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Cache is a contract stub (issue 1.2)",
-)
 def test_cache_get_reads_and_records_the_access():
     """``get`` must return the value *and* tell the policy.
 
@@ -570,10 +761,667 @@ def test_cache_get_reads_and_records_the_access():
         cache.get("absent")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Store is a contract stub (issue 1.2)",
+#: How long a lock test waits for a call that should have returned at once.
+#: A liveness bound, never a discriminator: nothing here decides what happened
+#: by how long it took, and a call answering at 4.9s passes like one answering
+#: immediately. It exists only because the failure these tests look for is a
+#: thread that never comes back, which no assertion on that thread can catch.
+WORKER_SECONDS = 5.0
+
+
+def _runs_without_blocking(call, label, diagnosis):
+    """Run ``call`` on a worker thread and fail, rather than hang, if it blocks.
+
+    ``diagnosis`` is what a timeout would mean, and is the whole finding: a
+    hang is the only symptom the caller ever sees, so the message has to say
+    which lock was taken twice and by whom.
+
+    The worker's own exception is re-raised rather than swallowed, because a
+    call that *died* still sets the event -- liveness alone would pass it.
+    """
+    finished = threading.Event()
+    failure = {}
+
+    def run():
+        try:
+            call()
+        except Exception as exc:  # noqa: BLE001 - re-raised below
+            failure["exc"] = exc
+        finally:
+            finished.set()
+
+    threading.Thread(target=run, daemon=True).start()
+    assert finished.wait(WORKER_SECONDS), diagnosis
+    if "exc" in failure:
+        raise AssertionError(
+            f"{label} raised {failure['exc']!r} on a worker thread"
+        ) from failure["exc"]
+
+
+@pytest.fixture
+def manual_collection():
+    """Turn automatic collection off for the test, and back on afterwards.
+
+    Removes scheduling nondeterminism rather than the hazard the cyclic tests
+    probe: with it on, an incidental collection before the probe runs could
+    reap the cycle early and the test would pass without having tested
+    anything. Each of those tests forces the collection it wants instead.
+    """
+    was_enabled = gc.isenabled()
+    gc.disable()
+    yield
+    if was_enabled:
+        gc.enable()
+
+
+def test_store_works_with_a_non_reentrant_lock(storage_dir):
+    """Every operation must acquire the lock exactly once.
+
+    ``lock=`` is part of the ``Store`` surface, and PLAN.md 3.6 lets a caller
+    inject a ``Lock`` protocol that need not be reentrant -- one shared across
+    stores, or an object that is not a ``threading`` lock at all. An
+    implementation whose public methods call each other re-acquires, which a
+    reentrant default hides: ``delete``, ``pop`` and ``count`` each hung
+    indefinitely under ``threading.Lock`` and nothing failed, because a deadlock
+    is not an exception.
+
+    Run on a worker with a bounded wait, since the failure mode is a hang, and
+    the worker's exception is re-raised rather than swallowed -- a call that
+    died still sets the "finished" event, so liveness alone would pass on a
+    broken call.
+
+    One backend, not the matrix: the claim is about ``Store`` acquiring its own
+    lock, which no backend participates in. Across the matrix SQLite would fail
+    here for an unrelated reason -- its connection cannot be used off the thread
+    that opened it (issue 2.3) -- and that noise would say nothing about locking.
+    """
+    backend = PickleBackend(str(storage_dir / "store"))
+    try:
+        store = Store(
+            backend=backend,
+            cache=Cache(policy=RecordingPolicy(), max_items=4),
+            lock=threading.Lock(),
+        )
+        store.set("a", "va")
+        store.set("b", "vb")
+
+        for label, call in (
+            ("contains", lambda: store.contains("a")),
+            ("get", lambda: store.get("a")),
+            ("count", lambda: store.count()),
+            ("iter_keys", lambda: list(store.iter_keys())),
+            ("pop", lambda: store.pop("a", None)),
+            ("delete", lambda: store.delete("b")),
+            ("clear", lambda: store.clear()),
+        ):
+            _runs_without_blocking(
+                call,
+                f"Store.{label}",
+                f"Store.{label} did not return within {WORKER_SECONDS}s under "
+                f"a plain Lock, so it acquires the lock more than once",
+            )
+    finally:
+        backend.destroy()
+
+
+def test_a_store_given_a_lock_to_share_refuses_to_be_pickled(storage_dir):
+    """Dropping a lock on the way out is only right when it was ours to drop.
+
+    A store that made its own lock pickles happily: the copy runs in another
+    process, where the original's lock means nothing, so it gets a fresh one.
+    An injected lock is a different thing -- the caller passed it in *to share*
+    -- and neither answer is safe to pick quietly. A copy with a new lock stops
+    excluding the original while still looking like it excludes it, and a copy
+    somehow keeping the original would be coordinating across a boundary that
+    ``threading`` locks do not cross. So this refuses, loudly, with the two
+    ways out named.
+    """
+    backend = PickleBackend(str(storage_dir / "store"))
+    try:
+        shared = threading.Lock()
+        store = Store(
+            backend=backend,
+            cache=Cache(policy=RecordingPolicy(), max_items=4),
+            lock=shared,
+        )
+
+        with pytest.raises(TypeError) as raised:
+            pickle.dumps(store)
+
+        assert "share" in str(raised.value), (
+            f"the refusal does not explain itself: {raised.value}"
+        )
+
+        # The store that owns its lock is the one that may travel.
+        own = Store(
+            backend=backend,
+            cache=Cache(policy=RecordingPolicy(), max_items=4),
+        )
+        own.set("a", "va")
+        assert pickle.loads(pickle.dumps(own)).get("a") == "va"
+    finally:
+        backend.destroy()
+
+
+def test_a_falsy_size_estimator_is_still_used():
+    """An estimator is a callable, not a truth value.
+
+    ``size_estimator or estimate_size`` reads as "use the default when none was
+    given", but it also replaces any estimator that happens to be falsy -- and
+    a callable object defining ``__len__``, such as one keeping a cache of
+    sizes it has already measured, is falsy for exactly as long as it is empty.
+    That is every call, because it never gets one. The cache then measures with
+    the default and nothing says so.
+    """
+
+    class Measured:
+        """Callable, and falsy until it has measured something."""
+
+        def __init__(self):
+            self.seen = 0
+
+        def __call__(self, value):
+            self.seen += 1
+            return 10
+
+        def __len__(self):
+            return self.seen
+
+    estimator = Measured()
+    cache = Cache(policy=RecordingPolicy(), max_items=10, size_estimator=estimator)
+    cache.put("a", "x")
+
+    assert estimator.seen == 1, (
+        "the cache never called the estimator it was given, so it fell back to "
+        "the default"
+    )
+    assert cache.nbytes() == 10, (
+        f"nbytes() reported {cache.nbytes()} for one value the estimator sizes "
+        f"at ten; sys.getsizeof would give about fifty"
+    )
+
+
+@pytest.mark.parametrize(
+    "bound, expected",
+    [(None, TypeError), ("ten", TypeError), (0, ValueError), (-1, ValueError)],
+    ids=["none", "string", "zero", "negative"],
 )
+def test_a_store_without_a_usable_bound_is_refused(bound, expected, storage_dir):
+    """Declaring ``max_in_memory`` required is not the same as requiring it.
+
+    ``max_in_memory=None`` satisfies the signature -- the parameter was passed
+    -- and reaches ``Cache`` as "no item budget", where nothing is ever over
+    budget, nothing is ever shed, and nothing reaches the backend. Fifty writes
+    leave fifty resident entries and an empty store on disk, which is the one
+    outcome this library exists to prevent, reached by the documented API
+    without a word of complaint.
+    """
+    backend = PickleBackend(str(storage_dir / "store"))
+    try:
+        with pytest.raises(expected) as raised:
+            EffiDict(
+                disk_backend=backend,
+                policy=FIFOPolicy(),
+                max_in_memory=bound,
+            )
+        assert "max_in_memory" in str(raised.value), (
+            f"the refusal does not name the parameter at fault: {raised.value}"
+        )
+    finally:
+        backend.destroy()
+
+
+class _TaggedText(str):
+    """A ``str`` subclass carrying state its holder can change in place.
+
+    Module level so pickle can find it by name, which the backend needs.
+    """
+
+    def __new__(cls, text, tags):
+        value = super().__new__(cls, text)
+        value.tags = list(tags)
+        return value
+
+    def __reduce__(self):
+        return (_TaggedText, (str(self), self.tags))
+
+
+def test_a_subclass_of_an_immutable_type_is_not_treated_as_immutable(storage_dir):
+    """Immutability is a property of the type, not of what it inherits from.
+
+    ``flush`` marks an entry clean only when nothing can change it behind the
+    cache's back, and an ``isinstance`` test gets that wrong for a subclass:
+    ``class Tagged(str)`` with a list attribute satisfies ``isinstance(v, str)``
+    while carrying state its holder can mutate freely. Marked clean, that
+    change is dropped at the next eviction -- the same silent loss the rule
+    exists to prevent, readmitted through the door marked "immutable".
+
+    One backend rather than the matrix: a custom class does not round-trip
+    through JSON or SQLite at all, which is the backends' value domain to
+    answer for (issue #7.2) and says nothing about this rule.
+    """
+    backend = PickleBackend(str(storage_dir / "store"))
+    try:
+        d = EffiDict(disk_backend=backend, policy=FIFOPolicy(), max_in_memory=1)
+        d["k"] = _TaggedText("hello", ["a"])
+        d.flush()
+
+        d["k"].tags.append("b")
+        d.flush()
+
+        assert backend.deserialize("k").tags == ["a", "b"], (
+            "the change to the subclass's own state never reached disk: the "
+            "entry was marked clean because it inherits from str"
+        )
+    finally:
+        backend.destroy()
+
+
+def test_the_facade_forwards_a_size_estimator(storage_dir):
+    """A hook the facade does not forward is not a hook.
+
+    ``Cache`` takes a ``size_estimator`` and the default cannot see past
+    ``sys.getsizeof`` for a container -- it reports the container's own
+    footprint, not its contents'. A caller whose values are sized by something
+    else therefore has to supply one, and they only ever reach ``Cache``
+    through ``EffiDict``.
+
+    The estimator here answers ten for values ``len`` would call one and
+    ``getsizeof`` would call fifty, so neither the default nor a hard-coded
+    rule can satisfy this.
+    """
+    backend = PickleBackend(str(storage_dir / "store"))
+    try:
+        d = EffiDict(
+            disk_backend=backend,
+            policy=FIFOPolicy(),
+            max_in_memory=100,
+            max_bytes=10 ** 6,
+            size_estimator=lambda value: 10,
+        )
+        for index in range(4):
+            d[f"k{index}"] = "x"
+
+        assert d._store.cache.nbytes() == 40, (
+            f"the cache measured {d._store.cache.nbytes()} bytes for four "
+            f"values the estimator sizes at ten each; the facade dropped it"
+        )
+    finally:
+        backend.destroy()
+
+
+#: Distinct from every value a test stores, so "the finalizer got KeyError"
+#: cannot be confused with "the finalizer read ``None``".
+_ABSENT = object()
+
+
+#: Read by :class:`_ReentrantFinalizer`, so the stored value itself holds
+#: nothing but a string and stays picklable -- the eviction case below writes it
+#: to disk. Keyed by tag, and each probe removes its own entry as it fires, so
+#: the copy that unpickling creates cannot set the recording off a second time.
+_FINALIZER_PROBES = {}
+
+
+class _ReentrantFinalizer:
+    """A stored value whose ``__del__`` queries the store that held it."""
+
+    def __init__(self, tag):
+        self.tag = tag
+
+    def __del__(self):
+        probe = _FINALIZER_PROBES.pop(self.tag, None)
+        if probe is not None:
+            probe()
+
+
+@pytest.mark.parametrize(
+    "operation, survives",
+    [
+        ("overwrite", True),
+        ("evict", True),
+        ("delete", False),
+        ("clear", False),
+    ],
+)
+def test_a_finalizer_never_runs_inside_a_tier_operation(
+    operation, survives, storage_dir
+):
+    """Displacing a value must not hand control to it mid-operation.
+
+    CPython runs ``__del__`` the instant the last reference goes, on the thread
+    that dropped it. Every mutating path drops one: an overwrite displaces the
+    old value, an eviction and a delete drop the cached one, ``clear`` drops
+    them all. Each of those drops sits inside the lock, so without care the
+    cache hands a tier operation it has half-applied to arbitrary user code.
+
+    Both halves are asserted, because the two plausible implementations each
+    fail only one. Keeping a plain lock and dropping the value in place
+    **hangs** -- the finalizer's query blocks on a lock its own thread holds --
+    which the bounded wait catches. Making the lock reentrant instead lets the
+    query through into the gap: measured on ``delete``, after the cache had
+    dropped the key and before the backend had, ``get`` returned the disk copy
+    of a key being deleted. So liveness alone is not the property; the
+    finalizer must also find the store whole, which is what ``survives``
+    pins per operation.
+
+    ``pop`` is absent deliberately: it returns the value, so the caller's
+    reference outlives the lock and nothing is dropped inside it.
+
+    One backend and the **default** lock. Default, because that is what a
+    reverted fix would change and what users actually get; injected locks are
+    ``test_store_works_with_a_non_reentrant_lock``'s subject. One backend,
+    for that test's reason -- SQLite's thread affinity (issue 2.3) would fail
+    here while saying nothing about finalizers.
+    """
+    backend = PickleBackend(str(storage_dir / "store"))
+    observed = []
+    tag = f"probe-{operation}"
+    try:
+        store = Store(
+            backend=backend,
+            cache=Cache(
+                policy=RecordingPolicy(),
+                max_items=1 if operation == "evict" else 4,
+            ),
+        )
+
+        def probe():
+            # Whatever the finalizer can see of the store it was dropped from.
+            try:
+                present = store.contains("k")
+            except BaseException as exc:  # noqa: BLE001 - reported below
+                observed.append(("contains-raised", exc))
+                return
+            try:
+                observed.append(("seen", present, store.get("k")))
+            except KeyError:
+                observed.append(("seen", present, _ABSENT))
+
+        _FINALIZER_PROBES[tag] = probe
+        # A disk copy as well as the cached one, so that "the store is whole"
+        # is a real question during a delete: a finalizer let into the gap
+        # reads this value, where one running afterwards gets ``KeyError``.
+        backend.serialize("k", "on-disk")
+        store.set("k", _ReentrantFinalizer(tag))
+
+        actions = {
+            "overwrite": lambda: store.set("k", "replacement"),
+            "evict": lambda: store.set("other", "v"),
+            "delete": lambda: store.delete("k"),
+            "clear": lambda: store.clear(),
+        }
+        _runs_without_blocking(
+            actions[operation],
+            operation,
+            f"{operation} did not return within {WORKER_SECONDS}s: the "
+            f"displaced value's __del__ ran while the lock was held and "
+            f"blocked on it",
+        )
+
+        assert len(observed) == 1, (
+            f"the finalizer ran {len(observed)} times during {operation}; the "
+            f"test proves nothing unless the value was actually dropped"
+        )
+        record = observed[0]
+        assert record[0] == "seen", (
+            f"the finalizer could not query the store during {operation}: "
+            f"{record}"
+        )
+        _, present, value = record
+        assert present is survives, (
+            f"during {operation} the finalizer saw contains('k') == {present}, "
+            f"expected {survives}: it was let into a half-applied operation"
+        )
+        if not survives:
+            assert value is _ABSENT, (
+                f"during {operation} the finalizer read {value!r} for a key "
+                f"being removed, so it ran between the two tiers"
+            )
+    finally:
+        _FINALIZER_PROBES.pop(tag, None)
+        backend.destroy()
+
+
+def _cycle_that_probes(recorded, probe):
+    """Return a self-referential value whose finalizer runs ``probe``.
+
+    Only the collector can free it, so the finalizer fires wherever the next
+    collection lands -- which is the whole point: that may be inside a locked
+    operation. What the probe did is appended to ``recorded``, either as
+    ``("returned", answer)`` or as ``("raised", exception)``.
+    """
+
+    class Cyclic:
+        def __init__(self):
+            self.self_ref = self
+
+        def __del__(self):
+            try:
+                recorded.append(("returned", probe()))
+            except BaseException as exc:  # noqa: BLE001 - inspected by the test
+                recorded.append(("raised", exc))
+
+    return Cyclic()
+
+
+def _assert_reentry_was_refused(recorded, during):
+    """Assert the probe ran once, inside the lock, and was turned away.
+
+    Refusal is what is asserted, not merely survival. A bare ``Lock`` hangs,
+    which the caller's bounded wait catches; a reentrant one serves the
+    finalizer a half-applied operation, and the probe then returns an answer
+    instead of raising. Only the guard raises, so the error *is* the evidence
+    that the finalizer ran inside the lock.
+    """
+    assert len(recorded) == 1, (
+        f"the finalizer ran {len(recorded)} times during {during}; the test "
+        f"proves nothing unless the collector reaped the cycle in there"
+    )
+    kind, detail = recorded[0]
+    assert kind == "raised", (
+        f"the finalizer re-entered during {during} and was served: the probe "
+        f"returned {detail!r} from inside a half-applied operation"
+    )
+    assert isinstance(detail, RuntimeError), (
+        f"re-entry during {during} raised {detail!r}, which says nothing a "
+        f"caller can act on; it should name the re-entry"
+    )
+    assert "re-entered" in str(detail), (
+        f"the re-entry error does not explain itself: {detail}"
+    )
+
+
+class _CollectsOnWrite(PickleBackend):
+    """A backend whose write runs a cyclic collection.
+
+    Stands in for the one thing a test cannot schedule: the collector tripping
+    its threshold partway through a locked operation. Writing allocates, so the
+    real collector may do exactly this at any time -- but *when* is not
+    controllable, and waiting for it does not make a guard. Measured on this
+    tree: 400 store operations under ``gc.set_threshold(1, 1, 1)`` put zero
+    collections inside the critical section, because the surrounding code
+    allocated first every time. Forcing the collection moves the rarity out of
+    the test without changing what is being tested.
+    """
+
+    def serialize(self, key, value):
+        gc.collect()
+        return super().serialize(key, value)
+
+
+def test_a_cyclic_value_cannot_deadlock_the_store(storage_dir, manual_collection):
+    """Re-entry the deferral cannot reach must report itself, not hang.
+
+    The ``released`` lists in ``Store`` hold a displaced value past the unlock,
+    which covers every finalizer that *refcounting* would run. A value in a
+    reference cycle is not one of them: dropping the last reference does not
+    free it, and the collector does, whenever it next runs -- which may be deep
+    inside an unrelated locked operation. No refcount-side strategy reaches
+    that, so the lock refuses same-thread re-entry instead.
+
+    Refusing is what is asserted, not merely surviving. A bare ``Lock`` hangs
+    here, which the bounded wait catches; a reentrant one would let the
+    finalizer through to read a half-applied operation, and then ``contains``
+    returns a bool rather than raising. Only the guard gives ``RuntimeError``,
+    so the error *is* the evidence that the finalizer ran inside the lock.
+
+    """
+    backend = _CollectsOnWrite(str(storage_dir / "store"))
+    recorded = []
+    try:
+        store = Store(
+            backend=backend,
+            cache=Cache(policy=RecordingPolicy(), max_items=1),
+        )
+
+        store.set(
+            "cyclic", _cycle_that_probes(recorded, lambda: store.contains("a"))
+        )
+        store.delete("cyclic")  # unreachable now; the cycle keeps it alive
+
+        def drive():
+            store.set("a", "va")
+            store.set("b", "vb")  # over budget -> serialize -> collect
+
+        _runs_without_blocking(
+            drive,
+            "the write",
+            "a cyclic value's __del__ ran inside the lock and blocked on it: "
+            "the write never returned",
+        )
+
+        _assert_reentry_was_refused(recorded, "the write")
+
+        # The refused call must leave the operation under it alone.
+        assert store.get("b") == "vb", "the write that was re-entered was lost"
+        assert not store.contains("cyclic"), "the deleted key came back"
+    finally:
+        backend.destroy()
+
+
+def test_stores_sharing_one_lock_share_re_entry_detection(
+    storage_dir, manual_collection
+):
+    """One lock means one critical section, so it must mean one answer.
+
+    ``Store`` takes an injected lock precisely so several stores can be held
+    consistent under it. A finalizer collected inside store A's operation and
+    querying store B is then re-entering the *lock*, not the store: B's
+    acquire blocks on a lock the calling thread already holds through A, and
+    the thread waits for itself. Detection has to be a property of the lock
+    rather than of either store, which is why the guard tracks the lock's
+    identity and not its own.
+    """
+    a_backend = _CollectsOnWrite(str(storage_dir / "a"))
+    b_backend = PickleBackend(str(storage_dir / "b"))
+    recorded = []
+    try:
+        lock = threading.Lock()
+        a = Store(
+            backend=a_backend,
+            cache=Cache(policy=RecordingPolicy(), max_items=1),
+            lock=lock,
+        )
+        b = Store(
+            backend=b_backend,
+            cache=Cache(policy=RecordingPolicy(), max_items=4),
+            lock=lock,
+        )
+        b.set("other", "untouched")
+
+        a.set("cyclic", _cycle_that_probes(recorded, lambda: b.contains("other")))
+        a.delete("cyclic")  # unreachable now; the cycle keeps it alive
+
+        def drive():
+            a.set("x", "vx")
+            a.set("y", "vy")  # over budget -> serialize -> collect
+
+        _runs_without_blocking(
+            drive,
+            "the write",
+            "a finalizer collected inside one store's operation queried the "
+            "other store sharing its lock, and blocked on it: the write never "
+            "returned",
+        )
+
+        _assert_reentry_was_refused(recorded, "a store sharing the lock")
+
+        # Neither store may be left disturbed by the call that was refused.
+        assert a.get("y") == "vy", "the write that was re-entered was lost"
+        assert b.get("other") == "untouched", "the queried store was disturbed"
+    finally:
+        a_backend.destroy()
+        b_backend.destroy()
+
+
+class _CollectingLock:
+    """A lock written in Python that collects inside ``acquire`` or ``release``.
+
+    The ``Lock`` protocol of PLAN.md 3.6 lets a caller inject any object with
+    these two methods, and a Python one runs Python in both -- so it allocates,
+    so the collector can trip there, while the underlying lock is already held
+    (inside ``acquire``) or still held (inside ``release``). Those are two
+    windows a guard that claims ownership only *between* the calls does not
+    cover. Collecting on purpose puts a finalizer in the window every time
+    rather than once in a long while; the stdlib locks cannot reach it at all,
+    which is why this takes a lock of its own to show.
+    """
+
+    def __init__(self, collect_in):
+        self._lock = threading.Lock()
+        self._collect_in = collect_in
+
+    def acquire(self, *args):
+        acquired = self._lock.acquire(*args)
+        if self._collect_in == "acquire":
+            gc.collect()
+        return acquired
+
+    def release(self):
+        if self._collect_in == "release":
+            gc.collect()
+        self._lock.release()
+
+
+@pytest.mark.parametrize("collect_in", ["acquire", "release"])
+def test_an_injected_python_lock_cannot_hide_re_entry(
+    collect_in, storage_dir, manual_collection
+):
+    """Ownership has to span the lock calls, not sit between them.
+
+    A finalizer run by a collection inside the injected lock's own ``acquire``
+    or ``release`` arrives while that lock is held, but outside the span a
+    guard would claim if it marked ownership after acquiring and dropped it
+    before releasing. It would then be waved through to block on a lock its
+    own thread holds. Marking before the acquire and clearing after the
+    release closes both ends.
+    """
+    backend = PickleBackend(str(storage_dir / "store"))
+    recorded = []
+    try:
+        store = Store(
+            backend=backend,
+            cache=Cache(policy=RecordingPolicy(), max_items=4),
+            lock=_CollectingLock(collect_in),
+        )
+        store.set(
+            "cyclic", _cycle_that_probes(recorded, lambda: store.contains("x"))
+        )
+        store.delete("cyclic")  # unreachable now; the cycle keeps it alive
+
+        _runs_without_blocking(
+            lambda: store.set("x", "vx"),
+            "the write",
+            f"a finalizer collected inside the lock's own {collect_in}() "
+            f"re-entered the store and blocked: the write never returned",
+        )
+
+        _assert_reentry_was_refused(recorded, f"the lock's {collect_in}()")
+        assert store.get("x") == "vx", "the write that was re-entered was lost"
+    finally:
+        backend.destroy()
+
+
 def test_store_pop_distinguishes_an_omitted_default_from_none(backend_cls, storage_dir):
     """``pop`` must tell ``pop(key)`` from ``pop(key, None)``.
 

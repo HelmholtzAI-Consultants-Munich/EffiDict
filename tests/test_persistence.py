@@ -21,23 +21,21 @@ from pathlib import Path
 
 import pytest
 
-from effidict import EffiDict, LRUReplacement
+from effidict import EffiDict, LRUPolicy
 
 from .conftest import release_store
-from .helpers import build_policy
 
 REPO_ROOT = str(Path(__file__).resolve().parents[1])
 
 KEYS = {f"k{i}": f"v{i}" for i in range(5)}
 
 
-def _build(backend, policy_cls=LRUReplacement, max_in_memory=2):
+def _build(backend, policy_cls=LRUPolicy, max_in_memory=2):
     """Wrap an already-constructed backend in an EffiDict."""
     return EffiDict(
         disk_backend=backend,
-        replacement_strategy=build_policy(
-            policy_cls, disk_backend=backend, max_in_memory=max_in_memory
-        ),
+        policy=policy_cls(),
+        max_in_memory=max_in_memory,
     )
 
 
@@ -204,7 +202,7 @@ def test_unflushed_writes_are_not_lost_on_close(backend_cls, policy_cls, storage
     writer = _build(backend_cls.create(path), policy_cls, max_in_memory=100)
     for key, value in KEYS.items():
         writer[key] = value
-    assert writer.disk_backend.keys() == [], "precondition: nothing spilled yet"
+    assert writer._store.backend.keys() == [], "precondition: nothing spilled yet"
     writer.close()
 
     reader = _build(backend_cls.open(path), policy_cls)
@@ -223,15 +221,13 @@ _WRITER_SCRIPT = textwrap.dedent(
     """
     import sys
     sys.path.insert(0, {repo!r})
-    from effidict import EffiDict, {backend}, LRUReplacement
-    from tests.helpers import build_policy  # see the note in test_concurrency
+    from effidict import EffiDict, {backend}, LRUPolicy
 
     backend = {backend}.create({path!r})
     store = EffiDict(
         disk_backend=backend,
-        replacement_strategy=build_policy(
-            LRUReplacement, disk_backend=backend, max_in_memory=2
-        ),
+        policy=LRUPolicy(),
+        max_in_memory=2,
     )
     for key, value in {keys!r}.items():
         store[key] = value
@@ -329,7 +325,11 @@ def test_temporary_stores_clean_up_after_themselves(backend_cls):
 
 @pytest.mark.xfail(
     strict=True,
-    reason="close() is a contract stub on the backend (issue 3.1)",
+    reason=(
+        "create() is a contract stub (issue 2.1), so this stops there and "
+        "never reaches the close() it is about -- which is a stub of its own "
+        "(issue 3.1), so 2.1 alone will not turn it green"
+    ),
 )
 def test_backend_close_is_idempotent_and_keeps_the_storage(backend_cls, storage_dir):
     """``close()`` must release handles, survive a second call, and keep the data.

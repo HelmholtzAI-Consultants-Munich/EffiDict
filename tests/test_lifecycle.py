@@ -40,7 +40,7 @@ import pytest
 from effidict import EffiDict
 
 from .conftest import DEFAULT_POLICY, release_store
-from .helpers import build_policy, on_disk
+from .helpers import on_disk
 
 
 def _build_unregistered(backend_cls, storage_dir, name="store", **kwargs):
@@ -53,7 +53,8 @@ def _build_unregistered(backend_cls, storage_dir, name="store", **kwargs):
     backend = backend_cls(str(storage_dir / name))
     effidict = EffiDict(
         disk_backend=backend,
-        replacement_strategy=build_policy(DEFAULT_POLICY, disk_backend=backend),
+        policy=DEFAULT_POLICY(),
+        max_in_memory=2,
         **kwargs,
     )
     return effidict, backend.storage_path
@@ -144,8 +145,8 @@ def test_copying_does_not_destroy_the_originals_storage(backend_cls, make_dict):
     test would pass while the data was already gone.
     """
     d = make_dict()
-    d.disk_backend.serialize("on-disk", "v")
-    path = d.disk_backend.storage_path
+    d._store.backend.serialize("on-disk", "v")
+    path = d._store.backend.storage_path
 
     try:
         duplicate = copy.copy(d)
@@ -161,7 +162,11 @@ def test_copying_does_not_destroy_the_originals_storage(backend_cls, make_dict):
 
 @pytest.mark.xfail(
     strict=True,
-    reason="clone() is a contract stub (issue 3.2)",
+    reason=(
+        "flush() is a contract stub (issue 1.4), so this stops there and "
+        "never reaches the clone() it is about -- which is a stub of its own "
+        "(issue 3.2), so 1.4 alone will not turn it green"
+    ),
 )
 def test_clone_produces_independent_store(backend_cls, make_dict, storage_dir):
     """``clone(new_path)`` must produce a store that shares nothing.
@@ -181,11 +186,11 @@ def test_clone_produces_independent_store(backend_cls, make_dict, storage_dir):
     d = make_dict()
     d["shared"] = "original"
     d.flush()
-    origin_path = d.disk_backend.storage_path
+    origin_path = d._store.backend.storage_path
 
     duplicate = d.clone(str(storage_dir / "clone"))
     try:
-        assert duplicate.disk_backend.storage_path != origin_path, (
+        assert duplicate._store.backend.storage_path != origin_path, (
             "the clone is pointed at the original's storage, so it is an alias"
         )
         assert duplicate["shared"] == "original"
@@ -267,13 +272,13 @@ def test_unpickled_instance_does_not_own_storage(backend_cls, make_dict):
     """
     d = make_dict()
     d["k"] = "v"
-    path = d.disk_backend.storage_path
+    path = d._store.backend.storage_path
 
     child = pickle.loads(pickle.dumps(d))
     # Held separately so the store below can still be collected while its
     # backend -- a second live handle on the same storage -- stays reachable
     # for release at the end. Without this the handle survives to process exit.
-    child_backend = child.disk_backend
+    child_backend = child._store.backend
     try:
         assert child["k"] == "v"
 
@@ -358,7 +363,8 @@ def test_temporary_store_is_destroyed_on_close(backend_cls):
     try:
         d = EffiDict(
             disk_backend=backend,
-            replacement_strategy=build_policy(DEFAULT_POLICY, disk_backend=backend),
+            policy=DEFAULT_POLICY(),
+            max_in_memory=2,
         )
         d["k"] = "v"
 
@@ -385,9 +391,9 @@ def test_dirty_entries_are_flushed_on_close(backend_cls, make_dict, backend_spy)
     d = make_dict(max_in_memory=100)
     for i in range(5):
         d[f"k{i}"] = f"v{i}"
-    assert d.disk_backend.keys() == [], "precondition: nothing spilled yet"
+    assert d._store.backend.keys() == [], "precondition: nothing spilled yet"
 
-    with backend_spy(d.disk_backend) as spy:
+    with backend_spy(d._store.backend) as spy:
         d.close()
 
         written = spy.count("serialize") + spy.count("write_many")

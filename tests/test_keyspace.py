@@ -176,7 +176,7 @@ def _with_int_key_on_disk(make_dict, key=1):
     policy into choosing this key.
 
     Provoking it is not viable. LIFO and MRU never evict an early key, and
-    ``RandomReplacement`` picks its victim by coin flip, so any bounded number of
+    ``RandomPolicy`` picks its victim by coin flip, so any bounded number of
     filler writes leaves a nonzero chance the probe never spills. That would turn
     a matrix case into a silent skip, which is worse than not having the test at
     all. Same reasoning, and the same technique, as ``_spill_to_disk`` in the
@@ -187,8 +187,8 @@ def _with_int_key_on_disk(make_dict, key=1):
     """
     store = make_dict(max_in_memory=4)
     store[key] = "one"
-    store.disk_backend.serialize(key, "one")
-    store.replacement_strategy.delete(key)
+    store._store.backend.serialize(key, "one")
+    store._store.cache.discard(key)
     return store
 
 

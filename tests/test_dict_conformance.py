@@ -51,7 +51,7 @@ from hypothesis.stateful import (
     run_state_machine_as_test,
 )
 
-from effidict import LRUReplacement, PickleBackend
+from effidict import LRUPolicy, PickleBackend
 
 from .conftest import BACKENDS, POLICIES, backend_marks, release_store
 from .helpers import assert_equal_value, supported_kinds
@@ -136,7 +136,7 @@ class CoreConformance(RuleBasedStateMachine):
 
     # Bound by _bind() before hypothesis instantiates the class.
     backend_cls = PickleBackend
-    policy_cls = LRUReplacement
+    policy_cls = LRUPolicy
     max_in_memory = 2
     dict_factory = None
 
@@ -365,15 +365,15 @@ MAX_IN_MEMORY = [1, 2, 10, 1000]
 CROSS_SECTION = [
     pytest.param(
         backend,
-        LRUReplacement,
-        id=f"{backend.__name__}-LRUReplacement",
+        LRUPolicy,
+        id=f"{backend.__name__}-LRUPolicy",
         marks=backend_marks(backend),
     )
     for backend in BACKENDS
 ] + [
     pytest.param(PickleBackend, policy, id=f"PickleBackend-{policy.__name__}")
     for policy in POLICIES
-    if policy is not LRUReplacement
+    if policy is not LRUPolicy
 ]
 
 
@@ -454,14 +454,6 @@ def test_clear_conformance_full_matrix(
 # signal here costs nothing, because the pin still flips.
 
 
-@pytest.mark.xfail(
-    strict=False,  # probabilistic; see the note above
-    reason=(
-        "two pop defects (issue 1.2): pop(key) with no default returns None "
-        "instead of raising KeyError, and pop removes only the memory copy so a "
-        "key present in both tiers survives"
-    ),
-)
 @pytest.mark.parametrize("backend_cls, policy_cls", CROSS_SECTION)
 def test_pop_conformance(backend_cls, policy_cls, make_dict):
     _run(PopConformance, backend_cls, policy_cls, 2, make_dict)
@@ -499,14 +491,6 @@ def test_order_conformance(backend_cls, policy_cls, make_dict):
 
 
 @pytest.mark.slow
-@pytest.mark.xfail(
-    strict=False,  # probabilistic; see the note above
-    reason=(
-        "two pop defects (issue 1.2): pop(key) with no default returns None "
-        "instead of raising KeyError, and pop removes only the memory copy so a "
-        "key present in both tiers survives"
-    ),
-)
 def test_pop_conformance_full_matrix(backend_cls, policy_cls, make_dict):
     _run(PopConformance, backend_cls, policy_cls, 2, make_dict)
 
@@ -530,13 +514,6 @@ def test_order_conformance_full_matrix(backend_cls, policy_cls, make_dict):
 
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "pop() is declared pop(key, default=None), so a missing key returns None "
-        "where dict raises KeyError (issue 1.2)"
-    ),
-)
 def test_pop_without_default_raises_keyerror(backend_cls, policy_cls, make_dict):
     """``pop`` with no default must raise ``KeyError``, as ``dict`` does.
 
@@ -572,9 +549,9 @@ def test_pop_without_default_raises_keyerror(backend_cls, policy_cls, make_dict)
 @pytest.mark.slow
 @pytest.mark.parametrize("max_in_memory", MAX_IN_MEMORY)
 def test_core_conformance_deep(max_in_memory, make_dict):
-    _run(CoreConformance, PickleBackend, LRUReplacement, max_in_memory, make_dict, DEEP)
+    _run(CoreConformance, PickleBackend, LRUPolicy, max_in_memory, make_dict, DEEP)
 
 
 @pytest.mark.slow
 def test_clear_conformance_deep(make_dict):
-    _run(ClearConformance, PickleBackend, LRUReplacement, 2, make_dict, DEEP)
+    _run(ClearConformance, PickleBackend, LRUPolicy, 2, make_dict, DEEP)
