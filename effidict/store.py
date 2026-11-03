@@ -21,6 +21,30 @@ class _Missing:
 MISSING = _Missing()
 
 
+#: Types whose values cannot change once stored. The clean tag asserts that
+#: disk holds *this exact value*, and the caller is holding the same object the
+#: cache is -- so for anything outside this set the assertion can be falsified
+#: in place, by the caller, with nothing told about it.
+_IMMUTABLE_TYPES = (str, bytes, int, float, complex, bool, type(None))
+
+
+def _is_immutable(value) -> bool:
+    """Whether ``value`` can be trusted not to change behind the cache's back.
+
+    A container counts only if everything inside it does. A ``tuple`` cannot be
+    reassigned, but it can hold a list, and mutating that list changes what the
+    tuple means just as surely as changing the tuple would.
+
+    Conservative by construction: anything unrecognised is treated as mutable,
+    which costs a rewrite at eviction and never costs the change itself.
+    """
+    if isinstance(value, _IMMUTABLE_TYPES):
+        return True
+    if isinstance(value, (tuple, frozenset)):
+        return all(_is_immutable(item) for item in value)
+    return False
+
+
 #: Which locks this thread is inside, by ``id``. Thread-local, so a guard only
 #: ever reads and writes the set belonging to the thread asking -- there is no
 #: shared state to race over, and no other thread's entry to misread. Keyed by
@@ -174,8 +198,47 @@ class Store:
         # its own -- a finalizer -- correct; it would only let it observe a
         # half-applied operation. How the deferral and the guard divide that
         # work between them is in the class docstring.
+        # Whether the lock is ours to recreate. A caller who injected one did
+        # so to share it; see :meth:`__getstate__`.
+        self._owns_lock = lock is None
         self._lock = _ReentrancyGuard(threading.Lock() if lock is None else lock)
         self._owns_storage = owns_storage
+
+    def __getstate__(self):
+        """Pickle everything except the lock, which does not survive a copy.
+
+        A ``threading.Lock`` cannot be pickled, so without this the whole
+        facade is unpicklable and never reaches a worker process -- joblib
+        fails at dispatch, before any of the storage-ownership behaviour the
+        worker specs are about.
+
+        Dropping it is right rather than merely convenient: a lock excludes
+        threads within one process, and the copy on the other side of a pickle
+        is in another process, where the original's lock means nothing. It gets
+        a fresh one of its own in :meth:`__setstate__`.
+
+        An **injected** lock is refused instead. The caller passed one in order
+        to share it -- across stores, or with code of their own -- and neither
+        answer is safe to pick silently: a copy carrying a new lock stops
+        excluding the original while looking like it still does, and a copy
+        that somehow kept the original would be coordinating across a process
+        boundary that ``threading`` locks do not cross.
+        """
+        if not self._owns_lock:
+            raise TypeError(
+                "this Store was given a lock to share, and a pickled copy "
+                "cannot share it: a copy with a lock of its own would silently "
+                "stop excluding the original. Pickle a store that makes its "
+                "own lock, or hand the worker a path and let it open its own."
+            )
+        state = self.__dict__.copy()
+        del state["_lock"]
+        return state
+
+    def __setstate__(self, state):
+        """Restore the store with a lock of this process's own."""
+        self.__dict__.update(state)
+        self._lock = _ReentrancyGuard(threading.Lock())
 
     @property
     def backend(self):
@@ -401,11 +464,23 @@ class Store:
         Marking clean is what makes the flush worth anything beyond the write:
         those entries can then be evicted without being written again, which is
         the half of I5 that costs nothing.
+
+        Only an immutable value is marked, though. The caller holds the same
+        object the cache does, so for a mutable one the tag can be falsified
+        without anything being told: ``d["k"] = []``, ``flush()``,
+        ``d["k"].append(1)`` leaves the cache holding ``[1]`` under a tag
+        claiming disk has it, and the next eviction drops it unwritten -- the
+        append is gone and the key reads ``[]`` again. Nothing in a write-back
+        cache can observe an in-place change, so "dirty" is the only honest tag
+        for a value the caller can still change. The cost is a rewrite at
+        eviction for those values, which is what *every* eviction did before
+        the tag existed.
         """
         with self._lock:
             for key, value in list(self._cache.dirty_items()):
                 self._backend.serialize(key, value)
-                self._cache.mark_clean(key)
+                if _is_immutable(value):
+                    self._cache.mark_clean(key)
 
     def close(self) -> None:
         """Close store resources without destroying storage.

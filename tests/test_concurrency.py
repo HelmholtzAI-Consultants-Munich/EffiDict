@@ -458,6 +458,36 @@ def test_picklable_backend_table_matches_reality(backend_cls, storage_dir):
 
 
 @over_picklable_backends
+def test_the_facade_survives_a_pickle_round_trip(backend_cls, storage_dir):
+    """A store has to reach a worker before anything about workers is testable.
+
+    ``Store`` holds a lock and a ``threading.Lock`` cannot be pickled, so
+    without hooks the whole facade is unpicklable and joblib fails at dispatch.
+
+    Deliberately unmarked, which is the point of it existing separately. The
+    three worker specs below are all xfail against storage-ownership defects
+    (issue 3.1), and an xfail is satisfied by *any* failure -- so when the lock
+    arrived with issue 1.2 all six of them quietly started failing at
+    ``cannot pickle '_thread.lock'`` instead, and went on reporting green for a
+    defect none of them was reaching any more.
+    """
+    backend = backend_cls(str(storage_dir / "store"))
+    try:
+        d = _build(backend, max_in_memory=4)
+        for key, value in WORKER_KEYS.items():
+            d[key] = value
+
+        revived = pickle.loads(pickle.dumps(d))
+
+        assert dict(revived.items()) == WORKER_KEYS, (
+            f"the revived store does not hold what the original did: "
+            f"{dict(revived.items())}"
+        )
+    finally:
+        release_store(backend)
+
+
+@over_picklable_backends
 @pytest.mark.xfail(
     strict=False,  # depends on when a sibling worker is collected; see below
     reason=(

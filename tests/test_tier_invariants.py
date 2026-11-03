@@ -529,6 +529,43 @@ def test_flush_persists_dirty_entries(backend_cls, policy_cls, make_dict):
 # --------------------------------------------------------------------------
 
 
+def test_mutating_a_value_after_flush_does_not_lose_it(
+    backend_cls, policy_cls, make_dict
+):
+    """I5/I7. Flushing must not promise more about a value than it can keep.
+
+    ``flush`` marks what it wrote clean, and a clean entry is dropped at
+    eviction without being written -- which is correct exactly while "disk has
+    this exact value" stays true. The caller holds the same object the cache
+    does, so for a mutable value that claim can be falsified in place, with
+    nothing told: the change is then dropped at eviction and the key reads back
+    as it was at flush time.
+
+    Asserted against disk after a second flush rather than against a read after
+    an eviction. The loss the caller feels is the eviction, but whether ``k`` is
+    the victim depends on the policy -- LIFO and MRU shed the key just written,
+    so ``k`` survives and the defect cannot show there at all. Going through
+    disk puts the same claim to every policy: what is still dirty gets written,
+    and a clean tag makes the second flush skip the key and leave ``[]`` behind.
+
+    A list is the value here because it round-trips faithfully through all four
+    backends -- it is in neither the unsupported nor the lossy table -- so a
+    failure is about the tag and not about the codec.
+    """
+    d = make_dict(max_in_memory=1)
+    d["k"] = []
+    d.flush()
+
+    d["k"].append(1)
+    d.flush()
+
+    assert d._store.backend.deserialize("k") == [1], (
+        "the in-place change never reached disk: the entry was marked clean by "
+        "the first flush, so the second one passed over it"
+    )
+    assert d["k"] == [1], "the store no longer reads back what it was given"
+
+
 def test_cache_respects_byte_budget(backend_cls, policy_cls, make_dict):
     """I8. The cache is bounded by bytes, not only by item count.
 

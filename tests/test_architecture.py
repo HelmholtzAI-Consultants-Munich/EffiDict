@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import gc
 import inspect
+import pickle
 import threading
 from collections import OrderedDict
 
@@ -859,6 +860,45 @@ def test_store_works_with_a_non_reentrant_lock(storage_dir):
                 f"Store.{label} did not return within {WORKER_SECONDS}s under "
                 f"a plain Lock, so it acquires the lock more than once",
             )
+    finally:
+        backend.destroy()
+
+
+def test_a_store_given_a_lock_to_share_refuses_to_be_pickled(storage_dir):
+    """Dropping a lock on the way out is only right when it was ours to drop.
+
+    A store that made its own lock pickles happily: the copy runs in another
+    process, where the original's lock means nothing, so it gets a fresh one.
+    An injected lock is a different thing -- the caller passed it in *to share*
+    -- and neither answer is safe to pick quietly. A copy with a new lock stops
+    excluding the original while still looking like it excludes it, and a copy
+    somehow keeping the original would be coordinating across a boundary that
+    ``threading`` locks do not cross. So this refuses, loudly, with the two
+    ways out named.
+    """
+    backend = PickleBackend(str(storage_dir / "store"))
+    try:
+        shared = threading.Lock()
+        store = Store(
+            backend=backend,
+            cache=Cache(policy=RecordingPolicy(), max_items=4),
+            lock=shared,
+        )
+
+        with pytest.raises(TypeError) as raised:
+            pickle.dumps(store)
+
+        assert "share" in str(raised.value), (
+            f"the refusal does not explain itself: {raised.value}"
+        )
+
+        # The store that owns its lock is the one that may travel.
+        own = Store(
+            backend=backend,
+            cache=Cache(policy=RecordingPolicy(), max_items=4),
+        )
+        own.set("a", "va")
+        assert pickle.loads(pickle.dumps(own)).get("a") == "va"
     finally:
         backend.destroy()
 
