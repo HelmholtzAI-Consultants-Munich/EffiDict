@@ -903,6 +903,85 @@ def test_a_store_given_a_lock_to_share_refuses_to_be_pickled(storage_dir):
         backend.destroy()
 
 
+class _TaggedText(str):
+    """A ``str`` subclass carrying state its holder can change in place.
+
+    Module level so pickle can find it by name, which the backend needs.
+    """
+
+    def __new__(cls, text, tags):
+        value = super().__new__(cls, text)
+        value.tags = list(tags)
+        return value
+
+    def __reduce__(self):
+        return (_TaggedText, (str(self), self.tags))
+
+
+def test_a_subclass_of_an_immutable_type_is_not_treated_as_immutable(storage_dir):
+    """Immutability is a property of the type, not of what it inherits from.
+
+    ``flush`` marks an entry clean only when nothing can change it behind the
+    cache's back, and an ``isinstance`` test gets that wrong for a subclass:
+    ``class Tagged(str)`` with a list attribute satisfies ``isinstance(v, str)``
+    while carrying state its holder can mutate freely. Marked clean, that
+    change is dropped at the next eviction -- the same silent loss the rule
+    exists to prevent, readmitted through the door marked "immutable".
+
+    One backend rather than the matrix: a custom class does not round-trip
+    through JSON or SQLite at all, which is the backends' value domain to
+    answer for (issue #7.2) and says nothing about this rule.
+    """
+    backend = PickleBackend(str(storage_dir / "store"))
+    try:
+        d = EffiDict(disk_backend=backend, policy=FIFOPolicy(), max_in_memory=1)
+        d["k"] = _TaggedText("hello", ["a"])
+        d.flush()
+
+        d["k"].tags.append("b")
+        d.flush()
+
+        assert backend.deserialize("k").tags == ["a", "b"], (
+            "the change to the subclass's own state never reached disk: the "
+            "entry was marked clean because it inherits from str"
+        )
+    finally:
+        backend.destroy()
+
+
+def test_the_facade_forwards_a_size_estimator(storage_dir):
+    """A hook the facade does not forward is not a hook.
+
+    ``Cache`` takes a ``size_estimator`` and the default cannot see past
+    ``sys.getsizeof`` for a container -- it reports the container's own
+    footprint, not its contents'. A caller whose values are sized by something
+    else therefore has to supply one, and they only ever reach ``Cache``
+    through ``EffiDict``.
+
+    The estimator here answers ten for values ``len`` would call one and
+    ``getsizeof`` would call fifty, so neither the default nor a hard-coded
+    rule can satisfy this.
+    """
+    backend = PickleBackend(str(storage_dir / "store"))
+    try:
+        d = EffiDict(
+            disk_backend=backend,
+            policy=FIFOPolicy(),
+            max_in_memory=100,
+            max_bytes=10 ** 6,
+            size_estimator=lambda value: 10,
+        )
+        for index in range(4):
+            d[f"k{index}"] = "x"
+
+        assert d._store.cache.nbytes() == 40, (
+            f"the cache measured {d._store.cache.nbytes()} bytes for four "
+            f"values the estimator sizes at ten each; the facade dropped it"
+        )
+    finally:
+        backend.destroy()
+
+
 #: Distinct from every value a test stores, so "the finalizer got KeyError"
 #: cannot be confused with "the finalizer read ``None``".
 _ABSENT = object()

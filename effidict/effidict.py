@@ -14,6 +14,7 @@ class EffiDict:
         *,
         max_in_memory: int,
         max_bytes: Optional[int] = None,
+        size_estimator=None,
     ):
         """Create an EffiDict facade over a single ``Store``.
 
@@ -35,10 +36,22 @@ class EffiDict:
         item count is the only bound. Approximate, because the sizes come from
         an estimator over arbitrary Python objects -- ``Cache`` documents what
         that can and cannot account for.
+
+        ``size_estimator`` is that estimator, and passing one is how to size a
+        value the default cannot see. The default reads ``memory_usage`` from
+        pandas objects and ``nbytes`` from buffers, and otherwise falls back to
+        ``sys.getsizeof``, which reports a container's own footprint rather
+        than that of what it holds. It is consulted on every write, so
+        ``nbytes()`` answers whether or not ``max_bytes`` is set.
         """
         self._store = Store(
             backend=disk_backend,
-            cache=Cache(policy=policy, max_items=max_in_memory, max_bytes=max_bytes),
+            cache=Cache(
+                policy=policy,
+                max_items=max_in_memory,
+                max_bytes=max_bytes,
+                size_estimator=size_estimator,
+            ),
         )
 
     def __enter__(self):

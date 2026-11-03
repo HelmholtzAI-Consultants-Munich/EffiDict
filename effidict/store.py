@@ -25,11 +25,18 @@ MISSING = _Missing()
 #: disk holds *this exact value*, and the caller is holding the same object the
 #: cache is -- so for anything outside this set the assertion can be falsified
 #: in place, by the caller, with nothing told about it.
-_IMMUTABLE_TYPES = (str, bytes, int, float, complex, bool, type(None))
+_IMMUTABLE_TYPES = frozenset({str, bytes, int, float, complex, bool, type(None)})
 
 
 def _is_immutable(value) -> bool:
     """Whether ``value`` can be trusted not to change behind the cache's back.
+
+    Exact type, not ``isinstance``. A subclass of an immutable type is not
+    itself immutable: ``class Tagged(str)`` with a list attribute passes any
+    ``isinstance(value, str)`` test while carrying state the holder can change
+    in place, which is the very thing this is here to catch. Subclasses are
+    therefore treated as mutable -- including ``namedtuple``, which costs it
+    the free eviction and costs nothing else.
 
     A container counts only if everything inside it does. A ``tuple`` cannot be
     reassigned, but it can hold a list, and mutating that list changes what the
@@ -38,9 +45,9 @@ def _is_immutable(value) -> bool:
     Conservative by construction: anything unrecognised is treated as mutable,
     which costs a rewrite at eviction and never costs the change itself.
     """
-    if isinstance(value, _IMMUTABLE_TYPES):
+    if type(value) in _IMMUTABLE_TYPES:
         return True
-    if isinstance(value, (tuple, frozenset)):
+    if type(value) in (tuple, frozenset):
         return all(_is_immutable(item) for item in value)
     return False
 
@@ -483,6 +490,13 @@ class Store:
         alternatives again -- copying on put, a mutation-tracking boundary, or
         marking everything clean and documenting the limit. Widening the rule
         without picking one of those brings the silent loss back.
+
+        "Disk holds this value" means as faithfully as the backend can hold it.
+        A lossy codec -- a tuple through JSON, an ``int`` through HDF5 --
+        changes the value on the way out, and does so whether or not the entry
+        is marked clean, because the write happens either way. That is the
+        backends' value domain to fix (issue #7.2), not this tag's to work
+        around.
         """
         with self._lock:
             for key, value in list(self._cache.dirty_items()):
