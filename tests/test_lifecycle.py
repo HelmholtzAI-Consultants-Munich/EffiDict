@@ -343,10 +343,6 @@ def test_context_manager_closes_but_does_not_destroy(backend_cls, storage_dir):
         _remove(path)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="temporary() is a contract stub (issues 2.1, 3.1)",
-)
 def test_temporary_store_is_destroyed_on_close(backend_cls):
     """A scratch store is the one case that *should* clean itself up on close.
 
@@ -357,6 +353,13 @@ def test_temporary_store_is_destroyed_on_close(backend_cls):
     ``storage_dir`` -- under the system temp directory -- where the autouse leak
     detector cannot see it. If close() ever stops destroying, this test would
     otherwise leave files on the machine every run.
+
+    Green since issue 2.1 gave ``temporary()`` a constructor, but green for the
+    wrong reason: ``close()`` still destroys *every* store, so this passes on
+    the defect 3.1 exists to remove rather than on anything opt-in. It is the
+    guard that 3.1 must keep green while making close non-destructive -- if it
+    goes red there, destroy-on-close was taken away from the one caller that
+    wanted it.
     """
     backend = backend_cls.temporary()
     path = backend.storage_path

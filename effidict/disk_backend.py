@@ -1,14 +1,14 @@
 from __future__ import annotations
 
-import time
 from abc import ABC, abstractmethod
 from typing import Dict, Iterator
-import sqlite3  
+import sqlite3
 import json
 import os
 import pickle
 import shutil
-import ast 
+import tempfile
+import ast
 
 try:
     import h5py
@@ -50,9 +50,30 @@ class DiskBackend(ABC):
       immediately.
     """
 
-    def __init__(self, storage_path):
-        self.storage_path = storage_path + f"{int(time.time())}_{id(self)}"
-        
+    #: Whether this backend's storage is a directory holding many files or a
+    #: single file. Only :meth:`temporary` needs to know, to pick between
+    #: ``mkdtemp`` and ``mkstemp``.
+    _STORAGE_IS_DIRECTORY = True
+
+    def __init__(self, storage_path, mode: str = "a"):
+        """Open the store at exactly ``storage_path``.
+
+        The path is used as given. It used to have
+        ``f"{int(time.time())}_{id(self)}"`` appended, which meant the same
+        argument named a different location on every construction -- so nothing
+        written could ever be found again, and "persistent" was not true of this
+        library in any useful sense. ``id()`` made it worse than merely useless:
+        it is only unique among *live* objects and is recycled after collection,
+        so a store built after an earlier one was freed could land on the
+        abandoned store's path and read its values back as its own.
+
+        ``mode`` is for the backends that must distinguish creating from
+        opening at the moment they take the handle -- only HDF5 today. The
+        others answer that question through :meth:`create` and :meth:`open`,
+        which check the path before constructing, and ignore it.
+        """
+        self.storage_path = storage_path
+
     @abstractmethod
     def serialize(self, key, value):
         pass
@@ -130,8 +151,13 @@ class DiskBackend(ABC):
         the facade currently destroys the store (issue 3.1).
 
         Must be idempotent, and must leave the store reopenable via ``open``.
+
+        The default does nothing, which is right for a backend that holds no
+        handle between calls: the file-per-key backends open and close a file
+        per operation, so there is nothing to release and nothing to flush.
+        SQLite and HDF5 override it, because a live connection or file handle is
+        exactly what stops the store being opened again.
         """
-        raise NotImplementedError("see issue #3.1")
 
     def compact(self) -> None:
         """Reclaim unused storage space."""
@@ -139,33 +165,68 @@ class DiskBackend(ABC):
 
     @classmethod
     def create(cls, path, **kwargs):
-        """Create a new backend at ``path``."""
-        raise NotImplementedError("see issue #2.1")
+        """Build a new store at ``path``, refusing to touch an existing one.
+
+        The refusal is the point: ``create`` is how a caller says "there should
+        be nothing here", and silently opening what is already there would hand
+        them someone else's data under the impression it was fresh.
+        """
+        if os.path.exists(path):
+            raise FileExistsError(
+                f"a store already exists at {path!r}; use open() to read it or "
+                f"open_or_create() to accept either"
+            )
+        return cls(path, mode="w-", **kwargs)
 
     @classmethod
-    def open(cls, path, mode: str = "r+", **kwargs):
-        """Open a backend at ``path``.
+    def open(cls, path, **kwargs):
+        """Open the store at ``path``, refusing to create a missing one.
 
-        ``mode`` follows the ``create``/``open``/``open_or_create``
-        distinction. The existing ``__init__`` behavior of deriving a unique
-        path from the clock and ``id(self)`` is a bug fixed in issue #2.1.
+        The mirror of :meth:`create`, and the refusal matters as much: opening
+        a path that holds nothing used to produce an empty store that looked
+        like a successfully reopened one, so a typo in a path read as data loss.
         """
-        raise NotImplementedError("see issue #2.1")
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                f"no store at {path!r}; use create() to make one or "
+                f"open_or_create() to accept either"
+            )
+        return cls(path, mode="r+", **kwargs)
 
     @classmethod
     def open_or_create(cls, path, **kwargs):
-        """Open an existing backend or create one at ``path``."""
-        raise NotImplementedError("see issue #2.1")
+        """Open the store at ``path``, creating it if there is none."""
+        return cls(path, mode="a", **kwargs)
 
     @classmethod
     def temporary(cls, prefix: str = "effidict-"):
-        """Create a scratch backend at a unique path."""
-        raise NotImplementedError("see issue #2.1")
+        """Build a scratch store at a path nothing else will be given.
+
+        Uniqueness comes from ``tempfile``, which is collision-free by
+        construction -- it creates the name it returns, so no second caller can
+        be handed it. That is the replacement for salting the path with
+        ``id(self)``, which only ever approximated this and got it wrong as soon
+        as an object was collected.
+
+        Destroying it is still the caller's to do; ``temporary`` owning its own
+        cleanup is issue #3.1.
+        """
+        if cls._STORAGE_IS_DIRECTORY:
+            return cls(tempfile.mkdtemp(prefix=prefix), mode="a")
+
+        # ``mkstemp`` leaves the file open and existing, so the handle is closed
+        # and the path reused. "w" rather than "a" because what is there is an
+        # empty file rather than a store -- HDF5 refuses to read it as one.
+        handle, temporary_path = tempfile.mkstemp(prefix=prefix)
+        os.close(handle)
+        return cls(temporary_path, mode="w")
 
 
 class SqliteBackend(DiskBackend):
-    def __init__(self, storage_path):
-        super().__init__(storage_path)
+    _STORAGE_IS_DIRECTORY = False
+
+    def __init__(self, storage_path, mode: str = "a"):
+        super().__init__(storage_path, mode)
         self.conn = sqlite3.connect(self.storage_path)
         self.cursor = self.conn.cursor()
         self.cursor.execute(
@@ -204,14 +265,18 @@ class SqliteBackend(DiskBackend):
                 items_to_insert,
             )
 
+    def close(self) -> None:
+        """Close the connection. ``sqlite3`` tolerates a second call."""
+        self.conn.close()
+
     def destroy(self):
         self.conn.close()
         os.remove(self.storage_path)
 
 
 class PickleBackend(DiskBackend):
-    def __init__(self, storage_path):
-        super().__init__(storage_path)
+    def __init__(self, storage_path, mode: str = "a"):
+        super().__init__(storage_path, mode)
         os.makedirs(self.storage_path, exist_ok=True)
 
     def serialize(self, key, value):
@@ -239,11 +304,22 @@ class PickleBackend(DiskBackend):
 
 
 class Hdf5Backend(DiskBackend):
-    def __init__(self, storage_path):
+    _STORAGE_IS_DIRECTORY = False
+
+    def __init__(self, storage_path, mode: str = "a"):
+        """Open the HDF5 file in the mode the caller's intent implies.
+
+        The mode is load-bearing here in a way it is not for the other three.
+        This used to be ``"w"`` unconditionally, which truncates: opening an
+        existing store destroyed it, so the data was lost by the act of looking
+        for it. ``"w-"`` creates and refuses to clobber, ``"r+"`` opens and
+        refuses to create, and ``"a"`` accepts either -- which makes the three
+        classmethods atomic rather than check-then-open.
+        """
         if h5py is None:
             raise ImportError("h5py is required for Hdf5Backend but is not installed.")
-        super().__init__(storage_path)
-        self.file = h5py.File(self.storage_path, "w")
+        super().__init__(storage_path, mode)
+        self.file = h5py.File(self.storage_path, mode)
 
     def serialize(self, key, value):
         """
@@ -296,13 +372,18 @@ class Hdf5Backend(DiskBackend):
     def keys(self):
         return list(self.file.keys())
     
+    def close(self) -> None:
+        """Close the file. ``h5py`` tolerates a second call."""
+        self.file.close()
+
     def destroy(self):
         self.file.close()
-        os.remove(self.storage_path)    
+        os.remove(self.storage_path)
+
 
 class JSONBackend(DiskBackend):
-    def __init__(self, storage_path):
-        super().__init__(storage_path)
+    def __init__(self, storage_path, mode: str = "a"):
+        super().__init__(storage_path, mode)
         os.makedirs(self.storage_path, exist_ok=True)
 
     def _file_path(self, key):

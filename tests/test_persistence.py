@@ -44,13 +44,6 @@ def _build(backend, policy_cls=LRUPolicy, max_in_memory=2):
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "storage_path appends time.time() and id(self), so the same argument "
-        "resolves to a different location every time (issue 2.1)"
-    ),
-)
 def test_storage_path_is_stable_across_instances(backend_cls, storage_dir):
     """The same path argument must always name the same store.
 
@@ -81,13 +74,6 @@ def test_storage_path_is_stable_across_instances(backend_cls, storage_dir):
         release_store(second)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "storage_path embeds id(self), which is only unique among live objects "
-        "and is recycled after GC (issue 2.1)"
-    ),
-)
 def test_id_reuse_cannot_collide(backend_cls, storage_dir):
     """A store's location must not depend on a recyclable process-local address.
 
@@ -123,7 +109,9 @@ def test_id_reuse_cannot_collide(backend_cls, storage_dir):
 @pytest.mark.xfail(
     strict=True,
     reason=(
-        "create()/open() and flush() are contract stubs, and close() destroys the storage rather than persisting it (issues 2.1, 1.4, 3.1)"
+        "close() destroys the storage instead of releasing it, so there is "
+        "nothing left to reopen: open() raises FileNotFoundError at the path "
+        "the writer just used (issue 3.1)"
     ),
 )
 def test_reopen_after_close_returns_all_values(backend_cls, policy_cls, storage_dir):
@@ -149,12 +137,39 @@ def test_reopen_after_close_returns_all_values(backend_cls, policy_cls, storage_
         release_store(reader)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "open() is a contract stub; Hdf5Backend also opens mode='w', which truncates on construction (issue 2.1)"
-    ),
-)
+def test_create_and_open_refuse_the_case_they_are_not_for(backend_cls, storage_dir):
+    """``create`` must not adopt an existing store, ``open`` must not invent one.
+
+    The two refusals are the entire difference between these and
+    ``open_or_create``; without them the three are one method under three
+    names. They are also what turns two silent wrongs into errors: a caller
+    asking for a fresh store would otherwise inherit whatever happened to be at
+    that path, and a typo in a path would read as a store that is merely empty
+    rather than as a mistake.
+    """
+    path = str(storage_dir / "store")
+
+    with pytest.raises(FileNotFoundError):
+        backend_cls.open(path)
+
+    created = backend_cls.create(path)
+    created.serialize("kept", "value")
+    created.close()
+
+    with pytest.raises(FileExistsError):
+        backend_cls.create(path)
+
+    # And refusing was not merely polite: the store it declined to clobber is
+    # still intact.
+    reopened = backend_cls.open(path)
+    try:
+        assert reopened.deserialize("kept") == "value", (
+            "create() refused but damaged the store it refused to replace"
+        )
+    finally:
+        release_store(reopened)
+
+
 def test_open_does_not_truncate_existing_store(backend_cls, storage_dir):
     """Opening an existing store must not empty it.
 
@@ -187,7 +202,10 @@ def test_open_does_not_truncate_existing_store(backend_cls, storage_dir):
 @pytest.mark.xfail(
     strict=True,
     reason=(
-        "create()/open() are contract stubs, nothing flushes on close, and close() destroys the storage (issues 2.1, 1.4, 3.1)"
+        "close() destroys the storage rather than writing the cache out to "
+        "it, so the reopen finds nothing at all -- whether close flushes "
+        "cannot even be observed until close and destroy are separated "
+        "(issue 3.1)"
     ),
 )
 def test_unflushed_writes_are_not_lost_on_close(backend_cls, policy_cls, storage_dir):
@@ -241,7 +259,9 @@ _WRITER_SCRIPT = textwrap.dedent(
 @pytest.mark.xfail(
     strict=True,
     reason=(
-        "create()/open() are contract stubs, so the writer subprocess cannot build a store at a known path (issue 2.1)"
+        "the writer subprocess calls close(), which destroys the store it "
+        "has just written, so this process finds nothing at the path "
+        "(issue 3.1)"
     ),
 )
 def test_data_survives_process_restart(backend_cls, storage_dir):
@@ -279,12 +299,6 @@ def test_data_survives_process_restart(backend_cls, storage_dir):
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "temporary() is a contract stub (issue 2.1)"
-    ),
-)
 def test_temporary_stores_are_unique(backend_cls):
     """``temporary()`` must hand out a fresh location every call.
 
@@ -301,10 +315,6 @@ def test_temporary_stores_are_unique(backend_cls):
             release_store(backend)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="temporary() is a contract stub (issue 2.1)",
-)
 def test_temporary_stores_clean_up_after_themselves(backend_cls):
     """Releasing a temporary store must leave nothing on disk.
 
@@ -323,14 +333,6 @@ def test_temporary_stores_clean_up_after_themselves(backend_cls):
     assert not os.path.exists(path), f"temporary store left behind: {path}"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "create() is a contract stub (issue 2.1), so this stops there and "
-        "never reaches the close() it is about -- which is a stub of its own "
-        "(issue 3.1), so 2.1 alone will not turn it green"
-    ),
-)
 def test_backend_close_is_idempotent_and_keeps_the_storage(backend_cls, storage_dir):
     """``close()`` must release handles, survive a second call, and keep the data.
 
@@ -360,15 +362,6 @@ def test_backend_close_is_idempotent_and_keeps_the_storage(backend_cls, storage_
         release_store(reopened)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "open_or_create() is a contract stub (issue 2.1). It also closes the "
-        "first handle before reopening, so it stays red until close() lands too "
-        "(issue 3.1) -- deliberately, because holding both handles open would "
-        "demand that every backend permit concurrent opens on one path"
-    ),
-)
 def test_open_or_create_creates_then_reopens_without_truncating(
     backend_cls, storage_dir
 ):
