@@ -14,6 +14,7 @@ backend property.
 from __future__ import annotations
 
 import os
+import sqlite3
 import subprocess
 import tempfile
 import sys
@@ -22,7 +23,7 @@ from pathlib import Path
 
 import pytest
 
-from effidict import EffiDict, LRUPolicy
+from effidict import EffiDict, LRUPolicy, SqliteBackend
 
 from .conftest import release_store
 
@@ -237,6 +238,118 @@ def test_create_and_open_refuse_the_case_they_are_not_for(backend_cls, storage_d
         )
     finally:
         release_store(reopened)
+
+
+# What ``open`` raises when the path is occupied by the wrong kind of thing.
+# Stated per backend rather than as "some error", because the point of the fix
+# is that the caller is told what actually went wrong: the two directory
+# backends raise it themselves, while SQLite and HDF5 pass their library's own
+# failure through untouched.
+_OBSTRUCTED_PATH_RAISES = {
+    "PickleBackend": NotADirectoryError,
+    "JSONBackend": NotADirectoryError,
+    "SqliteBackend": sqlite3.OperationalError,
+    "Hdf5Backend": OSError,
+}
+
+
+def test_open_preserves_a_failure_that_is_not_absence(backend_cls, storage_dir):
+    """Only a missing path may be reported as a missing store.
+
+    Every backend had to decide what a failed open meant, and three of them
+    answered "nothing is there" for any failure at all. SQLite could not do
+    better from the error alone -- measured both ways, a database that is not
+    there and one it will not open give the same ``SQLITE_CANTOPEN`` and the
+    same "unable to open database file" -- and the directory backends simply
+    asked ``isdir`` and read False as absence.
+
+    The cost was the same in both: an existing store that could not be opened
+    was reported as no store at all, and the caller who believed it and ran
+    ``create`` was then told a store already existed there. Two refusals
+    contradicting each other over one path, with whatever was there still in
+    place. So the path decides, and only a path with nothing at it is absence.
+
+    Obstructed with the wrong kind of thing rather than with permissions,
+    which makes the spec deterministic for any user -- ``chmod`` does not stop
+    root. HDF5 is here to hold a line it already held; it gated its own
+    translation on the path from the start.
+    """
+    path = storage_dir / "store"
+
+    # The half that must still translate: there is genuinely nothing there.
+    with pytest.raises(FileNotFoundError):
+        backend_cls.open(str(path))
+
+    # And the half that must not.
+    if backend_cls._STORAGE_IS_DIRECTORY:
+        path.write_text("not a store")
+        remove = path.unlink
+    else:
+        path.mkdir()
+        remove = path.rmdir
+    try:
+        with pytest.raises(_OBSTRUCTED_PATH_RAISES[backend_cls.__name__]) as caught:
+            backend_cls.open(str(path))
+        # ``OSError`` is broad enough to admit the very error being ruled out,
+        # so absence is excluded by name as well as by type.
+        assert not isinstance(caught.value, FileNotFoundError), (
+            "an obstructed path was reported as a missing store"
+        )
+        assert "no store at" not in str(caught.value), (
+            "an obstructed path was reported as a missing store"
+        )
+    finally:
+        remove()
+
+
+def test_create_does_not_claim_a_store_where_there_is_none(backend_cls, storage_dir):
+    """``create`` may only refuse for the reason it gives.
+
+    The mirror of the ``open`` case, and it closed the same loop from the other
+    end: every backend answered an occupied path with "a store already exists
+    here; use open() to read it", whatever was occupying it, because the call
+    that refuses -- ``makedirs``, ``O_EXCL``, ``h5py`` -- reports an occupied
+    path without saying what by. So a caller with a stray file in the way was
+    told to open a store that was not there, and ``open`` then told them it was
+    not a store. Neither message was true and neither call could succeed.
+
+    What the path holds is one ``isdir`` away, so that is what decides. The
+    one guess left is deliberate: for the file-backed backends a *file* at the
+    path is still reported as an existing store, because telling a database
+    from any other file means opening it, and ``create`` refusing to clobber
+    is the safe reading either way.
+    """
+    path = storage_dir / "store"
+    obstruction_raises = (
+        NotADirectoryError if backend_cls._STORAGE_IS_DIRECTORY
+        else IsADirectoryError
+    )
+
+    # The wrong kind of thing at the path: refused, but not as a store.
+    if backend_cls._STORAGE_IS_DIRECTORY:
+        path.write_text("not a store")
+        remove = path.unlink
+    else:
+        path.mkdir()
+        remove = path.rmdir
+    try:
+        with pytest.raises(obstruction_raises) as caught:
+            backend_cls.create(str(path))
+        assert "already exists" not in str(caught.value), (
+            "an obstructed path was reported as an existing store"
+        )
+    finally:
+        remove()
+
+    # And a real store at the path: still refused, and still as a store --
+    # naming the obstruction must not have swallowed the refusal it replaced.
+    created = backend_cls.create(str(path))
+    try:
+        created.close()
+        with pytest.raises(FileExistsError):
+            backend_cls.create(str(path))
+    finally:
+        release_store(created)
 
 
 def test_open_does_not_truncate_existing_store(backend_cls, storage_dir):

@@ -19,6 +19,13 @@ def _no_store_at(path) -> str:
     )
 
 
+def _obstructed_at(path) -> str:
+    return (
+        f"{path!r} exists but is not a store; move it aside or choose "
+        f"another path"
+    )
+
+
 def _store_already_at(path) -> str:
     return (
         f"a store already exists at {path!r}; use open() to read it or "
@@ -107,9 +114,22 @@ class DiskBackend(ABC):
             try:
                 os.makedirs(self.storage_path)
             except FileExistsError as exc:
+                # ``makedirs`` refuses an occupied path without saying what is
+                # occupying it, and a store here is a directory. Anything else
+                # is an obstruction, not a store to be preserved.
+                if not os.path.isdir(self.storage_path):
+                    raise NotADirectoryError(
+                        _obstructed_at(self.storage_path)
+                    ) from exc
                 raise FileExistsError(_store_already_at(self.storage_path)) from exc
         elif mode == "r+":
             if not os.path.isdir(self.storage_path):
+                # Something being at the path means that whatever is wrong, it
+                # is not absence. Calling it absence sent the caller to
+                # create(), which then refused the very same path as already
+                # occupied -- two refusals contradicting each other.
+                if os.path.exists(self.storage_path):
+                    raise NotADirectoryError(_obstructed_at(self.storage_path))
                 raise FileNotFoundError(_no_store_at(self.storage_path))
         else:
             os.makedirs(self.storage_path, exist_ok=True)
@@ -289,6 +309,14 @@ class SqliteBackend(DiskBackend):
                     self.storage_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY
                 )
             except FileExistsError as exc:
+                # ``O_EXCL`` refuses a directory for existing too. A file here
+                # may or may not be a database -- that cannot be known without
+                # opening it, and claiming a store is the useful guess -- but a
+                # directory certainly is not one.
+                if os.path.isdir(self.storage_path):
+                    raise IsADirectoryError(
+                        _obstructed_at(self.storage_path)
+                    ) from exc
                 raise FileExistsError(_store_already_at(self.storage_path)) from exc
             os.close(handle)
             self.conn = sqlite3.connect(self.storage_path)
@@ -301,6 +329,14 @@ class SqliteBackend(DiskBackend):
             try:
                 self.conn = sqlite3.connect(uri, uri=True)
             except sqlite3.OperationalError as exc:
+                # SQLite reports a missing database and one it refuses to open
+                # with the same SQLITE_CANTOPEN and the same message, so the
+                # path is the only thing that says which happened. Every other
+                # connection failure -- an unreadable file, a directory in the
+                # way -- keeps its own error instead of being reported as a
+                # store that is not there.
+                if os.path.exists(self.storage_path):
+                    raise
                 raise FileNotFoundError(_no_store_at(self.storage_path)) from exc
         else:
             self.conn = sqlite3.connect(self.storage_path)
@@ -402,6 +438,10 @@ class Hdf5Backend(DiskBackend):
             # four backends are distinguishable by behaviour rather than by
             # which exception type the caller has to be ready for.
             if mode == "w-" and os.path.exists(self.storage_path):
+                if os.path.isdir(self.storage_path):
+                    raise IsADirectoryError(
+                        _obstructed_at(self.storage_path)
+                    ) from exc
                 raise FileExistsError(_store_already_at(self.storage_path)) from exc
             if mode == "r+" and not os.path.exists(self.storage_path):
                 raise FileNotFoundError(_no_store_at(self.storage_path)) from exc
