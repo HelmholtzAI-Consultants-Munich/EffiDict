@@ -14,7 +14,9 @@ backend property.
 from __future__ import annotations
 
 import os
+import shutil
 import sqlite3
+import stat
 import subprocess
 import tempfile
 import sys
@@ -300,6 +302,53 @@ def test_open_preserves_a_failure_that_is_not_absence(backend_cls, storage_dir):
         )
     finally:
         remove()
+
+
+# ``chmod`` only denies this process on POSIX, and it never denies root. Where
+# it does not bite, the path stays inspectable and the spec would assert
+# nothing, so it says so rather than passing vacuously.
+_PERMISSIONS_BITE = os.name == "posix" and os.geteuid() != 0
+
+
+@pytest.mark.skipif(
+    not _PERMISSIONS_BITE,
+    reason="needs POSIX permissions that stop this process: not Windows, not root",
+)
+def test_open_does_not_read_an_unreachable_store_as_a_missing_one(
+    backend_cls, storage_dir
+):
+    """A path that cannot be inspected is not a path with nothing at it.
+
+    Two rounds hardened what the refusals say and left the predicate behind
+    them lying: ``os.path.exists`` and ``os.path.isdir`` answer False when they
+    are not allowed to look, so an intact store under an unsearchable parent
+    read exactly like no store at all. All four backends then reported a store
+    that was merely out of reach as one that was not there -- the same false
+    "your data is not here" the earlier fixes existed to remove, reached
+    through the one input those fixes never questioned.
+
+    ``os.stat`` is the version that distinguishes them, so absence now means a
+    confirmed ``FileNotFoundError`` and nothing else. Asserted against a store
+    with a key really in it, so a pass cannot come from there being nothing to
+    find.
+    """
+    parent = storage_dir / "locked"
+    parent.mkdir()
+    path = parent / "store"
+
+    created = backend_cls.create(str(path))
+    created.serialize("kept", "value")
+    created.close()
+
+    parent.chmod(0)
+    try:
+        # Not merely "an error": ``PermissionError`` and ``FileNotFoundError``
+        # are siblings, so naming one rules the other out.
+        with pytest.raises(PermissionError):
+            backend_cls.open(str(path))
+    finally:
+        parent.chmod(stat.S_IRWXU)
+        shutil.rmtree(parent)
 
 
 def test_create_does_not_claim_a_store_where_there_is_none(backend_cls, storage_dir):

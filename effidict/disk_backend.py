@@ -7,6 +7,7 @@ import json
 import os
 import pickle
 import shutil
+import stat
 import tempfile
 import urllib.parse
 import ast
@@ -17,6 +18,35 @@ def _no_store_at(path) -> str:
         f"no store at {path!r}; use create() to make one or "
         f"open_or_create() to accept either"
     )
+
+
+def _exists(path) -> bool:
+    """Whether anything is at ``path``, with "cannot tell" kept distinct.
+
+    ``os.path.exists`` and ``os.path.isdir`` answer False for a path they were
+    not allowed to inspect, which makes an intact store under an unsearchable
+    parent directory indistinguishable from no store at all -- and the
+    difference is the whole point of the refusals these predicates drive.
+    ``os.stat`` keeps them apart: only ``FileNotFoundError`` is absence, and
+    every other failure is left to reach the caller as itself.
+    """
+    return _stat(path) is not None
+
+
+def _is_directory(path) -> bool:
+    """``os.path.isdir`` with the same distinction. See :func:`_exists`."""
+    info = _stat(path)
+    return info is not None and stat.S_ISDIR(info.st_mode)
+
+
+def _stat(path):
+    try:
+        return os.stat(path)
+    except FileNotFoundError:
+        # The only answer that means "nothing is here". ``NotADirectoryError``
+        # from a file partway along the path is left to propagate too: nothing
+        # can be at that path, but saying so is more use than "no store".
+        return None
 
 
 def _obstructed_at(path) -> str:
@@ -117,18 +147,18 @@ class DiskBackend(ABC):
                 # ``makedirs`` refuses an occupied path without saying what is
                 # occupying it, and a store here is a directory. Anything else
                 # is an obstruction, not a store to be preserved.
-                if not os.path.isdir(self.storage_path):
+                if not _is_directory(self.storage_path):
                     raise NotADirectoryError(
                         _obstructed_at(self.storage_path)
                     ) from exc
                 raise FileExistsError(_store_already_at(self.storage_path)) from exc
         elif mode == "r+":
-            if not os.path.isdir(self.storage_path):
+            if not _is_directory(self.storage_path):
                 # Something being at the path means that whatever is wrong, it
                 # is not absence. Calling it absence sent the caller to
                 # create(), which then refused the very same path as already
                 # occupied -- two refusals contradicting each other.
-                if os.path.exists(self.storage_path):
+                if _exists(self.storage_path):
                     raise NotADirectoryError(_obstructed_at(self.storage_path))
                 raise FileNotFoundError(_no_store_at(self.storage_path))
         else:
@@ -313,7 +343,7 @@ class SqliteBackend(DiskBackend):
                 # may or may not be a database -- that cannot be known without
                 # opening it, and claiming a store is the useful guess -- but a
                 # directory certainly is not one.
-                if os.path.isdir(self.storage_path):
+                if _is_directory(self.storage_path):
                     raise IsADirectoryError(
                         _obstructed_at(self.storage_path)
                     ) from exc
@@ -335,7 +365,7 @@ class SqliteBackend(DiskBackend):
                 # connection failure -- an unreadable file, a directory in the
                 # way -- keeps its own error instead of being reported as a
                 # store that is not there.
-                if os.path.exists(self.storage_path):
+                if _exists(self.storage_path):
                     raise
                 raise FileNotFoundError(_no_store_at(self.storage_path)) from exc
         else:
@@ -437,13 +467,13 @@ class Hdf5Backend(DiskBackend):
             # h5py reports both refusals as a bare OSError. Translated so the
             # four backends are distinguishable by behaviour rather than by
             # which exception type the caller has to be ready for.
-            if mode == "w-" and os.path.exists(self.storage_path):
-                if os.path.isdir(self.storage_path):
+            if mode == "w-" and _exists(self.storage_path):
+                if _is_directory(self.storage_path):
                     raise IsADirectoryError(
                         _obstructed_at(self.storage_path)
                     ) from exc
                 raise FileExistsError(_store_already_at(self.storage_path)) from exc
-            if mode == "r+" and not os.path.exists(self.storage_path):
+            if mode == "r+" and not _exists(self.storage_path):
                 raise FileNotFoundError(_no_store_at(self.storage_path)) from exc
             raise
 
