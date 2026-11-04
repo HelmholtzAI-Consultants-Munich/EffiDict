@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import tempfile
 import sys
 import textwrap
 from pathlib import Path
@@ -135,6 +136,74 @@ def test_reopen_after_close_returns_all_values(backend_cls, policy_cls, storage_
         assert set(reader.keys()) == set(KEYS)
     finally:
         release_store(reader)
+
+
+def test_the_mode_alone_decides_create_from_open(backend_cls, storage_dir):
+    """The refusals live in the operation, not in a check before it.
+
+    ``create`` and ``open`` differ only by the mode they hand the constructor,
+    so the mode has to be what enforces them. It was not: three of the four
+    backends ignored it and leaned on the classmethod checking the path first,
+    and the construction then contradicted the check -- ``sqlite3.connect`` and
+    ``makedirs`` both create what is missing. Measured by making the path
+    vanish between the two steps: every non-HDF5 backend answered ``open`` on a
+    missing path with an empty store and no error, which is the failure
+    ``open`` exists to prevent, reported as success.
+
+    Asserted through the constructor rather than by racing two callers, so it
+    is deterministic: the mode either refuses or it does not.
+    """
+    path = str(storage_dir / "store")
+
+    with pytest.raises(FileNotFoundError):
+        backend_cls(path, mode="r+")
+    assert not os.path.exists(path), (
+        "opening a missing store created it instead of refusing"
+    )
+
+    created = backend_cls(path, mode="w-")
+    try:
+        created.close()
+
+        with pytest.raises(FileExistsError):
+            backend_cls(path, mode="w-")
+    finally:
+        release_store(created)
+
+
+def test_temporary_removes_the_path_it_allocated_when_construction_fails(
+    backend_cls, tmp_path, monkeypatch
+):
+    """A constructor that raises leaves nothing to clean up with.
+
+    ``temporary()`` asks ``tempfile`` for a path -- which creates it -- and only
+    then builds the backend. When that construction raises, the caller gets an
+    exception and no object, so the path is one nothing else will ever know:
+    ``Hdf5Backend`` raises before it owns anything when h5py is missing. It
+    would accumulate under the system temp directory, where conftest's leak
+    detector cannot see it because that only watches the suite's own storage.
+
+    ``tempfile`` is pointed at this test's own directory so the allocation is
+    observable at all, and the failure is injected rather than relying on h5py
+    being absent -- which would make this spec test nothing on a machine that
+    has it.
+    """
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+
+    class ConstructionFails(backend_cls):
+        def __init__(self, storage_path, mode: str = "a"):
+            raise RuntimeError("construction failed")
+
+    # Against a snapshot, not against emptiness: the leak detector's own
+    # storage directory lives under ``tmp_path`` too, and whether it has been
+    # created yet depends on fixture order.
+    before = {entry.name for entry in tmp_path.iterdir()}
+
+    with pytest.raises(RuntimeError):
+        ConstructionFails.temporary()
+
+    left = {entry.name for entry in tmp_path.iterdir()} - before
+    assert not left, f"temporary() left its allocated path behind: {sorted(left)}"
 
 
 def test_create_and_open_refuse_the_case_they_are_not_for(backend_cls, storage_dir):

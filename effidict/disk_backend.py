@@ -8,7 +8,22 @@ import os
 import pickle
 import shutil
 import tempfile
+import urllib.parse
 import ast
+
+
+def _no_store_at(path) -> str:
+    return (
+        f"no store at {path!r}; use create() to make one or "
+        f"open_or_create() to accept either"
+    )
+
+
+def _store_already_at(path) -> str:
+    return (
+        f"a store already exists at {path!r}; use open() to read it or "
+        f"open_or_create() to accept either"
+    )
 
 try:
     import h5py
@@ -73,6 +88,31 @@ class DiskBackend(ABC):
         which check the path before constructing, and ignore it.
         """
         self.storage_path = storage_path
+
+    def _open_directory(self, mode: str) -> None:
+        """Make or open the storage directory, honouring ``mode``.
+
+        Shared by the two file-per-key backends. The mode is enforced by the
+        call that makes the directory rather than by a check before it.
+        ``makedirs`` without ``exist_ok`` either creates the directory or
+        raises, with nothing in between, so two callers racing to ``create``
+        the same path cannot both believe they won.
+
+        ``r+`` not creating is the half that matters even with no race at all:
+        a check followed by an unconditional ``makedirs`` produces exactly the
+        empty store ``open`` exists to refuse, and reports it as a successful
+        reopen.
+        """
+        if mode == "w-":
+            try:
+                os.makedirs(self.storage_path)
+            except FileExistsError as exc:
+                raise FileExistsError(_store_already_at(self.storage_path)) from exc
+        elif mode == "r+":
+            if not os.path.isdir(self.storage_path):
+                raise FileNotFoundError(_no_store_at(self.storage_path))
+        else:
+            os.makedirs(self.storage_path, exist_ok=True)
 
     @abstractmethod
     def serialize(self, key, value):
@@ -170,12 +210,13 @@ class DiskBackend(ABC):
         The refusal is the point: ``create`` is how a caller says "there should
         be nothing here", and silently opening what is already there would hand
         them someone else's data under the impression it was fresh.
+
+        Enforced by the operation that makes the storage, not by a check before
+        it. A check-then-create can be beaten between its two steps, and on the
+        backends whose construction creates unconditionally it was never a
+        guarantee at all -- whatever the check decided, the constructor went
+        ahead and made the store.
         """
-        if os.path.exists(path):
-            raise FileExistsError(
-                f"a store already exists at {path!r}; use open() to read it or "
-                f"open_or_create() to accept either"
-            )
         return cls(path, mode="w-", **kwargs)
 
     @classmethod
@@ -186,11 +227,6 @@ class DiskBackend(ABC):
         a path that holds nothing used to produce an empty store that looked
         like a successfully reopened one, so a typo in a path read as data loss.
         """
-        if not os.path.exists(path):
-            raise FileNotFoundError(
-                f"no store at {path!r}; use create() to make one or "
-                f"open_or_create() to accept either"
-            )
         return cls(path, mode="r+", **kwargs)
 
     @classmethod
@@ -212,22 +248,62 @@ class DiskBackend(ABC):
         cleanup is issue #3.1.
         """
         if cls._STORAGE_IS_DIRECTORY:
-            return cls(tempfile.mkdtemp(prefix=prefix), mode="a")
+            temporary_path = tempfile.mkdtemp(prefix=prefix)
+            discard = shutil.rmtree
+        else:
+            # ``mkstemp`` leaves the file open and existing, so the handle is
+            # closed and the path reused. "w" rather than "a" because what is
+            # there is an empty file rather than a store -- HDF5 refuses to
+            # read it as one.
+            handle, temporary_path = tempfile.mkstemp(prefix=prefix)
+            os.close(handle)
+            discard = os.remove
 
-        # ``mkstemp`` leaves the file open and existing, so the handle is closed
-        # and the path reused. "w" rather than "a" because what is there is an
-        # empty file rather than a store -- HDF5 refuses to read it as one.
-        handle, temporary_path = tempfile.mkstemp(prefix=prefix)
-        os.close(handle)
-        return cls(temporary_path, mode="w")
+        try:
+            return cls(temporary_path, mode="w")
+        except BaseException:
+            # ``tempfile`` has already made the path, and a constructor that
+            # raised leaves no object through which to reach it -- an
+            # ``Hdf5Backend`` without h5py installed raises before it owns
+            # anything. Nobody else will ever know this path, so the file would
+            # sit in the system temp directory until the machine was cleaned.
+            discard(temporary_path)
+            raise
 
 
 class SqliteBackend(DiskBackend):
     _STORAGE_IS_DIRECTORY = False
 
     def __init__(self, storage_path, mode: str = "a"):
+        """Connect, letting the connection itself enforce ``mode``.
+
+        ``sqlite3.connect`` on a plain path creates the database when it is
+        missing, so neither refusal can be left to it. ``O_EXCL`` gives the
+        create half atomically, and the ``mode=rw`` URI gives the open half --
+        it opens an existing database and fails rather than making one.
+        """
         super().__init__(storage_path, mode)
-        self.conn = sqlite3.connect(self.storage_path)
+        if mode == "w-":
+            try:
+                handle = os.open(
+                    self.storage_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY
+                )
+            except FileExistsError as exc:
+                raise FileExistsError(_store_already_at(self.storage_path)) from exc
+            os.close(handle)
+            self.conn = sqlite3.connect(self.storage_path)
+        elif mode == "r+":
+            uri = (
+                "file:"
+                + urllib.parse.quote(os.path.abspath(self.storage_path))
+                + "?mode=rw"
+            )
+            try:
+                self.conn = sqlite3.connect(uri, uri=True)
+            except sqlite3.OperationalError as exc:
+                raise FileNotFoundError(_no_store_at(self.storage_path)) from exc
+        else:
+            self.conn = sqlite3.connect(self.storage_path)
         self.cursor = self.conn.cursor()
         self.cursor.execute(
             "CREATE TABLE IF NOT EXISTS data (key TEXT PRIMARY KEY, value TEXT)"
@@ -277,7 +353,7 @@ class SqliteBackend(DiskBackend):
 class PickleBackend(DiskBackend):
     def __init__(self, storage_path, mode: str = "a"):
         super().__init__(storage_path, mode)
-        os.makedirs(self.storage_path, exist_ok=True)
+        self._open_directory(mode)
 
     def serialize(self, key, value):
         with open(os.path.join(self.storage_path, key), "wb") as f:
@@ -319,7 +395,17 @@ class Hdf5Backend(DiskBackend):
         if h5py is None:
             raise ImportError("h5py is required for Hdf5Backend but is not installed.")
         super().__init__(storage_path, mode)
-        self.file = h5py.File(self.storage_path, mode)
+        try:
+            self.file = h5py.File(self.storage_path, mode)
+        except OSError as exc:
+            # h5py reports both refusals as a bare OSError. Translated so the
+            # four backends are distinguishable by behaviour rather than by
+            # which exception type the caller has to be ready for.
+            if mode == "w-" and os.path.exists(self.storage_path):
+                raise FileExistsError(_store_already_at(self.storage_path)) from exc
+            if mode == "r+" and not os.path.exists(self.storage_path):
+                raise FileNotFoundError(_no_store_at(self.storage_path)) from exc
+            raise
 
     def serialize(self, key, value):
         """
@@ -384,7 +470,7 @@ class Hdf5Backend(DiskBackend):
 class JSONBackend(DiskBackend):
     def __init__(self, storage_path, mode: str = "a"):
         super().__init__(storage_path, mode)
-        os.makedirs(self.storage_path, exist_ok=True)
+        self._open_directory(mode)
 
     def _file_path(self, key):
         return os.path.join(self.storage_path, f"{key}.json")
