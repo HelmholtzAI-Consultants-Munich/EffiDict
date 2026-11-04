@@ -27,16 +27,38 @@ def _exists(path) -> bool:
     not allowed to inspect, which makes an intact store under an unsearchable
     parent directory indistinguishable from no store at all -- and the
     difference is the whole point of the refusals these predicates drive.
-    ``os.stat`` keeps them apart: only ``FileNotFoundError`` is absence, and
-    every other failure is left to reach the caller as itself.
+    Only ``FileNotFoundError`` is absence; every other failure is left to reach
+    the caller as itself.
+
+    ``lstat``, because a symlink pointing at nothing is still something at the
+    path: ``stat`` follows it and reports the missing target, so a dangling
+    link read as an empty path while every call that tries to use it fails
+    with the path already taken.
     """
-    return _stat(path) is not None
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return False
+    return True
 
 
 def _is_directory(path) -> bool:
-    """``os.path.isdir`` with the same distinction. See :func:`_exists`."""
+    """``os.path.isdir`` with the same distinction. See :func:`_exists`.
+
+    Follows symlinks, unlike :func:`_exists`: a link to a real store directory
+    names that store and must open as one.
+    """
     info = _stat(path)
     return info is not None and stat.S_ISDIR(info.st_mode)
+
+
+def _is_regular_file(path) -> bool:
+    """Whether ``path`` is a plain file -- the only thing a single-file store
+    can be. A directory, a dangling symlink, a fifo or a socket occupies the
+    path without being a store that was ever written there.
+    """
+    info = _stat(path)
+    return info is not None and stat.S_ISREG(info.st_mode)
 
 
 def _stat(path):
@@ -119,10 +141,13 @@ class DiskBackend(ABC):
         so a store built after an earlier one was freed could land on the
         abandoned store's path and read its values back as its own.
 
-        ``mode`` is for the backends that must distinguish creating from
-        opening at the moment they take the handle -- only HDF5 today. The
-        others answer that question through :meth:`create` and :meth:`open`,
-        which check the path before constructing, and ignore it.
+        ``mode`` is the whole of the create/open distinction, and every
+        backend honours it: ``"w-"`` creates and refuses an occupied path,
+        ``"r+"`` opens and refuses a missing one, ``"a"`` accepts either.
+        :meth:`create`, :meth:`open` and :meth:`open_or_create` do nothing but
+        pick one -- they must not check the path first, because a check and
+        the operation that follows it can disagree, and the operation wins. A
+        subclass that ignores ``mode`` silently loses both refusals.
         """
         self.storage_path = storage_path
 
@@ -347,6 +372,11 @@ class SqliteBackend(DiskBackend):
                     raise IsADirectoryError(
                         _obstructed_at(self.storage_path)
                     ) from exc
+                if not _is_regular_file(self.storage_path):
+                    # A dangling symlink is the case that matters: the path is
+                    # taken, so the create refused, but nothing is there to be
+                    # the store this would otherwise claim to have found.
+                    raise FileExistsError(_obstructed_at(self.storage_path)) from exc
                 raise FileExistsError(_store_already_at(self.storage_path)) from exc
             os.close(handle)
             self.conn = sqlite3.connect(self.storage_path)
@@ -467,13 +497,22 @@ class Hdf5Backend(DiskBackend):
             # h5py reports both refusals as a bare OSError. Translated so the
             # four backends are distinguishable by behaviour rather than by
             # which exception type the caller has to be ready for.
-            if mode == "w-" and _exists(self.storage_path):
+            occupied = _exists(self.storage_path)
+            if occupied and not _is_regular_file(self.storage_path):
+                # A directory, or a symlink pointing at nothing: the path is
+                # taken, but not by anything this backend could have written.
+                # True whichever mode asked -- create cannot have the path and
+                # open cannot read it -- and h5py's own answer for a dangling
+                # link is ENOENT, which would report an occupied path as an
+                # empty one.
                 if _is_directory(self.storage_path):
                     raise IsADirectoryError(
                         _obstructed_at(self.storage_path)
                     ) from exc
+                raise FileExistsError(_obstructed_at(self.storage_path)) from exc
+            if mode == "w-" and occupied:
                 raise FileExistsError(_store_already_at(self.storage_path)) from exc
-            if mode == "r+" and not _exists(self.storage_path):
+            if mode == "r+" and not occupied:
                 raise FileNotFoundError(_no_store_at(self.storage_path)) from exc
             raise
 

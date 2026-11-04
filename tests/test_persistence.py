@@ -251,7 +251,7 @@ _OBSTRUCTED_PATH_RAISES = {
     "PickleBackend": NotADirectoryError,
     "JSONBackend": NotADirectoryError,
     "SqliteBackend": sqlite3.OperationalError,
-    "Hdf5Backend": OSError,
+    "Hdf5Backend": IsADirectoryError,
 }
 
 
@@ -349,6 +349,72 @@ def test_open_does_not_read_an_unreachable_store_as_a_missing_one(
     finally:
         parent.chmod(stat.S_IRWXU)
         shutil.rmtree(parent)
+
+
+@pytest.mark.skipif(
+    os.name != "posix", reason="symlinks need privilege on Windows"
+)
+def test_a_dangling_symlink_is_an_obstruction_not_an_empty_path(
+    backend_cls, storage_dir
+):
+    """A link pointing at nothing is still something at the path.
+
+    ``os.stat`` follows a symlink and reports on its target, so a dangling one
+    reads as an empty path to every predicate built on it -- while every call
+    that tries to *use* the path fails with it already taken. That split
+    produced the same contradiction twice over: ``open`` answered "no store
+    here", ``create`` answered "a store already exists here", and neither was
+    true of a link to nothing.
+
+    ``os.lstat`` is what sees the link rather than its target. Both calls are
+    asserted together because the bug was precisely that they disagreed.
+    """
+    path = storage_dir / "store"
+    path.symlink_to(storage_dir / "nothing-here")
+    try:
+        for call in (backend_cls.open, backend_cls.create):
+            # Not ``OSError``: SQLite answers with its own ``OperationalError``,
+            # which is not one. What the error is matters less here than what
+            # it must not be, and the two assertions below say that.
+            with pytest.raises(Exception) as caught:
+                call(str(path))
+            assert not isinstance(caught.value, FileNotFoundError), (
+                f"{call.__name__}() reported an occupied path as an empty one"
+            )
+            assert "already exists" not in str(caught.value), (
+                f"{call.__name__}() reported a broken link as an existing store"
+            )
+    finally:
+        path.unlink()
+
+
+@pytest.mark.skipif(
+    os.name != "posix", reason="symlinks need privilege on Windows"
+)
+def test_a_symlink_to_a_store_opens_that_store(backend_cls, storage_dir):
+    """Only a *broken* link is an obstruction.
+
+    The guard on the fix above: ``lstat`` stops following links, so the risk
+    is refusing the ones worth following. A link to a real store names that
+    store, and the predicate that decides whether a path holds one still
+    resolves it.
+    """
+    real = storage_dir / "real"
+    created = backend_cls.create(str(real))
+    created.serialize("kept", "value")
+    created.close()
+
+    link = storage_dir / "link"
+    link.symlink_to(real)
+    try:
+        through_link = backend_cls.open(str(link))
+        try:
+            assert through_link.deserialize("kept") == "value"
+        finally:
+            through_link.close()
+    finally:
+        link.unlink()
+        release_store(created)
 
 
 def test_create_does_not_claim_a_store_where_there_is_none(backend_cls, storage_dir):
