@@ -14,14 +14,18 @@ backend property.
 from __future__ import annotations
 
 import os
+import shutil
+import sqlite3
+import stat
 import subprocess
+import tempfile
 import sys
 import textwrap
 from pathlib import Path
 
 import pytest
 
-from effidict import EffiDict, LRUPolicy
+from effidict import EffiDict, LRUPolicy, SqliteBackend
 
 from .conftest import release_store
 
@@ -44,13 +48,6 @@ def _build(backend, policy_cls=LRUPolicy, max_in_memory=2):
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "storage_path appends time.time() and id(self), so the same argument "
-        "resolves to a different location every time (issue 2.1)"
-    ),
-)
 def test_storage_path_is_stable_across_instances(backend_cls, storage_dir):
     """The same path argument must always name the same store.
 
@@ -81,13 +78,6 @@ def test_storage_path_is_stable_across_instances(backend_cls, storage_dir):
         release_store(second)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "storage_path embeds id(self), which is only unique among live objects "
-        "and is recycled after GC (issue 2.1)"
-    ),
-)
 def test_id_reuse_cannot_collide(backend_cls, storage_dir):
     """A store's location must not depend on a recyclable process-local address.
 
@@ -123,7 +113,9 @@ def test_id_reuse_cannot_collide(backend_cls, storage_dir):
 @pytest.mark.xfail(
     strict=True,
     reason=(
-        "create()/open() and flush() are contract stubs, and close() destroys the storage rather than persisting it (issues 2.1, 1.4, 3.1)"
+        "close() destroys the storage instead of releasing it, so there is "
+        "nothing left to reopen: open() raises FileNotFoundError at the path "
+        "the writer just used (issue 3.1)"
     ),
 )
 def test_reopen_after_close_returns_all_values(backend_cls, policy_cls, storage_dir):
@@ -149,12 +141,332 @@ def test_reopen_after_close_returns_all_values(backend_cls, policy_cls, storage_
         release_store(reader)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "open() is a contract stub; Hdf5Backend also opens mode='w', which truncates on construction (issue 2.1)"
-    ),
+def test_the_mode_alone_decides_create_from_open(backend_cls, storage_dir):
+    """The refusals live in the operation, not in a check before it.
+
+    ``create`` and ``open`` differ only by the mode they hand the constructor,
+    so the mode has to be what enforces them. It was not: three of the four
+    backends ignored it and leaned on the classmethod checking the path first,
+    and the construction then contradicted the check -- ``sqlite3.connect`` and
+    ``makedirs`` both create what is missing. Measured by making the path
+    vanish between the two steps: every non-HDF5 backend answered ``open`` on a
+    missing path with an empty store and no error, which is the failure
+    ``open`` exists to prevent, reported as success.
+
+    Asserted through the constructor rather than by racing two callers, so it
+    is deterministic: the mode either refuses or it does not.
+    """
+    path = str(storage_dir / "store")
+
+    with pytest.raises(FileNotFoundError):
+        backend_cls(path, mode="r+")
+    assert not os.path.exists(path), (
+        "opening a missing store created it instead of refusing"
+    )
+
+    created = backend_cls(path, mode="w-")
+    try:
+        created.close()
+
+        with pytest.raises(FileExistsError):
+            backend_cls(path, mode="w-")
+    finally:
+        release_store(created)
+
+
+def test_temporary_removes_the_path_it_allocated_when_construction_fails(
+    backend_cls, tmp_path, monkeypatch
+):
+    """A constructor that raises leaves nothing to clean up with.
+
+    ``temporary()`` asks ``tempfile`` for a path -- which creates it -- and only
+    then builds the backend. When that construction raises, the caller gets an
+    exception and no object, so the path is one nothing else will ever know:
+    ``Hdf5Backend`` raises before it owns anything when h5py is missing. It
+    would accumulate under the system temp directory, where conftest's leak
+    detector cannot see it because that only watches the suite's own storage.
+
+    ``tempfile`` is pointed at this test's own directory so the allocation is
+    observable at all, and the failure is injected rather than relying on h5py
+    being absent -- which would make this spec test nothing on a machine that
+    has it.
+    """
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+
+    class ConstructionFails(backend_cls):
+        def __init__(self, storage_path, mode: str = "a"):
+            raise RuntimeError("construction failed")
+
+    # Against a snapshot, not against emptiness: the leak detector's own
+    # storage directory lives under ``tmp_path`` too, and whether it has been
+    # created yet depends on fixture order.
+    before = {entry.name for entry in tmp_path.iterdir()}
+
+    with pytest.raises(RuntimeError):
+        ConstructionFails.temporary()
+
+    left = {entry.name for entry in tmp_path.iterdir()} - before
+    assert not left, f"temporary() left its allocated path behind: {sorted(left)}"
+
+
+def test_create_and_open_refuse_the_case_they_are_not_for(backend_cls, storage_dir):
+    """``create`` must not adopt an existing store, ``open`` must not invent one.
+
+    The two refusals are the entire difference between these and
+    ``open_or_create``; without them the three are one method under three
+    names. They are also what turns two silent wrongs into errors: a caller
+    asking for a fresh store would otherwise inherit whatever happened to be at
+    that path, and a typo in a path would read as a store that is merely empty
+    rather than as a mistake.
+    """
+    path = str(storage_dir / "store")
+
+    with pytest.raises(FileNotFoundError):
+        backend_cls.open(path)
+
+    created = backend_cls.create(path)
+    created.serialize("kept", "value")
+    created.close()
+
+    with pytest.raises(FileExistsError):
+        backend_cls.create(path)
+
+    # And refusing was not merely polite: the store it declined to clobber is
+    # still intact.
+    reopened = backend_cls.open(path)
+    try:
+        assert reopened.deserialize("kept") == "value", (
+            "create() refused but damaged the store it refused to replace"
+        )
+    finally:
+        release_store(reopened)
+
+
+# What ``open`` raises when the path is occupied by the wrong kind of thing.
+# Stated per backend rather than as "some error", because the point of the fix
+# is that the caller is told what actually went wrong: the two directory
+# backends raise it themselves, while SQLite and HDF5 pass their library's own
+# failure through untouched.
+_OBSTRUCTED_PATH_RAISES = {
+    "PickleBackend": NotADirectoryError,
+    "JSONBackend": NotADirectoryError,
+    "SqliteBackend": sqlite3.OperationalError,
+    "Hdf5Backend": IsADirectoryError,
+}
+
+
+def test_open_preserves_a_failure_that_is_not_absence(backend_cls, storage_dir):
+    """Only a missing path may be reported as a missing store.
+
+    Every backend had to decide what a failed open meant, and three of them
+    answered "nothing is there" for any failure at all. SQLite could not do
+    better from the error alone -- measured both ways, a database that is not
+    there and one it will not open give the same ``SQLITE_CANTOPEN`` and the
+    same "unable to open database file" -- and the directory backends simply
+    asked ``isdir`` and read False as absence.
+
+    The cost was the same in both: an existing store that could not be opened
+    was reported as no store at all, and the caller who believed it and ran
+    ``create`` was then told a store already existed there. Two refusals
+    contradicting each other over one path, with whatever was there still in
+    place. So the path decides, and only a path with nothing at it is absence.
+
+    Obstructed with the wrong kind of thing rather than with permissions,
+    which makes the spec deterministic for any user -- ``chmod`` does not stop
+    root. HDF5 is here to hold a line it already held; it gated its own
+    translation on the path from the start.
+    """
+    path = storage_dir / "store"
+
+    # The half that must still translate: there is genuinely nothing there.
+    with pytest.raises(FileNotFoundError):
+        backend_cls.open(str(path))
+
+    # And the half that must not.
+    if backend_cls._STORAGE_IS_DIRECTORY:
+        path.write_text("not a store")
+        remove = path.unlink
+    else:
+        path.mkdir()
+        remove = path.rmdir
+    try:
+        with pytest.raises(_OBSTRUCTED_PATH_RAISES[backend_cls.__name__]) as caught:
+            backend_cls.open(str(path))
+        # ``OSError`` is broad enough to admit the very error being ruled out,
+        # so absence is excluded by name as well as by type.
+        assert not isinstance(caught.value, FileNotFoundError), (
+            "an obstructed path was reported as a missing store"
+        )
+        assert "no store at" not in str(caught.value), (
+            "an obstructed path was reported as a missing store"
+        )
+    finally:
+        remove()
+
+
+# ``chmod`` only denies this process on POSIX, and it never denies root. Where
+# it does not bite, the path stays inspectable and the spec would assert
+# nothing, so it says so rather than passing vacuously.
+_PERMISSIONS_BITE = os.name == "posix" and os.geteuid() != 0
+
+
+@pytest.mark.skipif(
+    not _PERMISSIONS_BITE,
+    reason="needs POSIX permissions that stop this process: not Windows, not root",
 )
+def test_open_does_not_read_an_unreachable_store_as_a_missing_one(
+    backend_cls, storage_dir
+):
+    """A path that cannot be inspected is not a path with nothing at it.
+
+    Two rounds hardened what the refusals say and left the predicate behind
+    them lying: ``os.path.exists`` and ``os.path.isdir`` answer False when they
+    are not allowed to look, so an intact store under an unsearchable parent
+    read exactly like no store at all. All four backends then reported a store
+    that was merely out of reach as one that was not there -- the same false
+    "your data is not here" the earlier fixes existed to remove, reached
+    through the one input those fixes never questioned.
+
+    ``os.stat`` is the version that distinguishes them, so absence now means a
+    confirmed ``FileNotFoundError`` and nothing else. Asserted against a store
+    with a key really in it, so a pass cannot come from there being nothing to
+    find.
+    """
+    parent = storage_dir / "locked"
+    parent.mkdir()
+    path = parent / "store"
+
+    created = backend_cls.create(str(path))
+    created.serialize("kept", "value")
+    created.close()
+
+    parent.chmod(0)
+    try:
+        # Not merely "an error": ``PermissionError`` and ``FileNotFoundError``
+        # are siblings, so naming one rules the other out.
+        with pytest.raises(PermissionError):
+            backend_cls.open(str(path))
+    finally:
+        parent.chmod(stat.S_IRWXU)
+        shutil.rmtree(parent)
+
+
+@pytest.mark.skipif(
+    os.name != "posix", reason="symlinks need privilege on Windows"
+)
+def test_a_dangling_symlink_is_an_obstruction_not_an_empty_path(
+    backend_cls, storage_dir
+):
+    """A link pointing at nothing is still something at the path.
+
+    ``os.stat`` follows a symlink and reports on its target, so a dangling one
+    reads as an empty path to every predicate built on it -- while every call
+    that tries to *use* the path fails with it already taken. That split
+    produced the same contradiction twice over: ``open`` answered "no store
+    here", ``create`` answered "a store already exists here", and neither was
+    true of a link to nothing.
+
+    ``os.lstat`` is what sees the link rather than its target. Both calls are
+    asserted together because the bug was precisely that they disagreed.
+    """
+    path = storage_dir / "store"
+    path.symlink_to(storage_dir / "nothing-here")
+    try:
+        for call in (backend_cls.open, backend_cls.create):
+            # Not ``OSError``: SQLite answers with its own ``OperationalError``,
+            # which is not one. What the error is matters less here than what
+            # it must not be, and the two assertions below say that.
+            with pytest.raises(Exception) as caught:
+                call(str(path))
+            assert not isinstance(caught.value, FileNotFoundError), (
+                f"{call.__name__}() reported an occupied path as an empty one"
+            )
+            assert "already exists" not in str(caught.value), (
+                f"{call.__name__}() reported a broken link as an existing store"
+            )
+    finally:
+        path.unlink()
+
+
+@pytest.mark.skipif(
+    os.name != "posix", reason="symlinks need privilege on Windows"
+)
+def test_a_symlink_to_a_store_opens_that_store(backend_cls, storage_dir):
+    """Only a *broken* link is an obstruction.
+
+    The guard on the fix above: ``lstat`` stops following links, so the risk
+    is refusing the ones worth following. A link to a real store names that
+    store, and the predicate that decides whether a path holds one still
+    resolves it.
+    """
+    real = storage_dir / "real"
+    created = backend_cls.create(str(real))
+    created.serialize("kept", "value")
+    created.close()
+
+    link = storage_dir / "link"
+    link.symlink_to(real)
+    try:
+        through_link = backend_cls.open(str(link))
+        try:
+            assert through_link.deserialize("kept") == "value"
+        finally:
+            through_link.close()
+    finally:
+        link.unlink()
+        release_store(created)
+
+
+def test_create_does_not_claim_a_store_where_there_is_none(backend_cls, storage_dir):
+    """``create`` may only refuse for the reason it gives.
+
+    The mirror of the ``open`` case, and it closed the same loop from the other
+    end: every backend answered an occupied path with "a store already exists
+    here; use open() to read it", whatever was occupying it, because the call
+    that refuses -- ``makedirs``, ``O_EXCL``, ``h5py`` -- reports an occupied
+    path without saying what by. So a caller with a stray file in the way was
+    told to open a store that was not there, and ``open`` then told them it was
+    not a store. Neither message was true and neither call could succeed.
+
+    What the path holds is one ``isdir`` away, so that is what decides. The
+    one guess left is deliberate: for the file-backed backends a *file* at the
+    path is still reported as an existing store, because telling a database
+    from any other file means opening it, and ``create`` refusing to clobber
+    is the safe reading either way.
+    """
+    path = storage_dir / "store"
+    obstruction_raises = (
+        NotADirectoryError if backend_cls._STORAGE_IS_DIRECTORY
+        else IsADirectoryError
+    )
+
+    # The wrong kind of thing at the path: refused, but not as a store.
+    if backend_cls._STORAGE_IS_DIRECTORY:
+        path.write_text("not a store")
+        remove = path.unlink
+    else:
+        path.mkdir()
+        remove = path.rmdir
+    try:
+        with pytest.raises(obstruction_raises) as caught:
+            backend_cls.create(str(path))
+        assert "already exists" not in str(caught.value), (
+            "an obstructed path was reported as an existing store"
+        )
+    finally:
+        remove()
+
+    # And a real store at the path: still refused, and still as a store --
+    # naming the obstruction must not have swallowed the refusal it replaced.
+    created = backend_cls.create(str(path))
+    try:
+        created.close()
+        with pytest.raises(FileExistsError):
+            backend_cls.create(str(path))
+    finally:
+        release_store(created)
+
+
 def test_open_does_not_truncate_existing_store(backend_cls, storage_dir):
     """Opening an existing store must not empty it.
 
@@ -187,7 +499,10 @@ def test_open_does_not_truncate_existing_store(backend_cls, storage_dir):
 @pytest.mark.xfail(
     strict=True,
     reason=(
-        "create()/open() are contract stubs, nothing flushes on close, and close() destroys the storage (issues 2.1, 1.4, 3.1)"
+        "close() destroys the storage rather than writing the cache out to "
+        "it, so the reopen finds nothing at all -- whether close flushes "
+        "cannot even be observed until close and destroy are separated "
+        "(issue 3.1)"
     ),
 )
 def test_unflushed_writes_are_not_lost_on_close(backend_cls, policy_cls, storage_dir):
@@ -241,7 +556,9 @@ _WRITER_SCRIPT = textwrap.dedent(
 @pytest.mark.xfail(
     strict=True,
     reason=(
-        "create()/open() are contract stubs, so the writer subprocess cannot build a store at a known path (issue 2.1)"
+        "the writer subprocess calls close(), which destroys the store it "
+        "has just written, so this process finds nothing at the path "
+        "(issue 3.1)"
     ),
 )
 def test_data_survives_process_restart(backend_cls, storage_dir):
@@ -279,12 +596,6 @@ def test_data_survives_process_restart(backend_cls, storage_dir):
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "temporary() is a contract stub (issue 2.1)"
-    ),
-)
 def test_temporary_stores_are_unique(backend_cls):
     """``temporary()`` must hand out a fresh location every call.
 
@@ -301,10 +612,6 @@ def test_temporary_stores_are_unique(backend_cls):
             release_store(backend)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="temporary() is a contract stub (issue 2.1)",
-)
 def test_temporary_stores_clean_up_after_themselves(backend_cls):
     """Releasing a temporary store must leave nothing on disk.
 
@@ -323,14 +630,6 @@ def test_temporary_stores_clean_up_after_themselves(backend_cls):
     assert not os.path.exists(path), f"temporary store left behind: {path}"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "create() is a contract stub (issue 2.1), so this stops there and "
-        "never reaches the close() it is about -- which is a stub of its own "
-        "(issue 3.1), so 2.1 alone will not turn it green"
-    ),
-)
 def test_backend_close_is_idempotent_and_keeps_the_storage(backend_cls, storage_dir):
     """``close()`` must release handles, survive a second call, and keep the data.
 
@@ -360,15 +659,6 @@ def test_backend_close_is_idempotent_and_keeps_the_storage(backend_cls, storage_
         release_store(reopened)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "open_or_create() is a contract stub (issue 2.1). It also closes the "
-        "first handle before reopening, so it stays red until close() lands too "
-        "(issue 3.1) -- deliberately, because holding both handles open would "
-        "demand that every backend permit concurrent opens on one path"
-    ),
-)
 def test_open_or_create_creates_then_reopens_without_truncating(
     backend_cls, storage_dir
 ):
