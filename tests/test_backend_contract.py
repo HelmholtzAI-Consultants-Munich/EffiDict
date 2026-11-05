@@ -14,6 +14,9 @@ into an ndarray, and SQLite/JSON return a tuple as a list.
 
 from __future__ import annotations
 
+import os
+import shutil
+import stat
 from unittest import mock
 
 import pytest
@@ -539,6 +542,119 @@ def test_has_does_not_answer_for_anything_outside_the_store(backend, storage_dir
         # test with a second, unrelated error.
         outsider.unlink(missing_ok=True)
         outsider_json.unlink(missing_ok=True)
+
+
+#: Keys no backend can store, each refused by a different layer: ``os.stat``
+#: raises ``ValueError`` for the NUL and ``ENAMETOOLONG`` for the long name,
+#: while the surrogate is a ``UnicodeEncodeError`` from the filesystem, h5py and
+#: the SQLite driver alike. The two non-strings are there because a driver that
+#: cannot bind the type refuses later than one that cannot encode it.
+UNNAMEABLE_KEYS = {
+    "nul": "a\x00b",
+    "surrogate": "a\ud800b",
+    "overlong": "x" * 300,
+    "tuple": (1, 2),
+    "object": object(),
+}
+
+
+@pytest.mark.parametrize("label", sorted(UNNAMEABLE_KEYS))
+def test_has_says_no_to_a_key_the_backend_cannot_name(backend, label):
+    """``has`` must answer, not raise, for a key that could never be stored.
+
+    Regression. Issue 2.2 replaced the key listing with a point lookup, and the
+    lookup hands the key to a layer that has an opinion about it: ``os.stat``
+    refuses an embedded NUL and a name past the length limit, h5py and the
+    SQLite driver refuse a lone surrogate, and the driver refuses a type it
+    cannot bind. Each came back as an exception from ``k in d``, where the
+    listing had simply answered ``False`` -- it compared in Python and never
+    asked anyone.
+
+    Asserted as one table rather than one spec per shape because they are one
+    defect: a backend that cannot express the key cannot be holding it, so the
+    answer is no. Whether such a key should be *refused* on the way in, with an
+    error that says why, is issue 7.1's.
+    """
+    key = UNNAMEABLE_KEYS[label]
+    backend.serialize("inside", "v")
+
+    assert key not in backend.keys(), (
+        f"precondition: {label} is not a key this store holds"
+    )
+    assert backend.has(key) is False, (
+        f"has() did not answer False for a {label} key"
+    )
+
+
+#: See ``test_persistence._PERMISSIONS_BITE``: root ignores the mode bits and
+#: Windows does not have them, and in either case the path stays inspectable,
+#: so the spec below would assert nothing rather than fail.
+_PERMISSIONS_BITE = os.name == "posix" and os.geteuid() != 0
+
+
+@pytest.mark.skipif(
+    not _PERMISSIONS_BITE,
+    reason="needs POSIX permissions that stop this process: not Windows, not root",
+)
+def test_has_does_not_report_an_uninspectable_key_as_absent(
+    backend_cls, storage_dir
+):
+    """"I could not look" must not come back as "it is not there".
+
+    The companion to ``test_has_says_no_to_a_key_the_backend_cannot_name``,
+    and the line between them is the whole point. A name the filesystem cannot
+    hold is a definite no. A key under a directory this process may not search
+    is not an answer at all, and reporting it as absence is what issue 2.1's
+    fifth finding was about -- ``os.path.exists`` returning ``False`` for a
+    store it was not allowed to inspect.
+
+    Only the backends that look the key up on the filesystem can be asked
+    this. SQLite and HDF5 hold an open handle to a file they opened before the
+    mode changed, so the lookup never goes back to the directory.
+    """
+    if not backend_cls._STORAGE_IS_DIRECTORY:
+        pytest.skip("membership does not reach the filesystem for this backend")
+
+    parent = storage_dir / "locked"
+    parent.mkdir()
+    backend = backend_cls(str(parent / "store"))
+    backend.serialize("present", "v")
+
+    parent.chmod(0)
+    try:
+        with pytest.raises(PermissionError):
+            backend.has("present")
+    finally:
+        parent.chmod(stat.S_IRWXU)
+        shutil.rmtree(parent)
+
+
+def test_has_agrees_with_keys_about_a_key_stored_as_null(backend):
+    """Whatever ``serialize(None, ...)`` leaves behind, ``has`` must find it.
+
+    Regression, and SQLite is where it bit: ``key`` is a ``TEXT PRIMARY KEY``
+    column, which in SQLite accepts ``NULL``, so ``keys()`` reports ``[None]``
+    -- while ``key = ?`` with ``None`` evaluates to UNKNOWN and matches
+    nothing. A spilled ``None`` key was invisible to ``Store.contains`` and
+    dropped from ``Store.count``.
+
+    Agreement with ``keys()`` rather than a literal expectation, because the
+    backends disagree about what a ``None`` key even is and all of those
+    answers are legitimate here: SQLite stores a NULL, JSON coerces it to the
+    name ``"None"``, and the other two refuse it outright. What is not
+    legitimate is ``keys()`` and ``has`` disagreeing about the result.
+
+    Refusing the key with an actionable error is issue 7.1's.
+    """
+    try:
+        backend.serialize(None, "stored under a null key")
+    except Exception:  # noqa: BLE001 - refusing the key is a legitimate answer
+        return
+
+    assert backend.has(None) is (None in backend.keys()), (
+        f"has(None) said {backend.has(None)} while keys() reports "
+        f"{backend.keys()}"
+    )
 
 
 def test_has_tells_two_keys_of_different_types_apart(backend):

@@ -3,6 +3,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Dict, Iterator
 import sqlite3
+import errno
 import json
 import os
 import pickle
@@ -72,6 +73,13 @@ def _names_one_entry(key) -> bool:
     column: ``"a/b"`` is an ordinary key there, ``keys()`` reports it, and
     refusing it here would be the same mistake in the other direction.
 
+    Structure only. Whether a name is *usable* -- short enough, free of NUL,
+    encodable at all -- is not knowable here without duplicating limits the
+    filesystem owns, and :func:`_absent_if_unnameable` reads those from the
+    refusal instead. A NUL check belongs in that pair, not both: with the
+    backstop in place an explicit one changes no answer on any backend,
+    measured rather than assumed.
+
     Rejecting these keys outright, with an error that says why, is issue 7.1.
     """
     return (
@@ -79,6 +87,38 @@ def _names_one_entry(key) -> bool:
         and key not in ("", os.curdir, os.pardir)
         and os.path.basename(key) == key
     )
+
+
+def _absent_if_unnameable(probe):
+    """Run ``probe``, reading "this backend cannot name that key" as absence.
+
+    ``has`` must answer what ``keys`` reports, and a key the backend cannot
+    express cannot have been stored, so it cannot be in the listing: the answer
+    is no. Before membership became a point lookup the comparison happened in
+    Python and such keys answered ``False`` without the backend ever being
+    asked; this keeps that true.
+
+    Each layer refuses differently, which is why this reads exceptions rather
+    than testing the key. A name past the filesystem's length limit is
+    ``ENAMETOOLONG`` from ``stat`` -- and the limit is the filesystem's to
+    know, not ours. A lone surrogate is a ``UnicodeEncodeError``, from
+    ``stat``, from h5py, and from the SQLite driver alike; it is a
+    ``ValueError`` subclass, which is also what an embedded NUL raises. A key
+    of a type the driver cannot bind at all is ``sqlite3.ProgrammingError``.
+
+    Deliberately narrow: every error named here says the *name* is impossible,
+    which is a definite answer. ``PermissionError`` and the rest say the
+    opposite -- that the question could not be settled -- and still propagate,
+    which is what issue 2.1's fifth finding was about.
+    """
+    try:
+        return probe()
+    except (ValueError, sqlite3.ProgrammingError):
+        return False
+    except OSError as exc:
+        if exc.errno == errno.ENAMETOOLONG:
+            return False
+        raise
 
 
 def _is_regular_file(path) -> bool:
@@ -487,11 +527,15 @@ class SqliteBackend(DiskBackend):
         the primary key index. Non-string keys are issue 7.1's to refuse; what
         matters here is that this answers what ``keys()`` reports.
         """
-        self.cursor.execute(
-            "SELECT 1 FROM data WHERE key=? AND typeof(key)=typeof(?) LIMIT 1",
-            (key, key),
-        )
-        return self.cursor.fetchone() is not None
+        def probe():
+            self.cursor.execute(
+                "SELECT 1 FROM data WHERE key IS ? AND typeof(key)=typeof(?) "
+                "LIMIT 1",
+                (key, key),
+            )
+            return self.cursor.fetchone() is not None
+
+        return _absent_if_unnameable(probe)
 
     def count(self) -> int:
         self.cursor.execute("SELECT COUNT(*) FROM data")
@@ -543,8 +587,8 @@ class PickleBackend(DiskBackend):
 
     def has(self, key) -> bool:
         """Whether this key's file is there -- one ``stat``, not a listing."""
-        return _names_one_entry(key) and _is_regular_file(
-            os.path.join(self.storage_path, key)
+        return _names_one_entry(key) and _absent_if_unnameable(
+            lambda: _is_regular_file(os.path.join(self.storage_path, key))
         )
 
     def count(self) -> int:
@@ -652,7 +696,9 @@ class Hdf5Backend(DiskBackend):
         # h5py reads a separator as a path inside the file, so "a/b" can be
         # found while keys() -- top-level members only -- reports "a".
         # Contained, unlike the other two, but the same disagreement.
-        return _names_one_entry(key) and key in self.file
+        return _names_one_entry(key) and _absent_if_unnameable(
+            lambda: key in self.file
+        )
 
     def count(self) -> int:
         return len(self.file)
@@ -695,7 +741,9 @@ class JSONBackend(DiskBackend):
         return [os.path.splitext(f)[0] for f in os.listdir(self.storage_path)]
 
     def has(self, key) -> bool:
-        return _names_one_entry(key) and _is_regular_file(self._file_path(key))
+        return _names_one_entry(key) and _absent_if_unnameable(
+            lambda: _is_regular_file(self._file_path(key))
+        )
 
     def count(self) -> int:
         with os.scandir(self.storage_path) as entries:
