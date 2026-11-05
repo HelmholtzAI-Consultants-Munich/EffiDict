@@ -3,6 +3,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Dict, Iterator
 import sqlite3
+import errno
 import json
 import os
 import pickle
@@ -50,6 +51,96 @@ def _is_directory(path) -> bool:
     """
     info = _stat(path)
     return info is not None and stat.S_ISDIR(info.st_mode)
+
+
+def _names_one_entry(key) -> bool:
+    """Whether ``key`` could name a single entry directly inside a store.
+
+    Three of the four backends derive a storage *location* from the key, and
+    for those a key is only a key if ``keys()`` could report it: one entry,
+    directly in the store, named by the key itself. Anything carrying a
+    separator, or one of the directory names, points elsewhere -- and
+    ``os.path.join(store, "../outsider")`` points outside the store
+    altogether, at a file the store has nothing to do with.
+
+    Answering about such a path is not merely untidy. ``Store.delete`` refuses
+    a key the store does not have, so a probe that said yes about an outside
+    file made ``del d["../outsider"]`` remove it. Before membership became a
+    point lookup the key listing could never name one, and this keeps that
+    true.
+
+    Not used by :class:`SqliteBackend`, which stores the key as data in a
+    column: ``"a/b"`` is an ordinary key there, ``keys()`` reports it, and
+    refusing it here would be the same mistake in the other direction.
+
+    Structure only. Whether a name is *usable* -- short enough, free of NUL,
+    encodable at all -- is not knowable here without duplicating limits the
+    filesystem owns, and :func:`_absent_if_unnameable` reads those from the
+    refusal instead. A NUL check belongs in that pair, not both: with the
+    backstop in place an explicit one changes no answer on any backend,
+    measured rather than assumed.
+
+    Rejecting these keys outright, with an error that says why, is issue 7.1.
+    """
+    return (
+        isinstance(key, str)
+        and key not in ("", os.curdir, os.pardir)
+        and os.path.basename(key) == key
+    )
+
+
+def _absent_if_unnameable(probe, without_the_key):
+    """Run ``probe``, reading "this backend cannot name that key" as absence.
+
+    ``has`` must answer what ``keys`` reports, and a key the backend cannot
+    express cannot have been stored, so it cannot be in the listing: the answer
+    is no. Before membership became a point lookup the comparison happened in
+    Python and such keys answered ``False`` without the backend ever being
+    asked; this keeps that true.
+
+    Each layer refuses differently, which is why this reads exceptions rather
+    than testing the key. A name past the filesystem's length limit is
+    ``ENAMETOOLONG`` from ``stat`` -- and the limit is the filesystem's to
+    know, not ours. A lone surrogate is a ``UnicodeEncodeError``, from
+    ``stat``, from h5py and from the SQLite driver alike; it is a
+    ``ValueError`` subclass, which is also what an embedded NUL raises. A key
+    of a type the driver cannot bind at all is ``sqlite3.ProgrammingError``.
+
+    Neither of those two classes is raised only about keys, which is what
+    ``without_the_key`` is for: h5py raises the same ``ValueError`` for a file
+    that has been closed, and sqlite3 the same ``ProgrammingError`` for a
+    closed connection or a cursor reached from another thread. Nothing in the
+    message separates the two cases that the library is not free to reword, so
+    ask the store something with no key in it instead. If it answers, the key
+    was the problem. If it cannot, the question was never settled, and
+    reporting that as absence is the defect issue 2.1's fifth finding removed
+    -- so the refusal propagates, for the same reason ``PermissionError`` and
+    every other ``OSError`` propagates here.
+    """
+    try:
+        return probe()
+    except (ValueError, sqlite3.ProgrammingError):
+        if _still_answers(without_the_key):
+            return False
+        raise
+    except OSError as exc:
+        if exc.errno == errno.ENAMETOOLONG:
+            return False
+        raise
+
+
+def _still_answers(question) -> bool:
+    """Whether the store answered ``question``, which names no key.
+
+    A predicate rather than a list of exception classes on purpose: what a
+    store raises once it is unusable is the library's to decide and to change,
+    and the only thing being asked here is whether it answered at all.
+    """
+    try:
+        question()
+    except Exception:  # noqa: BLE001 - any refusal means it did not answer
+        return False
+    return True
 
 
 def _is_regular_file(path) -> bool:
@@ -101,6 +192,12 @@ class DiskBackend(ABC):
     ``deserialize``, ``del_item``, ``keys`` or ``destroy`` used to construct and
     will now raise ``TypeError`` at instantiation. The four shipped backends are
     unaffected, which ``test_concrete_backends_remain_instantiable`` pins.
+
+    Issue 2.2 added ``has`` and ``count`` to that required set. Both had
+    concrete defaults written as a key listing, which every backend here now
+    overrides with a point lookup; leaving the defaults in place would have let
+    a backend added later inherit the O(N) membership that issue removed,
+    without anything saying so.
 
     Phase 0 carries three further user-visible changes, listed here so the set
     is in one place:
@@ -206,26 +303,38 @@ class DiskBackend(ABC):
         pass
 
     @abstractmethod
+    def has(self, key) -> bool:
+        """Whether ``key`` is here. Must not enumerate the keyspace.
+
+        The answer is whatever :meth:`keys` reports; an implementation that
+        disagrees with it is wrong, however fast it is.
+
+        Required rather than defaulted. The obvious default --
+        ``key in self.keys()`` -- is a full listing per call, and ``key in d``
+        reaches this method, so a backend that inherited it would quietly get
+        the membership cost issue 2.2 removed. Quietly is the problem: the
+        guard that measures that cost,
+        ``test_membership_cost_does_not_grow_with_the_store``, runs over the
+        backends in this repository, so a new one would not be measured until
+        somebody added it there. Making the method required moves the failure
+        to construction, where it cannot be missed.
+        """
+
+    @abstractmethod
+    def count(self) -> int:
+        """How many keys are here. Must not build the key listing.
+
+        Must agree with ``len(keys())``, and required for the same reason as
+        :meth:`has`: ``len(d)`` reaches this method.
+        """
+
+    @abstractmethod
     def destroy(self):
         pass
 
     def load_from_dict(self, dictionary):
         for key, value in dictionary.items():
             self.serialize(key, value)
-
-    def has(self, key) -> bool:
-        """Return whether ``key`` exists in this backend.
-
-        Naive on purpose: one full key listing per call. I3 needs a correct
-        answer here, and issue #2.2 makes it cheap per backend -- the complexity
-        guard ``test_membership_cost_does_not_grow_with_the_store`` is what that
-        issue has to satisfy, and this implementation does not.
-        """
-        return key in self.keys()
-
-    def count(self) -> int:
-        """Return the number of keys in this backend."""
-        raise NotImplementedError("see issue #2.2")
 
     def iter_keys(self) -> Iterator:
         """Iterate over keys in this backend."""
@@ -426,6 +535,65 @@ class SqliteBackend(DiskBackend):
     def keys(self):
         self.cursor.execute("SELECT key FROM data")
         return [key[0] for key in self.cursor.fetchall()]
+
+    def has(self, key) -> bool:
+        """One indexed probe. ``key`` is the primary key, so this is a seek.
+
+        ``typeof`` as well as value, because ``=`` alone is not key identity
+        here. The column is declared ``TEXT``, so its affinity converts an
+        integer to text on the way in *and* on the way into a comparison:
+        writing ``1`` stores ``'1'``, and probing with ``1`` then matches the
+        row that ``keys()`` reports as ``'1'``. Two distinct keys would read as
+        one, and ``len()`` would be short by one for every such pair. Comparing
+        the stored type with the probe's rejects that while still seeking on
+        the primary key index. Non-string keys are issue 7.1's to refuse; what
+        matters here is that this answers what ``keys()`` reports.
+
+        A key the driver cannot bind raises ``sqlite3.ProgrammingError``, which
+        is this backend's spelling of "cannot name that key". ``SELECT 1`` is
+        what settles that it was the key: the same class comes back from a
+        closed connection, and from a cursor reached off its own thread.
+        """
+        def probe():
+            self.cursor.execute(
+                "SELECT 1 FROM data WHERE key IS ? AND typeof(key)=typeof(?) "
+                "LIMIT 1",
+                (key, key),
+            )
+            return self.cursor.fetchone() is not None
+
+        return _absent_if_unnameable(
+            probe, lambda: self.cursor.execute("SELECT 1")
+        )
+
+    def count(self) -> int:
+        """Keys, not rows -- and both halves of the statement are index-only.
+
+        ``COUNT(*)`` alone is the obvious answer and is wrong by exactly the
+        rows ``NULL`` adds. A ``TEXT PRIMARY KEY`` column accepts ``NULL`` in
+        SQLite, and no two ``NULL``s conflict, so ``REPLACE`` does not replace
+        one: writing ``None`` twice leaves two rows for one key, and ``len(d)``
+        counted it twice where the set the old ``Store.count`` built never
+        could. Every other key is unique by the primary key index, so the
+        surplus ``NULL`` rows are the whole correction.
+
+        Subtracted rather than taken from ``COUNT(DISTINCT key)``, which is
+        wrong in the other direction -- it ignores ``NULL`` entirely and would
+        report 0 for a store whose ``keys()`` reports ``[None]`` -- and is a
+        scan where this is not. ``NULL``s sort first in the index, so the
+        second half is a seek, and the measured cost stays flat: 3.6µs at
+        N=100 and 5.8µs at N=40000, against 7µs and 1450µs for the scan.
+
+        That ``keys()`` still lists such a key once per row is the same quirk
+        from the write side, and goes to issue 7.1 with the rest of the
+        keyspace.
+        """
+        self.cursor.execute(
+            "SELECT (SELECT COUNT(*) FROM data), "
+            "(SELECT COUNT(*) FROM data WHERE key IS NULL)"
+        )
+        rows, nulls = self.cursor.fetchone()
+        return rows - max(nulls - 1, 0)
     
     def load_from_dict(self, dictionary):
         with self.conn:
@@ -470,6 +638,18 @@ class PickleBackend(DiskBackend):
 
     def keys(self):
         return os.listdir(self.storage_path)
+
+    def has(self, key) -> bool:
+        """Whether this key's file is there -- one ``stat``, not a listing."""
+        return _names_one_entry(key) and _absent_if_unnameable(
+            lambda: _is_regular_file(os.path.join(self.storage_path, key)),
+            lambda: os.stat(self.storage_path),
+        )
+
+    def count(self) -> int:
+        """``scandir``, not ``len(listdir())``: the entries are not collected."""
+        with os.scandir(self.storage_path) as entries:
+            return sum(1 for _ in entries)
 
     def destroy(self):
         shutil.rmtree(self.storage_path)
@@ -566,6 +746,31 @@ class Hdf5Backend(DiskBackend):
 
     def keys(self):
         return list(self.file.keys())
+
+    def has(self, key) -> bool:
+        """One membership test on the open file -- no listing of its members.
+
+        ``_names_one_entry`` because h5py reads a separator as a path inside
+        the file, so ``"a/b"`` can be found while ``keys()`` -- top-level
+        members only -- reports ``"a"``. Contained, unlike the two
+        file-per-key backends, but the same disagreement.
+
+        The closed-file check is not redundant: h5py's ``in`` answers ``False``
+        on a closed file instead of refusing, which is the predicate issue
+        2.1's fifth finding removed wearing a different coat -- ``keys()``
+        raises there, so the two would disagree about a store neither can read.
+        """
+        def probe():
+            if not self.file:
+                raise ValueError(f"no open HDF5 file at {self.storage_path!r}")
+            return key in self.file
+
+        return _names_one_entry(key) and _absent_if_unnameable(
+            probe, lambda: len(self.file)
+        )
+
+    def count(self) -> int:
+        return len(self.file)
     
     def close(self) -> None:
         """Close the file. ``h5py`` tolerates a second call."""
@@ -603,6 +808,16 @@ class JSONBackend(DiskBackend):
 
     def keys(self):
         return [os.path.splitext(f)[0] for f in os.listdir(self.storage_path)]
+
+    def has(self, key) -> bool:
+        return _names_one_entry(key) and _absent_if_unnameable(
+            lambda: _is_regular_file(self._file_path(key)),
+            lambda: os.stat(self.storage_path),
+        )
+
+    def count(self) -> int:
+        with os.scandir(self.storage_path) as entries:
+            return sum(1 for _ in entries)
     
     def destroy(self):
         shutil.rmtree(self.storage_path)

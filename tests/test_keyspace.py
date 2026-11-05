@@ -18,7 +18,7 @@ import unicodedata
 
 import pytest
 
-from effidict import Hdf5Backend, JSONBackend, PickleBackend
+from effidict import EffiDict, Hdf5Backend, JSONBackend, PickleBackend
 
 #: Keys that exercise the boundary between "key as data" and "key as location".
 KEY_PROBES = {
@@ -370,6 +370,51 @@ def test_keys_cannot_write_outside_the_storage_tree(
         # Removed here, not by the leak detector: the sentinel is outside
         # storage_dir by design, so nothing else cleans it up.
         shutil.rmtree(sentinel, ignore_errors=True)
+
+
+def test_a_key_the_store_never_held_cannot_delete_a_file_beside_it(
+    backend_cls, policy_cls, probe_backend
+):
+    """Membership decides deletion, so a probe that escapes is a delete that escapes.
+
+    Regression from issue 2.2. ``Store.delete`` refuses a key the store does
+    not have, and that refusal was the only thing standing between a traversal
+    key and an unrelated file: while ``has`` answered from the key listing it
+    could never name one. The point lookup that replaced it joined the key onto
+    the storage path, so ``'../outsider'`` found a real file one level up,
+    membership said yes, and the delete went through. Reproduced against
+    Pickle and JSON; SQLite keeps keys in a column and HDF5 resolves them
+    inside its own file, so neither reached the filesystem.
+
+    Distinct from ``test_keys_cannot_write_outside_the_storage_tree`` above,
+    which is about a key this store *writes*. This one is about a path the
+    store never held at all.
+
+    Refusing such a key outright is issue 7.1's answer and would satisfy this
+    spec too. What must not happen is the file disappearing.
+    """
+    beside_the_store = os.path.dirname(probe_backend.storage_path)
+    outsider = os.path.join(beside_the_store, "outsider")
+    with open(outsider, "w") as handle:
+        handle.write("not the store's")
+    # Both namings, so the spec does not have to know which backend is running.
+    outsider_json = outsider + ".json"
+    with open(outsider_json, "w") as handle:
+        handle.write("not the store's either")
+
+    d = EffiDict(probe_backend, policy_cls(), max_in_memory=4)
+    d["inside"] = "v"
+
+    assert "../outsider" not in d, "a file beside the store answered as a key"
+    with pytest.raises(KeyError):
+        del d["../outsider"]
+
+    assert os.path.exists(outsider), (
+        "deleting a key the store never held removed a file beside it"
+    )
+    assert os.path.exists(outsider_json), (
+        "deleting a key the store never held removed a file beside it"
+    )
 
 
 def test_traversal_key_round_trips(request, backend_cls, probe_backend):

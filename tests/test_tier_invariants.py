@@ -423,13 +423,6 @@ def test_membership_of_a_cached_key_never_touches_the_backend(
         )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "I3: backend.has() answers by listing every key, so membership still "
-        "scans the keyspace (issue 2.2)"
-    ),
-)
 @pytest.mark.parametrize("resident", [False, True], ids=["miss", "on-disk"])
 def test_membership_never_lists_the_keyspace(
     backend_cls, policy_cls, make_dict, backend_spy, resident
@@ -454,6 +447,60 @@ def test_membership_never_lists_the_keyspace(
 
         assert spy.count("keys") == 0, "__contains__ listed the whole keyspace"
         assert spy.count("iter_keys") == 0
+
+
+def test_len_counts_both_tiers_without_listing_them(
+    backend_cls, policy_cls, make_dict, backend_spy
+):
+    """I3, applied to ``len``: the size is asked for, never counted out.
+
+    ``len(d)`` is the union of the two tiers, and the cheap way to get it is to
+    ask the backend how many it holds and then ask about each *cached* key --
+    bounded by the cache, which does not grow with the store. The expensive way
+    is ``len(set(cache) | set(backend.keys()))``, which pulls the whole keyspace
+    into memory on every call. Both return the same number, so correctness
+    alone cannot tell them apart: this was green against the materialising
+    implementation until the spy assertion was added.
+
+    All three tier combinations have to be present at once, because each one is
+    the only thing that catches a different wrong answer:
+
+    * ``cache-only`` -- a key written and still resident. Counting the backend
+      alone loses it.
+    * ``disk-only`` -- spilled and no longer resident. Counting the cache alone
+      loses it.
+    * ``both`` -- resident *and* on disk, which I1 makes an ordinary state
+      rather than a contradiction. Adding the two tier counts double-counts it,
+      and with only the first two categories present the overlap is empty and
+      that sum is right by accident.
+    """
+    d = make_dict(max_in_memory=4)
+
+    # Seeded first, on the fresh dict _seed_in_both_tiers asks for: it spills
+    # and rewrites, and needs the free slot the spill leaves.
+    d["both"] = "v-both"
+    _seed_in_both_tiers(d, "both", "v-both")
+
+    d["disk"] = "v-disk"
+    _spill_to_disk(d, "disk")
+
+    d["cache"] = "v-cache"
+
+    # Asserted rather than assumed: a budget change or a policy that evicted
+    # early would quietly collapse three categories into two, and the test
+    # would go on passing while covering less than it says.
+    assert in_cache(d, "cache") and not on_disk(d, "cache"), "cache-only key"
+    assert on_disk(d, "disk") and not in_cache(d, "disk"), "disk-only key"
+    assert in_cache(d, "both") and on_disk(d, "both"), "dual-residency key"
+
+    with backend_spy(d._store.backend) as spy:
+        assert len(d) == 3, (
+            f"len() said {len(d)} for three distinct keys across two tiers "
+            f"with one of them in both"
+        )
+
+        assert spy.count("keys") == 0, "len() listed the whole keyspace"
+        assert spy.count("iter_keys") == 0, "len() streamed the whole keyspace"
 
 
 # --------------------------------------------------------------------------
