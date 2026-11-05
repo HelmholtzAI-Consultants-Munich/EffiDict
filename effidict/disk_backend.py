@@ -52,6 +52,35 @@ def _is_directory(path) -> bool:
     return info is not None and stat.S_ISDIR(info.st_mode)
 
 
+def _names_one_entry(key) -> bool:
+    """Whether ``key`` could name a single entry directly inside a store.
+
+    Three of the four backends derive a storage *location* from the key, and
+    for those a key is only a key if ``keys()`` could report it: one entry,
+    directly in the store, named by the key itself. Anything carrying a
+    separator, or one of the directory names, points elsewhere -- and
+    ``os.path.join(store, "../outsider")`` points outside the store
+    altogether, at a file the store has nothing to do with.
+
+    Answering about such a path is not merely untidy. ``Store.delete`` refuses
+    a key the store does not have, so a probe that said yes about an outside
+    file made ``del d["../outsider"]`` remove it. Before membership became a
+    point lookup the key listing could never name one, and this keeps that
+    true.
+
+    Not used by :class:`SqliteBackend`, which stores the key as data in a
+    column: ``"a/b"`` is an ordinary key there, ``keys()`` reports it, and
+    refusing it here would be the same mistake in the other direction.
+
+    Rejecting these keys outright, with an error that says why, is issue 7.1.
+    """
+    return (
+        isinstance(key, str)
+        and key not in ("", os.curdir, os.pardir)
+        and os.path.basename(key) == key
+    )
+
+
 def _is_regular_file(path) -> bool:
     """Whether ``path`` is a plain file -- the only thing a single-file store
     can be. A directory, a dangling symlink, a fifo or a socket occupies the
@@ -446,8 +475,22 @@ class SqliteBackend(DiskBackend):
         return [key[0] for key in self.cursor.fetchall()]
 
     def has(self, key) -> bool:
-        """One indexed probe. ``key`` is the primary key, so this is a seek."""
-        self.cursor.execute("SELECT 1 FROM data WHERE key=? LIMIT 1", (key,))
+        """One indexed probe. ``key`` is the primary key, so this is a seek.
+
+        ``typeof`` as well as value, because ``=`` alone is not key identity
+        here. The column is declared ``TEXT``, so its affinity converts an
+        integer to text on the way in *and* on the way into a comparison:
+        writing ``1`` stores ``'1'``, and probing with ``1`` then matches the
+        row that ``keys()`` reports as ``'1'``. Two distinct keys would read as
+        one, and ``len()`` would be short by one for every such pair. Comparing
+        the stored type with the probe's rejects that while still seeking on
+        the primary key index. Non-string keys are issue 7.1's to refuse; what
+        matters here is that this answers what ``keys()`` reports.
+        """
+        self.cursor.execute(
+            "SELECT 1 FROM data WHERE key=? AND typeof(key)=typeof(?) LIMIT 1",
+            (key, key),
+        )
         return self.cursor.fetchone() is not None
 
     def count(self) -> int:
@@ -500,7 +543,9 @@ class PickleBackend(DiskBackend):
 
     def has(self, key) -> bool:
         """Whether this key's file is there -- one ``stat``, not a listing."""
-        return _is_regular_file(os.path.join(self.storage_path, key))
+        return _names_one_entry(key) and _is_regular_file(
+            os.path.join(self.storage_path, key)
+        )
 
     def count(self) -> int:
         """``scandir``, not ``len(listdir())``: the entries are not collected."""
@@ -604,7 +649,10 @@ class Hdf5Backend(DiskBackend):
         return list(self.file.keys())
 
     def has(self, key) -> bool:
-        return key in self.file
+        # h5py reads a separator as a path inside the file, so "a/b" can be
+        # found while keys() -- top-level members only -- reports "a".
+        # Contained, unlike the other two, but the same disagreement.
+        return _names_one_entry(key) and key in self.file
 
     def count(self) -> int:
         return len(self.file)
@@ -647,7 +695,7 @@ class JSONBackend(DiskBackend):
         return [os.path.splitext(f)[0] for f in os.listdir(self.storage_path)]
 
     def has(self, key) -> bool:
-        return _is_regular_file(self._file_path(key))
+        return _names_one_entry(key) and _is_regular_file(self._file_path(key))
 
     def count(self) -> int:
         with os.scandir(self.storage_path) as entries:

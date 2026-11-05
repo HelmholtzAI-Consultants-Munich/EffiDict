@@ -504,6 +504,67 @@ def test_has_agrees_with_keys(backend):
     assert backend.has("absent") is False, "has() said True for a key never written"
 
 
+def test_has_does_not_answer_for_anything_outside_the_store(backend, storage_dir):
+    """``has`` must answer about this store, not about the filesystem round it.
+
+    Regression. Issue 2.2 replaced the key listing with a point lookup, and for
+    the file-per-key backends that lookup joins the key onto the storage path:
+    ``'../outsider'`` named a real file one level up and ``has`` said yes about
+    it, although ``keys()`` could never report it. Membership is what
+    ``Store.delete`` consults, so the delete that followed removed that file --
+    the store-level half of this is pinned in ``test_keyspace.py``.
+
+    The probe file is planted under both namings the file-per-key backends use,
+    so one spec covers all four backends without branching on which is running.
+    """
+    backend.serialize("inside", "v")
+
+    outsider = storage_dir / "outsider"
+    outsider.write_text("not the store's")
+    outsider_json = storage_dir / "outsider.json"
+    outsider_json.write_text("not the store's either")
+
+    probe = "../outsider"
+    try:
+        assert probe not in backend.keys(), (
+            f"precondition: the listing cannot name {probe!r}"
+        )
+        assert backend.has(probe) is False, (
+            f"has({probe!r}) answered about a file outside the store, which "
+            f"keys() reports as {backend.keys()}"
+        )
+    finally:
+        # Removed here rather than by the leak detector, which requires
+        # storage_dir to be empty and would otherwise fail every run of this
+        # test with a second, unrelated error.
+        outsider.unlink(missing_ok=True)
+        outsider_json.unlink(missing_ok=True)
+
+
+def test_has_tells_two_keys_of_different_types_apart(backend):
+    """``has`` must not report a key as present because another one converts to it.
+
+    Regression, and SQLite is where it bit. ``key`` is a ``TEXT`` column, so
+    its affinity converts an integer on both sides of a comparison: writing
+    ``'1'`` and probing with ``1`` matched, although ``keys()`` reports only
+    ``'1'``. Two distinct keys then read as one, and ``Store.count`` -- which
+    asks the backend about each cached key -- dropped the cached one from the
+    total, so ``len()`` was short by one for every such pair.
+
+    Whether a non-string key should be refused outright is issue 7.1's; the
+    contract here is only that ``has`` answers what ``keys`` reports.
+    """
+    backend.serialize("1", "stored under the string")
+
+    assert backend.has("1") is True, "has() lost the key that was written"
+    assert 1 not in backend.keys(), (
+        f"precondition: keys() reports {backend.keys()}, with no integer in it"
+    )
+    assert backend.has(1) is False, (
+        f"has(1) said True while keys() reports {backend.keys()}"
+    )
+
+
 def test_count_agrees_with_keys(backend):
     """``count`` must agree with ``len(keys())`` before and after a removal.
 
