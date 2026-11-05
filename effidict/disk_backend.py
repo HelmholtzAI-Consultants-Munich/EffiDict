@@ -89,7 +89,7 @@ def _names_one_entry(key) -> bool:
     )
 
 
-def _absent_if_unnameable(probe):
+def _absent_if_unnameable(probe, without_the_key):
     """Run ``probe``, reading "this backend cannot name that key" as absence.
 
     ``has`` must answer what ``keys`` reports, and a key the backend cannot
@@ -102,23 +102,45 @@ def _absent_if_unnameable(probe):
     than testing the key. A name past the filesystem's length limit is
     ``ENAMETOOLONG`` from ``stat`` -- and the limit is the filesystem's to
     know, not ours. A lone surrogate is a ``UnicodeEncodeError``, from
-    ``stat``, from h5py, and from the SQLite driver alike; it is a
+    ``stat``, from h5py and from the SQLite driver alike; it is a
     ``ValueError`` subclass, which is also what an embedded NUL raises. A key
     of a type the driver cannot bind at all is ``sqlite3.ProgrammingError``.
 
-    Deliberately narrow: every error named here says the *name* is impossible,
-    which is a definite answer. ``PermissionError`` and the rest say the
-    opposite -- that the question could not be settled -- and still propagate,
-    which is what issue 2.1's fifth finding was about.
+    Neither of those two classes is raised only about keys, which is what
+    ``without_the_key`` is for: h5py raises the same ``ValueError`` for a file
+    that has been closed, and sqlite3 the same ``ProgrammingError`` for a
+    closed connection or a cursor reached from another thread. Nothing in the
+    message separates the two cases that the library is not free to reword, so
+    ask the store something with no key in it instead. If it answers, the key
+    was the problem. If it cannot, the question was never settled, and
+    reporting that as absence is the defect issue 2.1's fifth finding removed
+    -- so the refusal propagates, for the same reason ``PermissionError`` and
+    every other ``OSError`` propagates here.
     """
     try:
         return probe()
     except (ValueError, sqlite3.ProgrammingError):
-        return False
+        if _still_answers(without_the_key):
+            return False
+        raise
     except OSError as exc:
         if exc.errno == errno.ENAMETOOLONG:
             return False
         raise
+
+
+def _still_answers(question) -> bool:
+    """Whether the store answered ``question``, which names no key.
+
+    A predicate rather than a list of exception classes on purpose: what a
+    store raises once it is unusable is the library's to decide and to change,
+    and the only thing being asked here is whether it answered at all.
+    """
+    try:
+        question()
+    except Exception:  # noqa: BLE001 - any refusal means it did not answer
+        return False
+    return True
 
 
 def _is_regular_file(path) -> bool:
@@ -526,6 +548,11 @@ class SqliteBackend(DiskBackend):
         the stored type with the probe's rejects that while still seeking on
         the primary key index. Non-string keys are issue 7.1's to refuse; what
         matters here is that this answers what ``keys()`` reports.
+
+        A key the driver cannot bind raises ``sqlite3.ProgrammingError``, which
+        is this backend's spelling of "cannot name that key". ``SELECT 1`` is
+        what settles that it was the key: the same class comes back from a
+        closed connection, and from a cursor reached off its own thread.
         """
         def probe():
             self.cursor.execute(
@@ -535,11 +562,38 @@ class SqliteBackend(DiskBackend):
             )
             return self.cursor.fetchone() is not None
 
-        return _absent_if_unnameable(probe)
+        return _absent_if_unnameable(
+            probe, lambda: self.cursor.execute("SELECT 1")
+        )
 
     def count(self) -> int:
-        self.cursor.execute("SELECT COUNT(*) FROM data")
-        return self.cursor.fetchone()[0]
+        """Keys, not rows -- and both halves of the statement are index-only.
+
+        ``COUNT(*)`` alone is the obvious answer and is wrong by exactly the
+        rows ``NULL`` adds. A ``TEXT PRIMARY KEY`` column accepts ``NULL`` in
+        SQLite, and no two ``NULL``s conflict, so ``REPLACE`` does not replace
+        one: writing ``None`` twice leaves two rows for one key, and ``len(d)``
+        counted it twice where the set the old ``Store.count`` built never
+        could. Every other key is unique by the primary key index, so the
+        surplus ``NULL`` rows are the whole correction.
+
+        Subtracted rather than taken from ``COUNT(DISTINCT key)``, which is
+        wrong in the other direction -- it ignores ``NULL`` entirely and would
+        report 0 for a store whose ``keys()`` reports ``[None]`` -- and is a
+        scan where this is not. ``NULL``s sort first in the index, so the
+        second half is a seek, and the measured cost stays flat: 3.6µs at
+        N=100 and 5.8µs at N=40000, against 7µs and 1450µs for the scan.
+
+        That ``keys()`` still lists such a key once per row is the same quirk
+        from the write side, and goes to issue 7.1 with the rest of the
+        keyspace.
+        """
+        self.cursor.execute(
+            "SELECT (SELECT COUNT(*) FROM data), "
+            "(SELECT COUNT(*) FROM data WHERE key IS NULL)"
+        )
+        rows, nulls = self.cursor.fetchone()
+        return rows - max(nulls - 1, 0)
     
     def load_from_dict(self, dictionary):
         with self.conn:
@@ -588,7 +642,8 @@ class PickleBackend(DiskBackend):
     def has(self, key) -> bool:
         """Whether this key's file is there -- one ``stat``, not a listing."""
         return _names_one_entry(key) and _absent_if_unnameable(
-            lambda: _is_regular_file(os.path.join(self.storage_path, key))
+            lambda: _is_regular_file(os.path.join(self.storage_path, key)),
+            lambda: os.stat(self.storage_path),
         )
 
     def count(self) -> int:
@@ -693,11 +748,25 @@ class Hdf5Backend(DiskBackend):
         return list(self.file.keys())
 
     def has(self, key) -> bool:
-        # h5py reads a separator as a path inside the file, so "a/b" can be
-        # found while keys() -- top-level members only -- reports "a".
-        # Contained, unlike the other two, but the same disagreement.
+        """One membership test on the open file -- no listing of its members.
+
+        ``_names_one_entry`` because h5py reads a separator as a path inside
+        the file, so ``"a/b"`` can be found while ``keys()`` -- top-level
+        members only -- reports ``"a"``. Contained, unlike the two
+        file-per-key backends, but the same disagreement.
+
+        The closed-file check is not redundant: h5py's ``in`` answers ``False``
+        on a closed file instead of refusing, which is the predicate issue
+        2.1's fifth finding removed wearing a different coat -- ``keys()``
+        raises there, so the two would disagree about a store neither can read.
+        """
+        def probe():
+            if not self.file:
+                raise ValueError(f"no open HDF5 file at {self.storage_path!r}")
+            return key in self.file
+
         return _names_one_entry(key) and _absent_if_unnameable(
-            lambda: key in self.file
+            probe, lambda: len(self.file)
         )
 
     def count(self) -> int:
@@ -742,7 +811,8 @@ class JSONBackend(DiskBackend):
 
     def has(self, key) -> bool:
         return _names_one_entry(key) and _absent_if_unnameable(
-            lambda: _is_regular_file(self._file_path(key))
+            lambda: _is_regular_file(self._file_path(key)),
+            lambda: os.stat(self.storage_path),
         )
 
     def count(self) -> int:

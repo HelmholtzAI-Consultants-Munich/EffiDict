@@ -50,6 +50,14 @@ DECODE_HOOK = {
 
 #: Backends whose ``deserialize`` wraps its whole body in ``except KeyError``, so
 #: a decode failure is indistinguishable from an absent key.
+#: How to take a backend's store away while the object itself stays usable.
+#: The two file-per-key backends hold no handle, so there is nothing to close
+#: and the spec using this leaves them alone.
+CLOSE_THE_HANDLE = {
+    SqliteBackend: lambda b: b.conn.close(),
+    Hdf5Backend: lambda b: b.file.close(),
+}
+
 #: Backends that actively rewrite a decode failure into ``KeyError(key)``. The
 #: others merely let the decoder's own ``KeyError`` through -- a different route
 #: to the same place, since the caller reads either as a miss. Kept apart only
@@ -657,6 +665,40 @@ def test_has_agrees_with_keys_about_a_key_stored_as_null(backend):
     )
 
 
+def test_has_does_not_report_a_closed_store_as_absent(backend, backend_cls):
+    """A store that cannot answer has not answered "no".
+
+    Regression, reported on SQLite and present on HDF5 by a second route. Both
+    probes read a refusal as "this backend cannot name that key", and each
+    library raises that same class when the *handle* is the problem rather than
+    the key: ``sqlite3.ProgrammingError`` for a closed connection or a cursor
+    reached from another thread, ``ValueError`` from h5py for a closed file.
+    h5py is the worse half, since its ``in`` does not raise at all -- it
+    answers ``False``, which is the predicate issue 2.1's fifth finding removed
+    wearing a different coat.
+
+    ``keys()`` is the reference here as everywhere in 2.2, and the expectation
+    is taken from it rather than written as a literal: it refuses on a closed
+    store, and while ``has`` went through it, ``has`` refused with it.
+    """
+    close = CLOSE_THE_HANDLE.get(backend_cls)
+    if close is None:
+        pytest.skip(f"{backend_cls.__name__} holds no handle to close")
+
+    backend.serialize("present", "a value")
+    close(backend)
+
+    try:
+        listing = backend.keys()
+    except Exception as exc:  # noqa: BLE001 - the class is what is being read
+        refusal = type(exc)
+    else:
+        pytest.fail(f"keys() answered {listing!r} on a closed store")
+
+    with pytest.raises(refusal):
+        backend.has("present")
+
+
 def test_has_tells_two_keys_of_different_types_apart(backend):
     """``has`` must not report a key as present because another one converts to it.
 
@@ -703,6 +745,34 @@ def test_count_agrees_with_keys(backend):
     assert backend.count() == len(backend.keys()) == len(BATCH_ITEMS) - 1, (
         f"after one removal count() said {backend.count()} and keys() reports "
         f"{len(backend.keys())}; expected {len(BATCH_ITEMS) - 1}"
+    )
+
+
+def test_count_counts_keys_not_rows(backend):
+    """One key written twice is one key, whatever the store kept underneath.
+
+    Regression, and SQLite is where it bit: ``key`` is a ``TEXT PRIMARY KEY``
+    column, SQLite accepts ``NULL`` in one, and no two ``NULL``s conflict -- so
+    ``REPLACE`` appends instead of replacing, and a second write under ``None``
+    left two rows for one key. ``count`` was ``COUNT(*)``, which counted both,
+    and ``len(d)`` reported one more key than the store had. The set the old
+    ``Store.count`` built never could, which is what makes the number this
+    issue's to fix; that ``keys()`` still lists the key once per row is the
+    same quirk from the write side and goes to issue 7.1.
+
+    ``None`` because it is the only key any of these backends stores that way.
+    A backend that refuses it is giving a legitimate answer and has nothing to
+    count, so it leaves -- the same shape as the ``has`` spec above.
+    """
+    try:
+        backend.serialize(None, "first")
+        backend.serialize(None, "second")
+    except Exception:  # noqa: BLE001 - refusing the key is a legitimate answer
+        return
+
+    assert backend.count() == len(set(backend.keys())) == 1, (
+        f"count() said {backend.count()} for one key written twice, while "
+        f"keys() reports {backend.keys()}"
     )
 
 
