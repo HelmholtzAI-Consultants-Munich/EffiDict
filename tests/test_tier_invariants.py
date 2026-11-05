@@ -423,13 +423,6 @@ def test_membership_of_a_cached_key_never_touches_the_backend(
         )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "I3: backend.has() answers by listing every key, so membership still "
-        "scans the keyspace (issue 2.2)"
-    ),
-)
 @pytest.mark.parametrize("resident", [False, True], ids=["miss", "on-disk"])
 def test_membership_never_lists_the_keyspace(
     backend_cls, policy_cls, make_dict, backend_spy, resident

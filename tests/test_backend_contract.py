@@ -504,7 +504,6 @@ def test_has_agrees_with_keys(backend):
     assert backend.has("absent") is False, "has() said True for a key never written"
 
 
-@pytest.mark.xfail(strict=True, reason="count is a contract stub (issue 2.2)")
 def test_count_agrees_with_keys(backend):
     """``count`` must agree with ``len(keys())`` before and after a removal.
 

@@ -102,6 +102,12 @@ class DiskBackend(ABC):
     will now raise ``TypeError`` at instantiation. The four shipped backends are
     unaffected, which ``test_concrete_backends_remain_instantiable`` pins.
 
+    Issue 2.2 added ``has`` and ``count`` to that required set. Both had
+    concrete defaults written as a key listing, which every backend here now
+    overrides with a point lookup; leaving the defaults in place would have let
+    a backend added later inherit the O(N) membership that issue removed,
+    without anything saying so.
+
     Phase 0 carries three further user-visible changes, listed here so the set
     is in one place:
 
@@ -206,26 +212,38 @@ class DiskBackend(ABC):
         pass
 
     @abstractmethod
+    def has(self, key) -> bool:
+        """Whether ``key`` is here. Must not enumerate the keyspace.
+
+        The answer is whatever :meth:`keys` reports; an implementation that
+        disagrees with it is wrong, however fast it is.
+
+        Required rather than defaulted. The obvious default --
+        ``key in self.keys()`` -- is a full listing per call, and ``key in d``
+        reaches this method, so a backend that inherited it would quietly get
+        the membership cost issue 2.2 removed. Quietly is the problem: the
+        guard that measures that cost,
+        ``test_membership_cost_does_not_grow_with_the_store``, runs over the
+        backends in this repository, so a new one would not be measured until
+        somebody added it there. Making the method required moves the failure
+        to construction, where it cannot be missed.
+        """
+
+    @abstractmethod
+    def count(self) -> int:
+        """How many keys are here. Must not build the key listing.
+
+        Must agree with ``len(keys())``, and required for the same reason as
+        :meth:`has`: ``len(d)`` reaches this method.
+        """
+
+    @abstractmethod
     def destroy(self):
         pass
 
     def load_from_dict(self, dictionary):
         for key, value in dictionary.items():
             self.serialize(key, value)
-
-    def has(self, key) -> bool:
-        """Return whether ``key`` exists in this backend.
-
-        Naive on purpose: one full key listing per call. I3 needs a correct
-        answer here, and issue #2.2 makes it cheap per backend -- the complexity
-        guard ``test_membership_cost_does_not_grow_with_the_store`` is what that
-        issue has to satisfy, and this implementation does not.
-        """
-        return key in self.keys()
-
-    def count(self) -> int:
-        """Return the number of keys in this backend."""
-        raise NotImplementedError("see issue #2.2")
 
     def iter_keys(self) -> Iterator:
         """Iterate over keys in this backend."""
@@ -426,6 +444,15 @@ class SqliteBackend(DiskBackend):
     def keys(self):
         self.cursor.execute("SELECT key FROM data")
         return [key[0] for key in self.cursor.fetchall()]
+
+    def has(self, key) -> bool:
+        """One indexed probe. ``key`` is the primary key, so this is a seek."""
+        self.cursor.execute("SELECT 1 FROM data WHERE key=? LIMIT 1", (key,))
+        return self.cursor.fetchone() is not None
+
+    def count(self) -> int:
+        self.cursor.execute("SELECT COUNT(*) FROM data")
+        return self.cursor.fetchone()[0]
     
     def load_from_dict(self, dictionary):
         with self.conn:
@@ -470,6 +497,15 @@ class PickleBackend(DiskBackend):
 
     def keys(self):
         return os.listdir(self.storage_path)
+
+    def has(self, key) -> bool:
+        """Whether this key's file is there -- one ``stat``, not a listing."""
+        return _is_regular_file(os.path.join(self.storage_path, key))
+
+    def count(self) -> int:
+        """``scandir``, not ``len(listdir())``: the entries are not collected."""
+        with os.scandir(self.storage_path) as entries:
+            return sum(1 for _ in entries)
 
     def destroy(self):
         shutil.rmtree(self.storage_path)
@@ -566,6 +602,12 @@ class Hdf5Backend(DiskBackend):
 
     def keys(self):
         return list(self.file.keys())
+
+    def has(self, key) -> bool:
+        return key in self.file
+
+    def count(self) -> int:
+        return len(self.file)
     
     def close(self) -> None:
         """Close the file. ``h5py`` tolerates a second call."""
@@ -603,6 +645,13 @@ class JSONBackend(DiskBackend):
 
     def keys(self):
         return [os.path.splitext(f)[0] for f in os.listdir(self.storage_path)]
+
+    def has(self, key) -> bool:
+        return _is_regular_file(self._file_path(key))
+
+    def count(self) -> int:
+        with os.scandir(self.storage_path) as entries:
+            return sum(1 for _ in entries)
     
     def destroy(self):
         shutil.rmtree(self.storage_path)

@@ -410,8 +410,8 @@ class Store:
         """Return whether ``key`` is present in any tier.
 
         I3, as the invariant states it: ``cache.has(key) or backend.has(key)``.
-        Making ``backend.has`` cheaper than a key listing is issue #2.2; the
-        shape of the answer is settled here.
+        Two point lookups, neither of which enumerates anything -- which is the
+        whole of I3, and is why ``backend.has`` had to stop being a key listing.
         """
         with self._lock:
             return self._contains(key)
@@ -421,9 +421,21 @@ class Store:
         return self._cache.has(key) or self._backend.has(key)
 
     def count(self) -> int:
-        """Return the number of distinct keys in the store."""
+        """Return the number of distinct keys in the store.
+
+        The union of the two tiers, counted without being built. A cached key
+        may or may not also be on disk -- I1 makes disk authoritative, not
+        exclusive -- so the overlap is real and adding the two counts would
+        double it. Asking the backend about each cached key instead bounds the
+        work by the cache, which is the one thing here that does not grow with
+        the store: ``max_in_memory`` point lookups, whether the store holds a
+        hundred keys or ten million. ``len(self._key_set())`` cost the whole
+        keyspace, materialised, per call.
+        """
         with self._lock:
-            return len(self._key_set())
+            return self._backend.count() + sum(
+                1 for key in self._cache if not self._backend.has(key)
+            )
 
     def iter_keys(self) -> Iterator:
         """Iterate over all distinct keys in the store.

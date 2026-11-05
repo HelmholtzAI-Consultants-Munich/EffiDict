@@ -82,13 +82,6 @@ def _count_enumerated(backend):
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "membership reaches backend.has(), which answers by listing every "
-        "key, so the work grows with the size of the store (issue 2.2)"
-    ),
-)
 def test_membership_cost_does_not_grow_with_the_store(backend_cls, policy_cls, make_dict):
     """A membership check must cost the same at 4000 keys as at 100.
 
@@ -117,13 +110,6 @@ def test_membership_cost_does_not_grow_with_the_store(backend_cls, policy_cls, m
     )
 
 
-@pytest.mark.xfail(
-    strict=False,  # wall clock; the deterministic pin is the guard above
-    reason=(
-        "__contains__ scans the keyspace, so it gets slower as the store grows "
-        "(issue 2.2)"
-    ),
-)
 def test_membership_time_is_flat(make_dict):
     """The wall-clock form of the guard above, as a ratio within one run.
 
